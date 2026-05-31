@@ -312,6 +312,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ref_store_delete_wrong_expected() {
+        let s = MemRefStore::new();
+        let n = RefName::new("refs/heads/conflict").unwrap();
+        let t = ObjectId::from_bytes([0xaau8; 32]);
+        s.update(&n, t, None).await.unwrap();
+        // Delete with wrong expected ObjectId must return Conflict
+        let wrong = ObjectId::from_bytes([0xbbu8; 32]);
+        let r = s.delete(&n, wrong).await;
+        assert!(matches!(r, Err(crate::LedgeError::Conflict { .. })));
+        // Ref must still exist after failed delete
+        assert!(s.get(&n).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn test_ref_store_list_prefix() {
         let s = MemRefStore::new();
         for r in ["refs/heads/main", "refs/heads/dev", "refs/tags/v1"] {
