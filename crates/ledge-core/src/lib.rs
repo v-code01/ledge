@@ -9,3 +9,4 @@ pub use error::{LedgeError, Result};
 pub use hlc::HLC;
 pub use object_id::ObjectId;
 pub use ref_entry::RefEntry;
+pub use ref_name::RefName;
