@@ -13,8 +13,8 @@ bench-baseline:
 	cargo bench --workspace -- --save-baseline main
 
 bench-compare:
-	cargo bench --workspace -- --load-baseline main --baseline main \
-		| awk '/regression/{found=1} END{exit found}'
+	cargo bench --workspace -- --baseline main \
+		| awk '/regressed/{found=1} END{exit found}'
 
 fmt:
 	cargo fmt --all

@@ -1,6 +1,3 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
 [alias]
 t  = "test --workspace"
 b  = "build --workspace"
