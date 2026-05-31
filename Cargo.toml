@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ledge-core",
+    "crates/ledge-object-store",
+    "crates/ledge-ref-store",
+    "crates/ledge-git",
+    "crates/ledge-server",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.78"
+license      = "MIT OR Apache-2.0"
+authors      = ["Vansh Verma"]
+
+[workspace.dependencies]
+blake3            = "1"
+tokio             = { version = "1", features = ["full"] }
+bytes             = "1"
+thiserror         = "2"
+arc-swap          = "1"
+serde             = { version = "1", features = ["derive"] }
+bincode           = "2"
+tracing           = "0.1"
+async-trait       = "0.1"
+hex               = "0.4"
+proptest          = "1"
+criterion         = { version = "0.5", features = ["html_reports"] }
+gix-pack          = "0.54"
+axum              = "0.8"
+tower             = "0.5"
+tower-http        = { version = "0.6", features = ["trace", "timeout", "limit"] }
+metrics           = "0.24"
+metrics-exporter-prometheus = "0.16"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap              = { version = "4", features = ["derive"] }
+config            = "0.14"
+sha1              = "0.10"
+rand              = "0.8"
+crc32fast         = "1"
+tempfile          = "3"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug    = true
