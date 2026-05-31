@@ -13,7 +13,9 @@ bytes.workspace       = true
 async-trait.workspace = true
 hex.workspace         = true
 serde.workspace       = true
+blake3.workspace      = true
 
 [dev-dependencies]
-proptest.workspace = true
-tokio              = { workspace = true, features = ["full", "test-util"] }
+proptest.workspace   = true
+serde_json.workspace = true
+tokio                = { workspace = true, features = ["full", "test-util"] }
