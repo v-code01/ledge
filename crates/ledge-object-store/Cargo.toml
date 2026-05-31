@@ -27,3 +27,4 @@ io-uring = "0.7"
 tempfile.workspace = true
 tokio              = { workspace = true, features = ["full", "test-util"] }
 proptest.workspace = true
+futures.workspace  = true
