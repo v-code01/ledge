@@ -174,6 +174,38 @@ pub fn encode_pack(objects: &[(u8, Bytes)]) -> Vec<u8> {
     pack
 }
 
+/// Map a stored ref name to the client-facing name by removing the workspace
+/// segment. `segment == ""` is the identity (Phase 1 default-repo behavior).
+///
+/// `refs/workspaces/<id>/heads/main` with segment `workspaces/<id>/`
+/// → `refs/heads/main`. A stored name that does not begin with the segment is
+/// returned unchanged (defensive; never panics).
+pub(crate) fn present_ref(stored: &str, segment: &str) -> String {
+    if segment.is_empty() {
+        return stored.to_string();
+    }
+    match stored.strip_prefix(&format!("refs/{segment}")) {
+        Some(rest) => format!("refs/{rest}"),
+        None => stored.to_string(),
+    }
+}
+
+/// Map a client-facing ref name to the stored name by inserting the workspace
+/// segment immediately after `refs/`. `segment == ""` is the identity.
+///
+/// `refs/heads/main` with segment `workspaces/<id>/`
+/// → `refs/workspaces/<id>/heads/main`. A client name that does not begin with
+/// `refs/` is returned unchanged.
+pub(crate) fn store_ref(client: &str, segment: &str) -> String {
+    if segment.is_empty() {
+        return client.to_string();
+    }
+    match client.strip_prefix("refs/") {
+        Some(rest) => format!("refs/{segment}{rest}"),
+        None => client.to_string(),
+    }
+}
+
 /// Handle `GET /:repo/info/refs?service=git-upload-pack`.
 ///
 /// Returns the git smart-HTTP discovery response: a flush-terminated pkt-line
@@ -659,6 +691,58 @@ mod tests {
         assert_eq!(&pd[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(pd[4..8].try_into().unwrap()), 2u32);
         assert_eq!(u32::from_be_bytes(pd[8..12].try_into().unwrap()), 2u32);
+    }
+
+    #[test]
+    fn present_ref_empty_segment_is_identity() {
+        assert_eq!(present_ref("refs/heads/main", ""), "refs/heads/main");
+        assert_eq!(present_ref("refs/tags/v1", ""), "refs/tags/v1");
+    }
+
+    #[test]
+    fn store_ref_empty_segment_is_identity() {
+        assert_eq!(store_ref("refs/heads/main", ""), "refs/heads/main");
+        assert_eq!(store_ref("refs/tags/v1", ""), "refs/tags/v1");
+    }
+
+    #[test]
+    fn present_ref_strips_workspace_segment() {
+        assert_eq!(
+            present_ref("refs/workspaces/abc/heads/main", "workspaces/abc/"),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            present_ref("refs/workspaces/abc/tags/v1", "workspaces/abc/"),
+            "refs/tags/v1"
+        );
+    }
+
+    #[test]
+    fn store_ref_inserts_workspace_segment() {
+        assert_eq!(
+            store_ref("refs/heads/main", "workspaces/abc/"),
+            "refs/workspaces/abc/heads/main"
+        );
+        assert_eq!(
+            store_ref("refs/tags/v1", "workspaces/abc/"),
+            "refs/workspaces/abc/tags/v1"
+        );
+    }
+
+    #[test]
+    fn present_store_roundtrip_both_segments() {
+        for seg in ["", "workspaces/abc/"] {
+            for client in ["refs/heads/main", "refs/tags/v1", "refs/heads/feature/x"] {
+                assert_eq!(present_ref(&store_ref(client, seg), seg), client);
+            }
+        }
+    }
+
+    #[test]
+    fn present_ref_passes_through_non_matching_segment() {
+        // A stored ref that does not begin with the segment is returned unchanged
+        // (defensive: a list() prefix guarantees a match, but never panic).
+        assert_eq!(present_ref("refs/heads/main", "workspaces/abc/"), "refs/heads/main");
     }
 
     #[test]
