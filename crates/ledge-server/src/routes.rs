@@ -19,6 +19,9 @@ pub struct AppState {
     /// Fallback TTL (seconds) for `POST /workspaces` when the request omits
     /// `ttl_seconds`. Sourced from `workspace.default_ttl_secs` config.
     pub default_ttl_secs: u64,
+    /// On-disk root of this repo's data (objects + refs + leases). Source of
+    /// the CoW snapshot at `POST /admin/snapshot` (Phase 2d).
+    pub data_dir: std::path::PathBuf,
 }
 
 #[derive(Deserialize)]

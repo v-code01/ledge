@@ -1,3 +1,4 @@
+pub mod admin_routes;
 pub mod config;
 pub mod metrics;
 pub mod routes;
@@ -53,6 +54,10 @@ pub fn build_app(state: AppState) -> Router {
             axum::routing::post(workspace_routes::commit_workspace),
         )
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
+        .route(
+            "/admin/snapshot",
+            axum::routing::post(admin_routes::admin_snapshot),
+        )
         // ── Workspace-scoped git (segment = workspaces/{id}/) ──────────────
         .route("/ws/{id}/info/refs", axum::routing::get(routes::ws_info_refs))
         .route(

@@ -441,7 +441,7 @@ mod route_tests {
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
         let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p, objects.clone(), refs.clone(), hlc).unwrap();
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
         AppState {
             objects,
             refs,
@@ -449,6 +449,7 @@ mod route_tests {
             leases,
             gc,
             default_ttl_secs: 3600,
+            data_dir: p,
         }
     }
 

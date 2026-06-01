@@ -21,6 +21,12 @@ pub const GC_RUNS_TOTAL: &str = "ledge_gc_runs_total";
 pub const GC_OBJECTS_RECLAIMED_TOTAL: &str = "ledge_gc_objects_reclaimed_total";
 pub const GC_BYTES_FREED_TOTAL: &str = "ledge_gc_bytes_freed_total";
 pub const GC_DURATION: &str = "ledge_gc_duration_seconds";
+pub const SNAPSHOTS_TOTAL: &str = "ledge_snapshots_total";
+pub const SNAPSHOT_FILES_TOTAL: &str = "ledge_snapshot_files_total";
+pub const SNAPSHOT_BYTES_TOTAL: &str = "ledge_snapshot_bytes_total";
+pub const SNAPSHOT_REFLINKED_TOTAL: &str = "ledge_snapshot_reflinked_total";
+pub const SNAPSHOT_COPIED_TOTAL: &str = "ledge_snapshot_copied_total";
+pub const SNAPSHOT_DURATION: &str = "ledge_snapshot_duration_seconds";
 
 pub fn install_recorder() -> ledge_core::Result<()> {
     let handle = PrometheusBuilder::new()
@@ -58,6 +64,17 @@ pub fn record_gc_run(stats: &ledge_workspace::GcStats, d: std::time::Duration) {
     metrics::histogram!(GC_DURATION).record(d.as_secs_f64());
 }
 
+/// Record one CoW snapshot: bump the run counter, files/bytes/reflinked/copied
+/// counters, and the duration histogram (Phase 2d, `POST /admin/snapshot`).
+pub fn record_snapshot(stats: &ledge_cow::CloneStats, d: std::time::Duration) {
+    metrics::counter!(SNAPSHOTS_TOTAL).increment(1);
+    metrics::counter!(SNAPSHOT_FILES_TOTAL).increment(stats.files as u64);
+    metrics::counter!(SNAPSHOT_BYTES_TOTAL).increment(stats.bytes);
+    metrics::counter!(SNAPSHOT_REFLINKED_TOTAL).increment(stats.reflinked as u64);
+    metrics::counter!(SNAPSHOT_COPIED_TOTAL).increment(stats.copied as u64);
+    metrics::histogram!(SNAPSHOT_DURATION).record(d.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +101,24 @@ mod tests {
     fn workspace_metric_constants_correct() {
         assert_eq!(WORKSPACES_ACTIVE, "ledge_workspaces_active");
         assert_eq!(GC_DURATION, "ledge_gc_duration_seconds");
+    }
+
+    #[test]
+    fn snapshot_metric_constants_correct() {
+        assert_eq!(SNAPSHOTS_TOTAL, "ledge_snapshots_total");
+        assert_eq!(SNAPSHOT_DURATION, "ledge_snapshot_duration_seconds");
+    }
+
+    #[test]
+    fn snapshot_record_helper_no_panic_without_recorder() {
+        let stats = ledge_cow::CloneStats {
+            files: 4,
+            dirs: 2,
+            reflinked: 4,
+            copied: 0,
+            bytes: 4096,
+        };
+        record_snapshot(&stats, std::time::Duration::from_millis(2));
     }
 
     #[test]

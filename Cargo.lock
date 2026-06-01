@@ -1393,6 +1393,7 @@ dependencies = [
  "clap",
  "config",
  "ledge-core",
+ "ledge-cow",
  "ledge-git",
  "ledge-object-store",
  "ledge-ref-store",

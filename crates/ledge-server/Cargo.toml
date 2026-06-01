@@ -21,6 +21,7 @@ ledge-object-store = { path = "../ledge-object-store" }
 ledge-ref-store    = { path = "../ledge-ref-store" }
 ledge-git          = { path = "../ledge-git" }
 ledge-workspace    = { path = "../ledge-workspace" }
+ledge-cow          = { path = "../ledge-cow" }
 axum.workspace              = true
 tower.workspace             = true
 tower-http.workspace        = true

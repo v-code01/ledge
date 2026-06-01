@@ -127,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         leases,
         gc,
         default_ttl_secs: cfg.workspace.default_ttl_secs,
+        data_dir: data_dir.clone(),
     });
     let addr: SocketAddr = cfg
         .server
