@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledge-sdk"
+version = "0.1.0"
+description = "Ledge Python SDK (Tier 3) — typed client over the Cap'n Proto POST /rpc control plane."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "pycapnp>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["ledge_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
