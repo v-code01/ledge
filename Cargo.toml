@@ -8,6 +8,7 @@ members = [
     "crates/ledge-git",
     "crates/ledge-server",
     "crates/ledge-bench",
+    "crates/ledge-cow",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ rand              = "0.8"
 crc32fast         = "1"
 tempfile          = "3"
 futures           = "0.3"
+reflink-copy      = "0.1"
 
 [profile.release]
 opt-level = 3
