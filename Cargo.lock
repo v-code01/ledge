@@ -1402,6 +1402,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledge-workspace"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "bytes",
+ "crc32fast",
+ "ledge-core",
+ "ledge-object-store",
+ "ledge-ref-store",
+ "proptest",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

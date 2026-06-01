@@ -4,6 +4,7 @@ members = [
     "crates/ledge-core",
     "crates/ledge-object-store",
     "crates/ledge-ref-store",
+    "crates/ledge-workspace",
     "crates/ledge-git",
     "crates/ledge-server",
     "crates/ledge-bench",
