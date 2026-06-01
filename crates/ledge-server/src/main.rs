@@ -6,6 +6,14 @@ use ledge_ref_store::RefStoreImpl;
 use ledge_server::{build_app, config::LedgeConfig, AppState};
 use tracing::info;
 
+/// The selected storage seams: the `dyn ObjectStore` seam, the `dyn RefStore`
+/// seam, and the optional per-shard Raft handles (`Some` only in cluster mode).
+type StorageSeams = (
+    Arc<dyn ledge_core::ObjectStore>,
+    Arc<dyn ledge_core::RefStore>,
+    Option<Arc<ledge_server::routes::ClusterHandles>>,
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "ledge", version, about)]
 struct Cli {
@@ -50,13 +58,90 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(&cfg.server.data_dir);
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.clone())?);
-    let refs = Arc::new(RefStoreImpl::open(data_dir.clone(), hlc.clone())?);
     ledge_server::metrics::install_recorder()?;
 
-    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+    // ── Storage seam selection ───────────────────────────────────────────────
+    // single-node (default): the dyn RefStore/ObjectStore seams are the same
+    // concrete local stores, up-cast — byte-identical to Phase 1/2.
+    // clustered (cfg.cluster.enabled): the dyn seams are the ClusterRefStore /
+    // ReplicatedObjectStore over per-shard Raft, plus the per-shard handles for
+    // the /raft + /cluster routes and the metrics poller.
+    let (objects_dyn, refs_dyn, raft_shards): StorageSeams = if cfg.cluster.enabled {
+        let peers: std::collections::HashMap<u64, String> = cfg
+            .cluster
+            .peers
+            .iter()
+            .map(|p| (p.id, p.addr.clone()))
+            .collect();
+        // openraft timer config: production-leaning defaults; election window
+        // comfortably above the heartbeat so a stable leader holds the lease.
+        let raft_config = Arc::new(
+            openraft::Config {
+                heartbeat_interval: 250,
+                election_timeout_min: 1000,
+                election_timeout_max: 2000,
+                ..Default::default()
+            }
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid raft config: {e}"))?,
+        );
+        info!(
+            node_id = cfg.cluster.node_id,
+            num_shards = cfg.cluster.num_shards,
+            peers = peers.len(),
+            "cluster mode enabled: assembling per-shard Raft groups"
+        );
+        let stack = ledge_server::build_cluster_stack(
+            data_dir.clone(),
+            objects.clone(),
+            hlc.clone(),
+            cfg.cluster.node_id,
+            cfg.cluster.num_shards,
+            peers,
+            raft_config,
+        )
+        .await?;
+
+        // ── Per-shard Raft metrics poller (cluster only) ─────────────────────
+        // One task per shard, watching that shard's metrics `watch::Receiver`
+        // and projecting into the per-shard gauges. Single-node never starts
+        // this, so those series are absent and /metrics is unchanged.
+        for (shard, raft) in stack.shards.iter() {
+            let shard_n = shard.0;
+            let mut rx = raft.metrics();
+            tokio::spawn(async move {
+                loop {
+                    {
+                        let m = rx.borrow().clone();
+                        ledge_server::metrics::record_raft_metrics(
+                            shard_n,
+                            m.current_leader,
+                            m.current_term,
+                            m.last_applied.map(|l| l.index),
+                            m.last_applied.map(|l| l.index),
+                        );
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // Raft shut down: the metrics channel closed.
+                    }
+                }
+            });
+        }
+
+        (stack.objects, stack.refs, Some(stack.shards))
+    } else {
+        let refs = Arc::new(RefStoreImpl::open(data_dir.clone(), hlc.clone())?);
+        (
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs as Arc<dyn ledge_core::RefStore>,
+            None,
+        )
+    };
+
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack_dyn(
         data_dir.clone(),
         objects.clone(),
-        refs.clone(),
+        refs_dyn.clone(),
         hlc.clone(),
     )?;
 
@@ -121,18 +206,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = build_app(AppState {
-        // Single-node: the object/ref trait seams are the same concrete stores,
-        // up-cast. raft_shards = None ⇒ the /raft and /cluster handlers report
-        // not-clustered (503); every existing path is byte-identical to Phase 2.
-        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
+        // concrete local stores up-cast in single-node mode (byte-identical to
+        // Phase 2), or the ClusterRefStore/ReplicatedObjectStore in cluster mode.
+        // `objects_disk` is always the node-local concrete store (git/RPC/GC).
+        // `raft_shards` is None single-node ⇒ /raft + /cluster report 503.
+        objects: objects_dyn,
         objects_disk: objects.clone(),
-        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        refs: refs_dyn,
         workspaces,
         leases,
         gc,
         default_ttl_secs: cfg.workspace.default_ttl_secs,
         data_dir: data_dir.clone(),
-        raft_shards: None,
+        raft_shards,
     });
     let addr: SocketAddr = cfg
         .server
