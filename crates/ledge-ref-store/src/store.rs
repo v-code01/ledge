@@ -164,6 +164,171 @@ impl RefStoreImpl {
 }
 
 // ---------------------------------------------------------------------------
+// AppliedOp / AppliedOutcome — deterministic, pre-resolved replicated ops
+// ---------------------------------------------------------------------------
+
+/// A pre-resolved, replicable ref operation.
+///
+/// Unlike `RefStore::update`/`delete`, the HLC is **caller-supplied** (assigned
+/// by the Raft leader at propose time and carried in the log entry), so every
+/// replica applying the same committed log prefix produces byte-identical state.
+/// The ledge-raft `LedgeOp` converts into this at apply time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppliedOp {
+    /// Create-or-update under CAS, stamping the entry with `hlc`.
+    Update {
+        name: RefName,
+        target: ObjectId,
+        expected: Option<ObjectId>,
+        hlc: u64,
+    },
+    /// Delete under CAS; `hlc` records the tombstone time in the WAL.
+    Delete {
+        name: RefName,
+        expected: ObjectId,
+        hlc: u64,
+    },
+}
+
+/// The deterministic result of applying an `AppliedOp`.
+///
+/// This is the canonical per-op outcome the Raft state machine maps to
+/// `LedgeResp`. It mirrors the success/`Conflict`/`NotFound` cases of the
+/// single-node `update`/`delete` but as a value (no `Result`) because the
+/// state machine must surface every outcome to the client through consensus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppliedOutcome {
+    /// Ref was created or updated; carries the committed entry.
+    Updated(RefEntry),
+    /// CAS precondition failed; carries the current entry observed at apply.
+    Conflict(RefEntry),
+    /// Target ref did not exist for an update-with-expected or a delete.
+    NotFound,
+    /// Ref was deleted.
+    Deleted,
+}
+
+impl RefStoreImpl {
+    /// Deterministically apply a pre-resolved op using the supplied `hlc`
+    /// (no internal `hlc.tick()`).
+    ///
+    /// Same CAS semantics as `update`/`delete`, but the `hlc` is caller-supplied
+    /// so all Raft replicas agree on every `RefEntry` byte-for-byte. This is the
+    /// replicated apply path; single-node callers keep using `update`/`delete`.
+    ///
+    /// # Determinism
+    /// The outcome is a pure function of `(applied_state, op)`. openraft applies
+    /// committed entries in log order one at a time, so the CAS loop swaps on its
+    /// first attempt in practice; the loop is retained only to share the proven
+    /// lock-free shape and remain correct under hypothetical concurrent calls.
+    ///
+    /// # Side effects
+    /// On success, appends to the WAL exactly like `update`/`delete` for crash
+    /// durability of the applied state.
+    #[instrument(skip(self, op))]
+    pub async fn apply_op(&self, op: &AppliedOp) -> AppliedOutcome {
+        match op {
+            AppliedOp::Update { name, target, expected, hlc } => {
+                let key = name.as_str().as_bytes().to_vec();
+                loop {
+                    let current_arc = self.root.load_full();
+                    let current_root = current_arc.as_ref();
+                    let current_entry: Option<RefEntry> = match current_root {
+                        None => None,
+                        Some(root) => art_lookup(root, &key, 0).cloned(),
+                    };
+
+                    // Same precondition checks as `update`, returned as outcomes.
+                    match (&current_entry, expected) {
+                        (Some(existing), None) => {
+                            return AppliedOutcome::Conflict(existing.clone());
+                        }
+                        (None, Some(_)) => {
+                            return AppliedOutcome::NotFound;
+                        }
+                        (Some(existing), Some(exp_oid)) if existing.target != *exp_oid => {
+                            return AppliedOutcome::Conflict(existing.clone());
+                        }
+                        _ => {}
+                    }
+
+                    let new_version =
+                        current_entry.as_ref().map(|e| e.version + 1).unwrap_or(1);
+                    debug_assert!(new_version >= 1, "version invariant: version >= 1");
+
+                    // CRITICAL: use the SUPPLIED hlc, never self.hlc.tick().
+                    let new_entry = RefEntry {
+                        target: *target,
+                        hlc: *hlc,
+                        version: new_version,
+                    };
+
+                    let new_root = art_insert(current_root.clone(), &key, new_entry.clone(), 0);
+                    let new_root_arc = Arc::new(Some(new_root));
+                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    if Arc::ptr_eq(&prev, &current_arc) {
+                        // WAL append; on I/O failure, log and still return the
+                        // logical outcome — the replicated apply must be
+                        // deterministic regardless of local disk transients
+                        // (Task 6 hardens durable-log fsync ordering).
+                        if let Err(e) = self
+                            .wal
+                            .append(&WalEntry::Update {
+                                name: name.as_str().to_string(),
+                                entry: new_entry.clone(),
+                            })
+                            .await
+                        {
+                            warn!("apply_op Update WAL append failed: {e:?}");
+                        }
+                        return AppliedOutcome::Updated(new_entry);
+                    }
+                    // CAS lost — reload and retry.
+                }
+            }
+            AppliedOp::Delete { name, expected, hlc } => {
+                let key = name.as_str().as_bytes().to_vec();
+                loop {
+                    let current_arc = self.root.load_full();
+                    let current_root = current_arc.as_ref();
+                    let current_entry: RefEntry = match current_root {
+                        None => return AppliedOutcome::NotFound,
+                        Some(root) => match art_lookup(root, &key, 0) {
+                            None => return AppliedOutcome::NotFound,
+                            Some(e) => e.clone(),
+                        },
+                    };
+                    if current_entry.target != *expected {
+                        return AppliedOutcome::Conflict(current_entry);
+                    }
+
+                    let new_root_opt = match current_root {
+                        None => None,
+                        Some(root) => art_delete(Arc::clone(root), &key, 0),
+                    };
+                    let new_root_arc = Arc::new(new_root_opt);
+                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    if Arc::ptr_eq(&prev, &current_arc) {
+                        if let Err(e) = self
+                            .wal
+                            .append(&WalEntry::Delete {
+                                name: name.as_str().to_string(),
+                                hlc: *hlc, // supplied hlc, not tick()
+                            })
+                            .await
+                        {
+                            warn!("apply_op Delete WAL append failed: {e:?}");
+                        }
+                        return AppliedOutcome::Deleted;
+                    }
+                    // CAS lost — retry.
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RefStore implementation
 // ---------------------------------------------------------------------------
 
@@ -465,6 +630,122 @@ mod tests {
         assert_eq!(snap.get(&n).unwrap().target, t1, "snapshot must be isolated from writes");
         // Live store reflects t2.
         assert_eq!(store.get(&n).await.unwrap().unwrap().target, t2);
+    }
+
+    // ── apply_op: deterministic explicit-HLC apply path ─────────────────────────
+
+    #[tokio::test]
+    async fn apply_op_update_creates_with_supplied_hlc() {
+        let store = make_store();
+        let n = name("refs/heads/applied");
+        let t = oid(1);
+        let outcome = store
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: t,
+                expected: None,
+                hlc: 777,
+            })
+            .await;
+        match outcome {
+            AppliedOutcome::Updated(entry) => {
+                assert_eq!(entry.target, t);
+                assert_eq!(entry.version, 1, "first write is version 1");
+                assert_eq!(entry.hlc, 777, "apply_op must use the SUPPLIED hlc, not tick()");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        // Visible through the normal read path.
+        let got = store.get(&n).await.unwrap().unwrap();
+        assert_eq!(got.hlc, 777);
+        assert_eq!(got.target, t);
+    }
+
+    #[tokio::test]
+    async fn apply_op_update_version_increments_with_supplied_hlc() {
+        let store = make_store();
+        let n = name("refs/heads/appliedv");
+        let (t1, t2) = (oid(1), oid(2));
+        let _ = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: t1, expected: None, hlc: 10 })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: t2, expected: Some(t1), hlc: 20 })
+            .await;
+        match outcome {
+            AppliedOutcome::Updated(e) => {
+                assert_eq!(e.version, 2);
+                assert_eq!(e.hlc, 20);
+                assert_eq!(e.target, t2);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_op_update_wrong_expected_is_conflict() {
+        let store = make_store();
+        let n = name("refs/heads/appliedcas");
+        let _ = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(1), expected: None, hlc: 1 })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(2), expected: Some(oid(99)), hlc: 2 })
+            .await;
+        match outcome {
+            AppliedOutcome::Conflict(current) => {
+                assert_eq!(current.target, oid(1), "conflict surfaces the current entry");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_op_create_existing_is_conflict() {
+        let store = make_store();
+        let n = name("refs/heads/applieddup");
+        let _ = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(1), expected: None, hlc: 1 })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(2), expected: None, hlc: 2 })
+            .await;
+        assert!(matches!(outcome, AppliedOutcome::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_op_delete_then_missing() {
+        let store = make_store();
+        let n = name("refs/heads/applieddel");
+        let t = oid(0xdd);
+        let _ = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: t, expected: None, hlc: 1 })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: t, hlc: 2 })
+            .await;
+        assert!(matches!(outcome, AppliedOutcome::Deleted));
+        assert!(store.get(&n).await.unwrap().is_none());
+
+        // Deleting a now-missing ref → NotFound.
+        let outcome = store
+            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: t, hlc: 3 })
+            .await;
+        assert!(matches!(outcome, AppliedOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn apply_op_delete_wrong_expected_is_conflict() {
+        let store = make_store();
+        let n = name("refs/heads/applieddelcas");
+        let _ = store
+            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(0xaa), expected: None, hlc: 1 })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: oid(0xbb), hlc: 2 })
+            .await;
+        assert!(matches!(outcome, AppliedOutcome::Conflict(_)));
+        assert!(store.get(&n).await.unwrap().is_some(), "ref survives a failed delete");
     }
 
     // ── 9. WAL replay durability ─────────────────────────────────────────────
