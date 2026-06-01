@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_pack_two_objects() {
+    fn encode_pack_one_object() {
         let sha1_a = make_sha1(0x10);
         let p = encode_pack(&[(&sha1_a, Bytes::from(b"hello world".to_vec()))]);
         assert_eq!(&p[..4], b"PACK");
