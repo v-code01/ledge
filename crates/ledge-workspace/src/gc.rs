@@ -31,7 +31,7 @@ pub struct Gc {
 /// - `reachable` — objects reachable from the snapshotted root set.
 /// - `reclaimed` — candidate objects deleted this pass.
 /// - `bytes_freed` — sum of on-disk file sizes of the reclaimed objects.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GcStats {
     pub scanned: usize,
     pub reachable: usize,
