@@ -2,6 +2,7 @@ use crate::pkt_line::{decode_line, encode, encode_flush, PktLine};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ledge_core::{LedgeError, ObjectId, ObjectStore, RefStore};
+use ledge_object_store::graph::{commit_parent_sha1s, commit_tree_sha1, tree_child_sha1s};
 use ledge_object_store::DiskObjectStore;
 use std::sync::Arc;
 
@@ -82,82 +83,6 @@ fn kind_from_type_byte(type_byte: u8) -> GitObjectKind {
         4 => GitObjectKind::Tag,
         _ => GitObjectKind::Blob,
     }
-}
-
-/// Decode a 40-char lowercase hex SHA-1 into 20 raw bytes.
-fn parse_hex_sha1(hex_str: &str) -> Option<[u8; 20]> {
-    if hex_str.len() != 40 {
-        return None;
-    }
-    let bytes = hex::decode(hex_str).ok()?;
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
-}
-
-/// Extract the `tree` SHA-1 from a git commit object body.
-///
-/// A commit body is a header block of `key SP value LF` lines (the first line
-/// is always `tree <40-hex-sha1>`), a blank line, then the message.
-fn commit_tree_sha1(content: &[u8]) -> Option<[u8; 20]> {
-    let text = std::str::from_utf8(content).ok()?;
-    for line in text.lines() {
-        if line.is_empty() {
-            break; // end of header block
-        }
-        if let Some(rest) = line.strip_prefix("tree ") {
-            return parse_hex_sha1(rest.trim());
-        }
-    }
-    None
-}
-
-/// Extract all `parent` SHA-1s from a git commit object body (0+ entries).
-fn commit_parent_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
-    let mut parents = Vec::new();
-    if let Ok(text) = std::str::from_utf8(content) {
-        for line in text.lines() {
-            if line.is_empty() {
-                break; // end of header block
-            }
-            if let Some(rest) = line.strip_prefix("parent ") {
-                if let Some(sha1) = parse_hex_sha1(rest.trim()) {
-                    parents.push(sha1);
-                }
-            }
-        }
-    }
-    parents
-}
-
-/// Extract all child SHA-1s referenced by a git tree object body.
-///
-/// A tree body is a packed sequence of entries:
-/// ```text
-/// <mode-ascii> SP <name> NUL <20-byte-raw-sha1>
-/// ```
-/// Both sub-trees and blobs are returned; the BFS resolves each by SHA-1.
-fn tree_child_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
-    let mut children = Vec::new();
-    let mut pos = 0usize;
-    while pos < content.len() {
-        // Find the NUL terminating "<mode> <name>".
-        let nul = match content[pos..].iter().position(|&b| b == 0) {
-            Some(n) => pos + n,
-            None => break,
-        };
-        // The 20-byte SHA-1 immediately follows the NUL.
-        let sha1_start = nul + 1;
-        let sha1_end = sha1_start + 20;
-        if sha1_end > content.len() {
-            break;
-        }
-        let mut sha1 = [0u8; 20];
-        sha1.copy_from_slice(&content[sha1_start..sha1_end]);
-        children.push(sha1);
-        pos = sha1_end;
-    }
-    children
 }
 
 /// Encode the git pack object type-and-size varint.

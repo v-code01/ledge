@@ -221,6 +221,76 @@ impl DiskObjectStore {
         Ok(map)
     }
 
+    /// Enumerate the [`ObjectId`] of every loose object currently stored.
+    ///
+    /// Walks the same `<data_dir>/objects/<XX>/<YY>/<id>` fan-out as
+    /// [`Self::sha1_index`], skipping the `tmp/` staging dir, but stops at the
+    /// filename: each 64-hex file name is parsed straight into an `ObjectId`
+    /// with no header read. This is the candidate-set source for GC
+    /// (mark-and-sweep): every id returned here is a deletion candidate unless
+    /// proven reachable.
+    ///
+    /// A missing `objects/` directory yields an empty vector (a freshly opened,
+    /// never-written store). Non-directory entries and names that are not
+    /// 64-hex are skipped defensively.
+    ///
+    /// Complexity: O(N) in the number of stored objects; no file contents are
+    /// opened, so it is strictly cheaper than [`Self::sha1_index`].
+    pub async fn list_all_ids(&self) -> ledge_core::Result<Vec<ObjectId>> {
+        let mut ids = Vec::new();
+        let objects_dir = self.data_dir.join("objects");
+        let mut lvl1 = match tokio::fs::read_dir(&objects_dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(e) => return Err(LedgeError::Io(e)),
+        };
+        while let Some(d1) = lvl1.next_entry().await.map_err(LedgeError::Io)? {
+            // Skip the write-staging directory; only 2-hex fan-out dirs hold objects.
+            if d1.file_name() == std::ffi::OsStr::new("tmp") {
+                continue;
+            }
+            if !d1.file_type().await.map_err(LedgeError::Io)?.is_dir() {
+                continue;
+            }
+            let mut lvl2 = tokio::fs::read_dir(d1.path()).await.map_err(LedgeError::Io)?;
+            while let Some(d2) = lvl2.next_entry().await.map_err(LedgeError::Io)? {
+                if !d2.file_type().await.map_err(LedgeError::Io)?.is_dir() {
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(d2.path()).await.map_err(LedgeError::Io)?;
+                while let Some(f) = files.next_entry().await.map_err(LedgeError::Io)? {
+                    let name = f.file_name();
+                    let hex = match name.to_str() {
+                        Some(h) if h.len() == 64 => h,
+                        _ => continue,
+                    };
+                    if let Ok(id) = ObjectId::from_hex(hex) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Remove the object file for `id`.
+    ///
+    /// **Idempotent:** a missing file is treated as success (`Ok(())`), because
+    /// GC sweeps and lease release may both attempt to delete the same object,
+    /// and a crash mid-sweep means the next pass re-attempts deletes that have
+    /// already happened. Only the empty leaf file is removed; the `<XX>/<YY>/`
+    /// fan-out directories are intentionally left in place to avoid an rmdir
+    /// race with a concurrent writer creating a sibling object.
+    ///
+    /// Any I/O error other than "not found" is surfaced as [`LedgeError::Io`].
+    pub async fn delete(&self, id: ObjectId) -> ledge_core::Result<()> {
+        match tokio::fs::remove_file(self.object_path(&id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LedgeError::Io(e)),
+        }
+    }
+
     /// Read the git object type byte from the header (reserved[0]).
     pub async fn git_type_of(&self, id: ObjectId) -> ledge_core::Result<u8> {
         use tokio::io::AsyncReadExt as _;
@@ -351,6 +421,48 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = DiskObjectStore::new(dir.path().to_path_buf()).unwrap();
         (store, dir)
+    }
+
+    #[tokio::test]
+    async fn list_all_ids_returns_every_written_object() {
+        let (store, _dir) = make_store();
+        // Write three distinct objects (distinct content → distinct ids).
+        let id_a = store.write(Bytes::from_static(b"alpha")).await.unwrap();
+        let id_b = store.write(Bytes::from_static(b"beta")).await.unwrap();
+        let id_c = store.write(Bytes::from_static(b"gamma")).await.unwrap();
+
+        let mut ids = store.list_all_ids().await.unwrap();
+        ids.sort_by_key(|id| *id.as_bytes());
+
+        let mut expected = vec![id_a, id_b, id_c];
+        expected.sort_by_key(|id| *id.as_bytes());
+
+        assert_eq!(ids, expected, "list_all_ids must return exactly the written ids");
+    }
+
+    #[tokio::test]
+    async fn list_all_ids_empty_store_is_empty() {
+        let (store, _dir) = make_store();
+        assert!(store.list_all_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_object_then_exists_is_false() {
+        let (store, _dir) = make_store();
+        let id = store.write(Bytes::from_static(b"to be deleted")).await.unwrap();
+        assert!(store.exists(id).await.unwrap());
+        store.delete(id).await.unwrap();
+        assert!(!store.exists(id).await.unwrap(), "object must be gone after delete");
+    }
+
+    #[tokio::test]
+    async fn delete_missing_id_is_ok() {
+        let (store, _dir) = make_store();
+        // Deleting an id that was never written is a no-op (idempotent).
+        store
+            .delete(ObjectId::from_bytes([0x11u8; 32]))
+            .await
+            .expect("delete of a missing object must be Ok");
     }
 
     // ── Task 8: write path ────────────────────────────────────────────────────
