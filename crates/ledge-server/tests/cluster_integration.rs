@@ -1,4 +1,4 @@
-//! Cluster control-plane route tests (Phase 3, Task 7B).
+//! Cluster control-plane route tests (Phase 3, Task 7B + Task 9.2 decision).
 //!
 //! Covers three properties:
 //! 1. `cluster_routes_503_when_disabled` — a default (single-node) `AppState`
@@ -10,6 +10,26 @@
 //! 3. `raft_append_endpoint_feeds_local_raft` — a bincode heartbeat
 //!    `AppendEntriesRequest` POSTed to `/raft/0/append` round-trips a decodable
 //!    `AppendEntriesResponse` (the server side of the Task 6 HTTP transport).
+//!
+//! # Task 9.2 — server-level localhost HTTP cluster smoke (decision)
+//! The plan calls for a 2–3 node localhost HTTP cluster smoke (bootstrap → elect
+//! → one replicated write over the real transport). That smoke IS implemented and
+//! runs by default — it lives in `ledge-cluster`'s `net_http` test module as
+//! `localhost_http_cluster_bootstrap_elect_replicate`: three Axum servers, each
+//! serving the identical `POST /raft/{shard}/{kind}` route shape these handlers
+//! serve, with each node's `Raft` driven over `HttpRaftNetworkFactory`. It elects
+//! a leader purely over HTTP and replicates a committed `client_write` to all
+//! three state machines. It is deterministic in-process (bounded metrics polling,
+//! no fixed sleeps), so it is NOT `#[ignore]`d.
+//!
+//! This file keeps the server-level coverage at the *route-handler* granularity
+//! (the three tests above) because a multi-process `ledge-server` cluster would
+//! add no consensus coverage beyond that smoke: the route handlers here are thin
+//! wrappers over `handle_rpc` / `Raft::metrics` / `Raft::initialize`, each tested
+//! directly, and the end-to-end HTTP consensus path is the cluster-crate smoke.
+//! Together — in-memory safety proof (Tasks 3 / 9.1) + per-RPC serde + live HTTP
+//! RPC + the 3-node HTTP smoke + these route tests — the HTTP surface is fully
+//! exercised without a flaky multi-process harness.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

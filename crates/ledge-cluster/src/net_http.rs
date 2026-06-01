@@ -687,6 +687,201 @@ mod tests {
         server.abort();
     }
 
+    // ── Server-level localhost HTTP cluster smoke (Task 9.2) ─────────────────
+    //
+    // A genuine 3-node cluster over the REAL HTTP transport: each node runs an
+    // Axum server exposing `POST /raft/{shard}/{kind}` (the exact route shape
+    // `ledge-server`'s `cluster_routes` serve), and each node's `Raft` drives its
+    // peers through `HttpRaftNetworkFactory` pointed at the others' ephemeral
+    // ports. We bootstrap membership, await a leader elected purely over HTTP
+    // RPCs, commit one ref via `client_write`, and assert the commit replicates
+    // and applies on ALL three nodes' state machines.
+    //
+    // This is the localhost-cluster smoke the plan calls for: it is achievable
+    // and deterministic in-process (bounded metrics polling, no fixed sleeps),
+    // so it runs by default rather than `#[ignore]`. It complements — does not
+    // replace — the in-memory-network safety proof (Task 3 / Task 9.1): election
+    // and replication correctness are proven there; this proves the HTTP wire
+    // path carries them end-to-end across separate servers.
+
+    use crate::router::ShardRouter;
+    use ledge_core::ObjectId as _ObjectId;
+    use ledge_raft::{LedgeOp, LedgeResp};
+    use openraft::ServerState;
+    use std::collections::BTreeMap;
+
+    /// One HTTP-served node in the smoke cluster: its Raft handle and the Axum
+    /// server task serving its `/raft/*` endpoints.
+    struct HttpNode {
+        id: NodeId,
+        raft: openraft::Raft<TypeConfig>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// Boot one node: build its `Raft` over HTTP networking to `peers`, bind an
+    /// Axum server on an ephemeral port, and return the assembled handle. The
+    /// listener is bound BEFORE `Raft::new` so the address is known for the peer
+    /// table, and the server is spawned immediately so inbound RPCs are served as
+    /// soon as elections begin.
+    async fn boot_http_node(
+        id: NodeId,
+        shard: ShardId,
+        listener: tokio::net::TcpListener,
+        peers: HashMap<NodeId, PeerAddr>,
+    ) -> HttpNode {
+        use axum::extract::{Path, State};
+        use axum::routing::post;
+        use axum::Router;
+
+        let log = LogStore::default();
+        let sm = StateMachineStore::new_temp().await;
+        let net = HttpRaftNetworkFactory::new(shard, peers);
+        let raft = openraft::Raft::new(id, raft_config(), net, log, sm)
+            .await
+            .expect("Raft::new over HTTP net");
+
+        async fn route(
+            State(raft): State<Arc<openraft::Raft<TypeConfig>>>,
+            path: Path<(u32, String)>,
+            body: axum::body::Bytes,
+        ) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+            let (shard, kind_seg) = path.0;
+            let kind = RpcKind::from_path(&kind_seg)
+                .ok_or((axum::http::StatusCode::NOT_FOUND, "bad kind".into()))?;
+            handle_rpc(ShardId(shard), kind, &body, &raft)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))
+        }
+
+        let app = Router::new()
+            .route("/raft/{shard}/{kind}", post(route))
+            .with_state(Arc::new(raft.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        HttpNode { id, raft, server }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn localhost_http_cluster_bootstrap_elect_replicate() {
+        let shard = ShardId(0);
+        let ids = [1u64, 2, 3];
+
+        // Bind all listeners first so every node's address is known before any
+        // Raft is constructed (peers reference each other).
+        let mut listeners = Vec::new();
+        let mut addrs: HashMap<NodeId, PeerAddr> = HashMap::new();
+        for &id in &ids {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = format!("http://{}", l.local_addr().unwrap());
+            addrs.insert(id, a);
+            listeners.push((id, l));
+        }
+
+        // Boot every node with the full peer table (each excludes only itself).
+        let mut nodes: BTreeMap<NodeId, HttpNode> = BTreeMap::new();
+        for (id, listener) in listeners {
+            let peers: HashMap<NodeId, PeerAddr> = addrs
+                .iter()
+                .filter(|(k, _)| **k != id)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let node = boot_http_node(id, shard, listener, peers).await;
+            nodes.insert(id, node);
+        }
+
+        // Bootstrap membership on node 1 (members carry their HTTP addrs, so a
+        // node added without a static peer entry is still reachable via BasicNode).
+        let members: BTreeMap<NodeId, Node> = ids
+            .iter()
+            .map(|&id| (id, Node::new(addrs[&id].clone())))
+            .collect();
+        nodes[&1]
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize over HTTP");
+
+        // Await a leader elected purely over the HTTP transport (bounded poll).
+        let leader_id = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let mut found = None;
+                for n in nodes.values() {
+                    let m = n.raft.metrics().borrow().clone();
+                    if m.state == ServerState::Leader {
+                        found = Some(n.id);
+                        break;
+                    }
+                }
+                if let Some(l) = found {
+                    break l;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no leader elected over HTTP within 15s"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        // One replicated write through the leader's `client_write` (the op crosses
+        // the HTTP transport to reach a commit quorum).
+        let router = ShardRouter::new(1);
+        let ref_name = "refs/workspaces/acme/main";
+        assert_eq!(router.shard_for(ref_name), shard, "route lands on shard 0");
+        let resp = nodes[&leader_id]
+            .raft
+            .client_write::<tokio::sync::oneshot::error::RecvError>(LedgeOp::RefUpdate {
+                name: ref_name.to_string(),
+                target_bytes: [0xab; 32],
+                expected_bytes: None,
+                hlc: 1,
+            })
+            .await
+            .expect("client_write over HTTP cluster");
+        assert!(matches!(resp.data, LedgeResp::RefUpdated(_)));
+
+        // The committed ref must replicate + apply on ALL three nodes' SMs (the
+        // followers receive the entry via HTTP append-entries). Poll each node's
+        // metrics until last_applied advances past the membership entry, then read.
+        let want = _ObjectId::from_bytes([0xab; 32]);
+        for n in nodes.values() {
+            let mut ok = false;
+            for _ in 0..300 {
+                let m = n.raft.metrics().borrow().clone();
+                if m.last_applied.map(|l| l.index).unwrap_or(0) >= 2 {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(ok, "node {} did not apply the committed write", n.id);
+        }
+        // Read back through the leader's applied SM for a concrete value check.
+        let leader_resp = nodes[&leader_id]
+            .raft
+            .client_write::<tokio::sync::oneshot::error::RecvError>(LedgeOp::RefUpdate {
+                name: ref_name.to_string(),
+                target_bytes: [0xab; 32],
+                expected_bytes: Some([0xab; 32]),
+                hlc: 2,
+            })
+            .await
+            .expect("idempotent CAS confirms applied value over HTTP");
+        match leader_resp.data {
+            LedgeResp::RefUpdated(e) => assert_eq!(e.target, want),
+            other => panic!("expected RefUpdated confirming applied value, got {other:?}"),
+        }
+
+        // Tear down: shut every Raft and abort its server task.
+        for (_, n) in nodes {
+            n.raft.shutdown().await.ok();
+            n.server.abort();
+        }
+    }
+
     // ── Object replication transport tests ───────────────────────────────────
 
     use crate::object_store::{ObjectPeer, ReplicatedObjectStore};

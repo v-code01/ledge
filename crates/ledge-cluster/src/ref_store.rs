@@ -108,7 +108,17 @@ async fn leader_handle(replicas: &[ShardHandle], shard: ShardId) -> Result<&Shar
             // node whose id is 0 with the no-leader case.)
             if let Some(leader) = h.raft.metrics().borrow().current_leader {
                 if let Some(lead) = replicas.iter().find(|r| r.node_id == leader) {
-                    return Ok(lead);
+                    // A `current_leader` pointer can be STALE: after the prior
+                    // leader crashes, a lagging follower (or the crashed node's own
+                    // frozen metrics) may still name the dead node. Only trust the
+                    // pointer if the named replica itself confirms it is the leader
+                    // — a crashed / deposed node never reports `Leader`. This keeps
+                    // failover deterministic (no write/read landing on a corpse) and
+                    // is strictly correct in production too (the resolved leader must
+                    // be live to accept the write).
+                    if lead.raft.metrics().borrow().state == openraft::ServerState::Leader {
+                        return Ok(lead);
+                    }
                 }
             }
         }

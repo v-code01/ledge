@@ -375,6 +375,67 @@ impl MultiShardCluster {
         names
     }
 
+    /// Crash one replica of `shard`: shut its Raft down AND deregister it from
+    /// the network so peers observe it as `Unreachable` (a hard partition, the
+    /// shape the failover path relies on). The dead `ShardReplica` is left in
+    /// `replicas` so handle indexing stays stable; it simply never wins another
+    /// election. Returns once the node's `Raft` has fully shut down.
+    pub async fn kill_replica(&self, shard: ShardId, node: NodeId) {
+        let reps = self.replicas.get(&shard).expect("shard exists");
+        let rep = reps.iter().find(|r| r.node == node).expect("replica exists");
+        rep.raft.shutdown().await.expect("raft shutdown");
+        self.registry.deregister(shard, node);
+    }
+
+    /// Poll until `shard` elects a leader that is NOT `excluded` (used after
+    /// killing the prior leader to confirm a *new* one emerged). Bounded poll on
+    /// the metrics watch — no fixed sleep gates correctness.
+    pub async fn wait_for_new_leader(&self, shard: ShardId, excluded: NodeId) -> NodeId {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reps = self.replicas.get(&shard).expect("shard exists");
+        loop {
+            for r in reps {
+                if r.node == excluded {
+                    continue;
+                }
+                let m = r.raft.metrics().borrow().clone();
+                if let Some(l) = m.current_leader {
+                    if l != excluded {
+                        if let Some(lr) = reps.iter().find(|x| x.node == l) {
+                            if lr.raft.metrics().borrow().state == ServerState::Leader {
+                                return l;
+                            }
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("shard {shard:?}: no NEW leader (excluding {excluded}) within 10s");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Has any *live* replica of `shard` (excluding `dead`) applied `name`? Polls
+    /// briefly so post-failover follower application is observed deterministically.
+    pub async fn surviving_replica_has_ref(
+        &self,
+        shard: ShardId,
+        dead: NodeId,
+        name: &ledge_core::RefName,
+    ) -> bool {
+        let reps = self.replicas_of(shard);
+        for _ in 0..300 {
+            for r in reps {
+                if r.node != dead && r.sm.applied_ref(name.as_str()).await.is_some() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     /// Wait until every replica of `shard` has applied the same number of refs
     /// as the leader's applied ref count, i.e. replication has caught up.
     pub async fn await_applied(&self, shard: ShardId, name: &ledge_core::RefName) {
