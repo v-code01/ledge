@@ -1598,6 +1598,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bincode",
+ "crc32fast",
  "ledge-core",
  "ledge-ref-store",
  "ledge-workspace",

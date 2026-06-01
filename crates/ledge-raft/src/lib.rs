@@ -18,11 +18,13 @@
 //! - `apply` returns `Result<Vec<C::R>, StorageError<C::NodeId>>` (no 0.10
 //!   `EntryResponder`/`IOFlushed`).
 pub mod log_store;
+pub mod log_wal;
 pub mod op;
 pub mod state_machine;
 pub mod type_config;
 
 pub use log_store::LogStore;
+pub use log_wal::WalLogStore;
 pub use op::{outcome_to_resp, LedgeOp, LedgeResp};
 pub use state_machine::{ReadHandle, StateMachineStore};
 pub use type_config::TypeConfig;
