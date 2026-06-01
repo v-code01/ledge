@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use ledge_core::{RefEntry, RefName, HLC};
 use ledge_ref_store::RefStoreImpl;
+use ledge_workspace::id::WorkspaceId;
 use ledge_workspace::lease::{Lease, LeaseStore};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -233,6 +234,49 @@ impl ReadHandle {
     pub async fn applied_leases(&self) -> Vec<Lease> {
         let leases = self.stores.load().leases.clone();
         leases.live(0).await.unwrap_or_default()
+    }
+
+    /// All applied refs whose name starts with `prefix`, as `(RefName, RefEntry)`
+    /// pairs. Backs the clustered `list`/`snapshot` fan-out: a cheap single
+    /// `ArcSwap` load + ART prefix scan over the local applied state.
+    pub async fn applied_refs_with_prefix(&self, prefix: &str) -> Vec<(RefName, RefEntry)> {
+        use ledge_core::RefStore;
+        let refs = self.stores.load().refs.clone();
+        refs.list(prefix).await.unwrap_or_default()
+    }
+
+    /// The full applied ref map (every ref → entry). Used by the clustered
+    /// snapshot merge; equivalent to `applied_refs_with_prefix("")`.
+    pub async fn applied_ref_map(&self) -> Vec<(RefName, RefEntry)> {
+        self.applied_refs_with_prefix("").await
+    }
+
+    /// The full applied ref map, read SYNCHRONOUSLY via the ref store's
+    /// lock-free `snapshot()` (an O(1) atomic load + sync prefix scan). This
+    /// backs the trait's sync `RefStore::snapshot()`, which cannot `.await`.
+    pub fn applied_ref_map_sync(&self) -> Vec<(RefName, RefEntry)> {
+        use ledge_core::RefStore;
+        let refs = self.stores.load().refs.clone();
+        refs.snapshot().list("")
+    }
+
+    /// The applied lease for `id`, or `None` if absent/tombstoned. Reads the
+    /// local applied lease index directly (no Raft round-trip).
+    pub async fn applied_lease(&self, id: WorkspaceId) -> Option<Lease> {
+        let leases = self.stores.load().leases.clone();
+        leases.get(id).await.unwrap_or(None)
+    }
+
+    /// All applied leases live at `now_ms` (expiry strictly after `now_ms`).
+    pub async fn applied_leases_live(&self, now_ms: u64) -> Vec<Lease> {
+        let leases = self.stores.load().leases.clone();
+        leases.live(now_ms).await.unwrap_or_default()
+    }
+
+    /// All applied leases expired at `now_ms` (expiry at or before `now_ms`).
+    pub async fn applied_leases_expired(&self, now_ms: u64) -> Vec<Lease> {
+        let leases = self.stores.load().leases.clone();
+        leases.expired(now_ms).await.unwrap_or_default()
     }
 }
 
