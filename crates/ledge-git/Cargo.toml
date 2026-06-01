@@ -8,14 +8,17 @@ license.workspace     = true
 authors.workspace     = true
 
 [dependencies]
-ledge-core    = { path = "../ledge-core" }
-bytes.workspace       = true
-tokio.workspace       = true
+ledge-core         = { path = "../ledge-core" }
+ledge-object-store = { path = "../ledge-object-store" }
+blake3.workspace   = true
+sha1.workspace     = true
+bytes.workspace    = true
+tokio.workspace    = true
 async-trait.workspace = true
-tracing.workspace     = true
-thiserror.workspace   = true
-gix-pack.workspace    = true
-hex.workspace         = true
+tracing.workspace  = true
+hex.workspace      = true
+flate2.workspace   = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+blake3.workspace = true
