@@ -59,9 +59,8 @@ impl WorkspaceId {
         for (i, b) in bytes.iter_mut().enumerate() {
             let hi = s.as_bytes()[i * 2];
             let lo = s.as_bytes()[i * 2 + 1];
-            *b = hex_pair(hi, lo).ok_or_else(|| {
-                LedgeError::Corruption(format!("invalid WorkspaceId hex '{s}'"))
-            })?;
+            *b = hex_pair(hi, lo)
+                .ok_or_else(|| LedgeError::Corruption(format!("invalid WorkspaceId hex '{s}'")))?;
         }
         Ok(WorkspaceId(bytes))
     }
@@ -114,7 +113,9 @@ mod tests {
         let id = WorkspaceId::generate(&hlc);
         let h = id.to_hex();
         assert_eq!(h.len(), 32);
-        assert!(h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -136,7 +137,7 @@ mod tests {
 
     #[test]
     fn from_hex_rejects_bad_input() {
-        assert!(WorkspaceId::from_hex("xyz").is_err());          // too short + non-hex
+        assert!(WorkspaceId::from_hex("xyz").is_err()); // too short + non-hex
         assert!(WorkspaceId::from_hex(&"0".repeat(31)).is_err()); // wrong length (31)
         assert!(WorkspaceId::from_hex(&"0".repeat(33)).is_err()); // wrong length (33)
         assert!(WorkspaceId::from_hex(&"g".repeat(32)).is_err()); // right length, non-hex

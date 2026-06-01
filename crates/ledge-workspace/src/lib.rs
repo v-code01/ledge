@@ -12,5 +12,5 @@ pub mod manager;
 
 pub use id::WorkspaceId;
 pub use lease::{Lease, LeaseStore};
-// Task 3 adds: pub use manager::{WorkspaceManager, WorkspaceView, CommitOutcome};
+pub use manager::{CommitOutcome, WorkspaceManager, WorkspaceView};
 // Task 5 adds: pub use gc::{Gc, GcStats};

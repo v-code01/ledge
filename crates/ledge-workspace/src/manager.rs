@@ -194,7 +194,11 @@ impl WorkspaceManager {
             let current = self.refs.get(durable_ref).await?;
             let expected = current.as_ref().map(|c| c.target);
 
-            match self.refs.update(durable_ref, ws_entry.target, expected).await {
+            match self
+                .refs
+                .update(durable_ref, ws_entry.target, expected)
+                .await
+            {
                 Ok(entry) => outcomes.push(CommitOutcome::Ok {
                     target: durable_ref.as_str().to_string(),
                     entry,
@@ -293,8 +297,9 @@ mod tests {
         let hlc = Arc::new(HLC::new());
         let refs =
             Arc::new(RefStoreImpl::open(dir.path().join("refs"), hlc.clone()).expect("ref store"));
-        let leases =
-            Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("lease store"));
+        let leases = Arc::new(
+            LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("lease store"),
+        );
         let mgr = WorkspaceManager::new(refs, leases, hlc);
         (mgr, dir)
     }
@@ -313,7 +318,7 @@ mod tests {
         mgr.refs.update(&main, target, None).await.unwrap();
 
         let view = mgr
-            .fork(&[main.clone()], Duration::from_secs(60))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(60))
             .await
             .unwrap();
 
@@ -328,7 +333,12 @@ mod tests {
         assert_eq!(stored.target, target);
 
         // The lease is recorded and live.
-        let lease = mgr.leases.get(view.id).await.unwrap().expect("lease present");
+        let lease = mgr
+            .leases
+            .get(view.id)
+            .await
+            .unwrap()
+            .expect("lease present");
         assert_eq!(lease.generation, 1);
         assert_eq!(lease.source_refs, vec!["refs/heads/main".to_string()]);
         assert!(lease.expires_at_ms > lease.created_at_ms);
@@ -413,7 +423,7 @@ mod tests {
         let src_target = oid(1);
         mgr.refs.update(&src, src_target, None).await.unwrap();
         let view = mgr
-            .fork(&[src.clone()], Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
             .await
             .unwrap();
 
@@ -458,7 +468,7 @@ mod tests {
         let src = r("refs/heads/main");
         mgr.refs.update(&src, oid(1), None).await.unwrap();
         let view = mgr
-            .fork(&[src.clone()], Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &src).unwrap();
@@ -466,7 +476,7 @@ mod tests {
 
         // A SECOND workspace forked from the same source, with DIFFERENT work.
         let view2 = mgr
-            .fork(&[src.clone()], Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
             .await
             .unwrap();
         let ws2 = workspace_ref(&view2.id, &src).unwrap();
@@ -490,7 +500,10 @@ mod tests {
         // through the ref store — exactly what a client holding a pre-move read
         // does. The CAS must be rejected with the live durable entry (oid(2)).
         let stale_expected = oid(1);
-        let direct = mgr.refs.update(&durable, oid(3), Some(stale_expected)).await;
+        let direct = mgr
+            .refs
+            .update(&durable, oid(3), Some(stale_expected))
+            .await;
         match direct {
             Err(LedgeError::Conflict { current }) => {
                 // The ref store reports the live durable (oid(2)); this is the
@@ -583,19 +596,19 @@ mod tests {
 
         // Live workspace (long TTL).
         let live = mgr
-            .fork(&[main.clone()], Duration::from_secs(3600))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(3600))
             .await
             .unwrap();
         // Released workspace (tombstoned -> not live).
         let released = mgr
-            .fork(&[main.clone()], Duration::from_secs(3600))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(3600))
             .await
             .unwrap();
         mgr.release(released.id).await.unwrap();
         // Expired workspace (TTL already elapsed). expires_at_ms == created_at_ms;
         // `live` uses `expires_at_ms > now_ms`, so a 0ms TTL is not live.
         let expired = mgr
-            .fork(&[main.clone()], Duration::from_millis(0))
+            .fork(std::slice::from_ref(&main), Duration::from_millis(0))
             .await
             .unwrap();
 

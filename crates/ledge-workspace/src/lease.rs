@@ -287,7 +287,11 @@ mod tests {
         let got = store.get(id).await.unwrap().expect("present");
         assert_eq!(got.id, id);
         assert_eq!(got.generation, 0);
-        assert!(store.get(WorkspaceId::generate(&h)).await.unwrap().is_none());
+        assert!(store
+            .get(WorkspaceId::generate(&h))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -341,10 +345,20 @@ mod tests {
         store.put(lease(a, now + 1)).await.unwrap(); // live
         store.put(lease(b, now)).await.unwrap(); // expired (<=)
         store.put(lease(c, now - 1)).await.unwrap(); // expired
-        let live: std::collections::HashSet<_> =
-            store.live(now).await.unwrap().into_iter().map(|l| l.id).collect();
-        let exp: std::collections::HashSet<_> =
-            store.expired(now).await.unwrap().into_iter().map(|l| l.id).collect();
+        let live: std::collections::HashSet<_> = store
+            .live(now)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        let exp: std::collections::HashSet<_> = store
+            .expired(now)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
         assert_eq!(live, std::collections::HashSet::from([a]));
         assert_eq!(exp, std::collections::HashSet::from([b, c]));
         assert!(live.is_disjoint(&exp));
@@ -366,7 +380,10 @@ mod tests {
         }; // store dropped → file closed
         let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
         for id in ids {
-            assert!(store.get(id).await.unwrap().is_some(), "lease {id} lost on reopen");
+            assert!(
+                store.get(id).await.unwrap().is_some(),
+                "lease {id} lost on reopen"
+            );
         }
         assert_eq!(store.live(now_ms()).await.unwrap().len(), 3);
     }
@@ -386,7 +403,10 @@ mod tests {
         };
         let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
         assert!(store.get(live_id).await.unwrap().is_some());
-        assert!(store.get(dead_id).await.unwrap().is_none(), "tombstone did not survive reopen");
+        assert!(
+            store.get(dead_id).await.unwrap().is_none(),
+            "tombstone did not survive reopen"
+        );
     }
 
     #[tokio::test]
@@ -446,8 +466,13 @@ mod tests {
             live
         };
         let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
-        let reopened: std::collections::HashSet<_> =
-            store.live(now).await.unwrap().into_iter().map(|l| l.id).collect();
+        let reopened: std::collections::HashSet<_> = store
+            .live(now)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
         assert_eq!(reopened, live_set);
     }
 }
