@@ -11,6 +11,7 @@ members = [
     "crates/ledge-cow",
     "crates/ledge-rpc",
     "crates/ledge-raft",
+    "crates/ledge-cluster",
 ]
 
 [workspace.package]

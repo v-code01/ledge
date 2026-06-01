@@ -1,0 +1,23 @@
+[package]
+name = "ledge-cluster"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Exposes the in-process test harness (TestCluster) to downstream crates.
+testkit = []
+
+[dependencies]
+ledge-core = { path = "../ledge-core" }
+ledge-ref-store = { path = "../ledge-ref-store" }
+ledge-workspace = { path = "../ledge-workspace" }
+ledge-raft = { path = "../ledge-raft" }
+openraft = { workspace = true, features = ["serde", "storage-v2"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util", "macros", "rt-multi-thread"] }

@@ -1513,6 +1513,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledge-cluster"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "ledge-core",
+ "ledge-raft",
+ "ledge-ref-store",
+ "ledge-workspace",
+ "openraft",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ledge-core"
 version = "0.1.0"
 dependencies = [
