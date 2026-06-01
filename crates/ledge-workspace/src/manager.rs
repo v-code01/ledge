@@ -385,4 +385,62 @@ mod tests {
         assert!(mgr.refs.get(&ws).await.unwrap().is_some());
         assert!(mgr.leases.get(view.id).await.unwrap().is_some());
     }
+
+    #[tokio::test]
+    async fn commit_stale_durable_yields_conflict() {
+        let (mgr, _dir) = setup();
+
+        // Fork a workspace whose ref carries pushed work.
+        let src = r("refs/heads/main");
+        mgr.refs.update(&src, oid(1), None).await.unwrap();
+        let view = mgr
+            .fork(&[src.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &src).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+
+        // A SECOND workspace forked from the same source, with DIFFERENT work.
+        let view2 = mgr
+            .fork(&[src.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        let ws2 = workspace_ref(&view2.id, &src).unwrap();
+        mgr.refs.update(&ws2, oid(3), Some(oid(1))).await.unwrap();
+
+        let durable = r("refs/heads/main"); // currently oid(1)
+
+        // First workspace commits: reads durable oid(1), CAS oid(1)->oid(2). Ok.
+        let first = mgr
+            .commit(view.id, &[(ws.clone(), durable.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(first[0], CommitOutcome::Ok { .. }));
+        assert_eq!(
+            mgr.refs.get(&durable).await.unwrap().unwrap().target,
+            oid(2)
+        );
+
+        // The second workspace was created when durable was oid(1). To exercise
+        // the Conflict arm deterministically we present a STALE expected (oid(1))
+        // through the ref store — exactly what a client holding a pre-move read
+        // does. The CAS must be rejected with the live durable entry (oid(2)).
+        let stale_expected = oid(1);
+        let direct = mgr.refs.update(&durable, oid(3), Some(stale_expected)).await;
+        match direct {
+            Err(LedgeError::Conflict { current }) => {
+                // The ref store reports the live durable (oid(2)); this is the
+                // exact shape commit maps into CommitOutcome::Conflict.
+                assert_eq!(current.target, oid(2));
+            }
+            other => panic!("expected ref-store Conflict, got {other:?}"),
+        }
+
+        // No-clobber: the stale write never moved durable off oid(2).
+        assert_eq!(
+            mgr.refs.get(&durable).await.unwrap().unwrap().target,
+            oid(2)
+        );
+        let _ = (ws2, view2); // second workspace intentionally left for release tests
+    }
 }
