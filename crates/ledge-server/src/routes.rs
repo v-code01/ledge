@@ -13,6 +13,9 @@ use crate::metrics;
 pub struct AppState {
     pub objects: Arc<ledge_object_store::DiskObjectStore>,
     pub refs: Arc<ledge_ref_store::RefStoreImpl>,
+    pub workspaces: Arc<ledge_workspace::WorkspaceManager>,
+    pub leases: Arc<ledge_workspace::LeaseStore>,
+    pub gc: Arc<ledge_workspace::Gc>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +130,111 @@ pub async fn receive_pack(
         Ok(r) => git_response("application/x-git-receive-pack-result", r),
         Err(e) => {
             warn!(error = %e, "receive-pack failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /ws/{id}/info/refs — workspace-scoped discovery.
+pub async fn ws_info_refs(
+    Path(id): Path<String>,
+    Query(q): Query<InfoRefsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let segment = format!("workspaces/{id}/");
+    let start = Instant::now();
+    info!(ws = %id, service = %q.service, "ws git info/refs");
+    match q.service.as_str() {
+        "git-upload-pack" => {
+            metrics::record_git_request("upload-pack");
+            let r = ledge_git::fetch::handle_upload_pack_discovery(
+                state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
+                state.objects.as_ref(),
+                &segment,
+            )
+            .await;
+            metrics::record_git_request_duration("upload-pack", start.elapsed());
+            match r {
+                Ok(b) => git_response("application/x-git-upload-pack-advertisement", b),
+                Err(e) => {
+                    warn!(error = %e, "ws upload-pack discovery failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        "git-receive-pack" => {
+            metrics::record_git_request("receive-pack");
+            let r = ledge_git::push::handle_receive_pack_discovery(
+                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
+                state.objects.as_ref(),
+                &segment,
+            )
+            .await;
+            metrics::record_git_request_duration("receive-pack", start.elapsed());
+            match r {
+                Ok(b) => git_response("application/x-git-receive-pack-advertisement", b),
+                Err(e) => {
+                    warn!(error = %e, "ws receive-pack discovery failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        unknown => {
+            warn!(service = %unknown, "unknown service");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// POST /ws/{id}/git-upload-pack
+pub async fn ws_upload_pack(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let segment = format!("workspaces/{id}/");
+    let start = Instant::now();
+    metrics::record_git_request("upload-pack");
+    let r = ledge_git::fetch::handle_upload_pack(
+        body,
+        state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
+        state.objects.as_ref(),
+        &segment,
+    )
+    .await;
+    metrics::record_git_request_duration("upload-pack", start.elapsed());
+    match r {
+        Ok(p) => git_response("application/x-git-upload-pack-result", p),
+        Err(e) => {
+            warn!(error = %e, "ws upload-pack failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /ws/{id}/git-receive-pack
+pub async fn ws_receive_pack(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let segment = format!("workspaces/{id}/");
+    let start = Instant::now();
+    metrics::record_git_request("receive-pack");
+    let r = ledge_git::push::handle_receive_pack(
+        body,
+        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
+        state.objects.as_ref(),
+        &segment,
+    )
+    .await;
+    metrics::record_git_request_duration("receive-pack", start.elapsed());
+    match r {
+        Ok(r) => git_response("application/x-git-receive-pack-result", r),
+        Err(e) => {
+            warn!(error = %e, "ws receive-pack failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

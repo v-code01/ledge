@@ -11,8 +11,11 @@ async fn start_server() -> (String, TempDir) {
     let data_dir = TempDir::new().unwrap();
     let hlc     = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.path().to_path_buf()).unwrap());
-    let refs    = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc).unwrap());
-    let app     = build_app(AppState { objects, refs });
+    let refs    = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        data_dir.path().to_path_buf(), objects.clone(), refs.clone(), hlc,
+    ).unwrap();
+    let app     = build_app(AppState { objects, refs, workspaces, leases, gc });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.ok(); });

@@ -50,9 +50,79 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(&cfg.server.data_dir);
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.clone())?);
-    let refs = Arc::new(RefStoreImpl::open(data_dir, hlc)?);
+    let refs = Arc::new(RefStoreImpl::open(data_dir.clone(), hlc.clone())?);
     ledge_server::metrics::install_recorder()?;
-    let app = build_app(AppState { objects, refs });
+
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        data_dir.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc.clone(),
+    )?;
+
+    // ── Expiry sweeper: every expiry_interval_secs, release each expired lease. ──
+    {
+        let workspaces = workspaces.clone();
+        let leases = leases.clone();
+        let interval_secs = cfg.workspace.expiry_interval_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                match leases.expired(now_ms).await {
+                    Ok(expired) => {
+                        let n = expired.len() as u64;
+                        for lease in expired {
+                            if let Err(e) = workspaces.release(lease.id).await {
+                                tracing::warn!(error = %e, id = %lease.id.to_hex(), "expiry release failed");
+                            }
+                        }
+                        if n > 0 {
+                            ledge_server::metrics::record_lease_expired(n);
+                            if let Ok(live) = workspaces.list().await {
+                                ledge_server::metrics::set_workspaces_active(live.len() as f64);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "expiry sweep: lease scan failed"),
+                }
+            }
+        });
+    }
+
+    // ── GC scheduler: every gc_interval_secs, run a mark-and-sweep pass. ──────────
+    {
+        let gc = gc.clone();
+        let interval_secs = cfg.workspace.gc_interval_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let start = std::time::Instant::now();
+                match gc.run().await {
+                    Ok(stats) => {
+                        ledge_server::metrics::record_gc_run(&stats, start.elapsed());
+                        tracing::info!(reclaimed = stats.reclaimed, bytes_freed = stats.bytes_freed, "scheduled gc pass");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "scheduled gc pass failed"),
+                }
+            }
+        });
+    }
+
+    let app = build_app(AppState {
+        objects,
+        refs,
+        workspaces,
+        leases,
+        gc,
+    });
     let addr: SocketAddr = cfg
         .server
         .addr

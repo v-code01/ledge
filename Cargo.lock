@@ -1387,6 +1387,7 @@ dependencies = [
  "ledge-git",
  "ledge-object-store",
  "ledge-ref-store",
+ "ledge-workspace",
  "metrics",
  "metrics-exporter-prometheus",
  "reqwest",
