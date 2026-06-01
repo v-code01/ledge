@@ -21,6 +21,7 @@
 //! - `Snapshot { meta, snapshot: Box<SnapshotData> }`.
 
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -30,7 +31,8 @@ use ledge_workspace::id::WorkspaceId;
 use ledge_workspace::lease::{Lease, LeaseStore};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
-    BasicNode, EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StoredMembership,
+    BasicNode, EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -43,6 +45,35 @@ use crate::type_config::TypeConfig;
 struct StateDump {
     refs: Vec<(String, RefEntry)>,
     leases: Vec<Lease>,
+}
+
+/// Durable applied-state metadata, persisted on every `apply`/`install_snapshot`
+/// in the disk-backed (`open`) mode. openraft consults `applied_state()` on
+/// startup to learn where to resume; without this the SM would report `None`
+/// after a restart and openraft would attempt to replay log entries that have
+/// already been purged behind a snapshot — silently losing committed state.
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedMeta {
+    last_applied_log: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, BasicNode>,
+}
+
+/// File name (under `data_dir`) for the durable applied-state metadata.
+const META_FILE: &str = "applied-meta";
+/// File name (under `data_dir`) for the durable current snapshot.
+const SNAPSHOT_FILE: &str = "snapshot";
+
+/// A durably-persisted snapshot: its `SnapshotMeta` fields plus the raw
+/// `StateDump` payload. Persisting the meta alongside the bytes lets
+/// `get_current_snapshot` return a snapshot whose coverage (`last_log_id`,
+/// membership, id) is exactly what it was at build/install time — NOT the
+/// SM's current `last_applied_log`, which may have advanced past the snapshot.
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshot {
+    last_log_id: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, BasicNode>,
+    snapshot_id: String,
+    payload: Vec<u8>,
 }
 
 /// The applied stores, swapped atomically as a unit on snapshot install so a
@@ -69,6 +100,12 @@ pub struct StateMachineStore {
     last_membership: StoredMembership<u64, BasicNode>,
     /// Monotone snapshot id counter (per-SM, for unique `snapshot_id`s).
     snapshot_idx: u64,
+    /// Durable root directory. `Some` ⟺ disk-backed (`open`): applied-state
+    /// metadata + the current snapshot are persisted here so the SM survives a
+    /// restart even after the Raft log is purged post-snapshot. `None` ⟺ the
+    /// in-memory/test (`new_temp`) path: no metadata/snapshot persistence (the
+    /// wrapped stores' own tempdirs vanish on drop, as tests expect).
+    durable_dir: Option<PathBuf>,
 }
 
 impl StateMachineStore {
@@ -91,7 +128,153 @@ impl StateMachineStore {
             last_applied_log: None,
             last_membership: StoredMembership::default(),
             snapshot_idx: 0,
+            durable_dir: None,
         }
+    }
+
+    /// Open a durable state machine rooted at `data_dir`. The wrapped RefStoreImpl
+    /// and LeaseStore persist to `data_dir` (WAL-backed), so applied state survives
+    /// restart even after the Raft log is purged post-snapshot. Also persists the
+    /// last-applied log id, last-membership, and current snapshot durably so openraft
+    /// can resume without replaying purged entries.
+    ///
+    /// # Restart-safety contract
+    /// On reopen this constructor reconstructs three pieces of durable state:
+    ///
+    /// 1. Applied refs/leases — the wrapped `RefStoreImpl`/`LeaseStore` replay their
+    ///    own WALs on `open`, so the applied ref/lease set is exactly what it was at
+    ///    the last write.
+    /// 2. Applied-state metadata — `last_applied_log` + `last_membership` are loaded
+    ///    from `data_dir/applied-meta` so `applied_state()` returns the true resume
+    ///    point (not `None`). This is what stops openraft from replaying purged log
+    ///    entries.
+    /// 3. Current snapshot — if a snapshot was persisted to `data_dir/snapshot`,
+    ///    `get_current_snapshot()` serves it after restart so a lagging follower can
+    ///    be caught up even though the covered log prefix is gone.
+    ///
+    /// The apply/determinism logic is unchanged; only durability of (applied-state
+    /// metadata + snapshot) is added on top of the already-durable stores.
+    ///
+    /// # Errors
+    /// Propagates store-open or metadata-read I/O / corruption errors.
+    pub async fn open(data_dir: PathBuf, hlc: Arc<HLC>) -> ledge_core::Result<Self> {
+        std::fs::create_dir_all(&data_dir).map_err(ledge_core::LedgeError::Io)?;
+        // The wrapped stores replay their own WALs on open → durable applied state.
+        let refs = Arc::new(RefStoreImpl::open(data_dir.join("refs"), hlc.clone())?);
+        let leases = Arc::new(LeaseStore::open(data_dir.join("leases"), hlc)?);
+
+        // Load the durable applied-state metadata, if present. Absent ⟺ first boot.
+        let meta = Self::load_meta(&data_dir)?;
+
+        Ok(Self {
+            stores: Arc::new(ArcSwap::from_pointee(Stores {
+                refs,
+                leases,
+                _dir: None, // durable: no tempdir; the stores own real paths.
+            })),
+            last_applied_log: meta.last_applied_log,
+            last_membership: meta.last_membership,
+            snapshot_idx: 0,
+            durable_dir: Some(data_dir),
+        })
+    }
+
+    /// Load persisted applied-state metadata from `dir/applied-meta`.
+    /// A missing file yields the default (first-boot) meta. A present-but-corrupt
+    /// file is a hard error: silently resetting to `None` would re-introduce the
+    /// very replay-of-purged-entries bug this durability layer prevents.
+    fn load_meta(dir: &Path) -> ledge_core::Result<PersistedMeta> {
+        let path = dir.join(META_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let (meta, _): (PersistedMeta, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| {
+                            ledge_core::LedgeError::Corruption(format!("applied-meta decode: {e}"))
+                        })?;
+                Ok(meta)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PersistedMeta::default()),
+            Err(e) => Err(ledge_core::LedgeError::Io(e)),
+        }
+    }
+
+    /// Durably persist `last_applied_log` + `last_membership` to `dir/applied-meta`.
+    ///
+    /// Written via a temp-file + atomic rename so a crash mid-write never leaves a
+    /// torn metadata file (which `load_meta` would reject as corrupt). No-op in the
+    /// in-memory (`new_temp`) path. Bincode keeps the record tiny (tens of bytes).
+    fn persist_meta(&self) -> ledge_core::Result<()> {
+        let Some(dir) = self.durable_dir.as_ref() else {
+            return Ok(());
+        };
+        let meta = PersistedMeta {
+            last_applied_log: self.last_applied_log,
+            last_membership: self.last_membership.clone(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard())
+            .map_err(|e| ledge_core::LedgeError::Corruption(format!("applied-meta encode: {e}")))?;
+        Self::atomic_write(&dir.join(META_FILE), &bytes)
+    }
+
+    /// Durably persist a snapshot (its meta + payload) to `dir/snapshot`, so
+    /// `get_current_snapshot()` can serve it after a restart even though the
+    /// covered log prefix has been purged. No-op in the in-memory path.
+    fn persist_snapshot(
+        dir: Option<&Path>,
+        last_log_id: Option<LogId<u64>>,
+        last_membership: &StoredMembership<u64, BasicNode>,
+        snapshot_id: &str,
+        payload: &[u8],
+    ) -> ledge_core::Result<()> {
+        let Some(dir) = dir else {
+            return Ok(());
+        };
+        let rec = PersistedSnapshot {
+            last_log_id,
+            last_membership: last_membership.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            payload: payload.to_vec(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
+            .map_err(|e| ledge_core::LedgeError::Corruption(format!("snapshot encode: {e}")))?;
+        Self::atomic_write(&dir.join(SNAPSHOT_FILE), &bytes)
+    }
+
+    /// Load the persisted snapshot, if any (durable path only). A missing file
+    /// yields `None`; a corrupt file is a hard error (callers must not silently
+    /// serve a torn snapshot).
+    fn load_snapshot(&self) -> ledge_core::Result<Option<PersistedSnapshot>> {
+        let Some(dir) = self.durable_dir.as_ref() else {
+            return Ok(None);
+        };
+        match std::fs::read(dir.join(SNAPSHOT_FILE)) {
+            Ok(bytes) => {
+                let (rec, _): (PersistedSnapshot, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| {
+                            ledge_core::LedgeError::Corruption(format!("snapshot decode: {e}"))
+                        })?;
+                Ok(Some(rec))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ledge_core::LedgeError::Io(e)),
+        }
+    }
+
+    /// Atomically write `bytes` to `path` via a sibling temp file + rename, so a
+    /// reader (or a crash) never observes a partially-written file.
+    fn atomic_write(path: &Path, bytes: &[u8]) -> ledge_core::Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(ledge_core::LedgeError::Io)?;
+            f.write_all(bytes).map_err(ledge_core::LedgeError::Io)?;
+            f.flush().map_err(ledge_core::LedgeError::Io)?;
+            f.sync_all().map_err(ledge_core::LedgeError::Io)?;
+        }
+        std::fs::rename(&tmp, path).map_err(ledge_core::LedgeError::Io)?;
+        Ok(())
     }
 
     /// A cloneable, read-only handle onto this SM's applied state. The handle
@@ -292,6 +475,10 @@ pub struct LedgeSnapshotBuilder {
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     snapshot_id: String,
+    /// Durable root dir (disk-backed SM only). When `Some`, `build_snapshot`
+    /// persists the freshly-built snapshot to `dir/snapshot` so it survives a
+    /// restart and can still be served once the covered log prefix is purged.
+    durable_dir: Option<PathBuf>,
 }
 
 impl LedgeSnapshotBuilder {
@@ -312,6 +499,16 @@ impl LedgeSnapshotBuilder {
 impl RaftSnapshotBuilder<TypeConfig> for LedgeSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let bytes = self.dump().await;
+        // Persist the built snapshot durably (disk-backed SM only) so a restart
+        // can still serve it after the covered Raft log prefix is purged.
+        StateMachineStore::persist_snapshot(
+            self.durable_dir.as_deref(),
+            self.last_applied_log,
+            &self.last_membership,
+            &self.snapshot_id,
+            &bytes,
+        )
+        .map_err(|e| StorageError::from(StorageIOError::write_snapshot(None, &e)))?;
         let meta = SnapshotMeta {
             last_log_id: self.last_applied_log,
             last_membership: self.last_membership.clone(),
@@ -357,6 +554,12 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 }
             }
         }
+        // Durably record the new resume point (disk-backed SM only; no-op for
+        // `new_temp`). The wrapped stores already fsync'd their own WALs above;
+        // this small atomic write keeps `applied_state()` correct across restart
+        // so openraft never replays purged-then-snapshotted entries.
+        self.persist_meta()
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         Ok(responses)
     }
 
@@ -372,6 +575,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             last_applied_log: self.last_applied_log,
             last_membership: self.last_membership.clone(),
             snapshot_id,
+            durable_dir: self.durable_dir.clone(),
         }
     }
 
@@ -389,12 +593,45 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         self.restore(snapshot.get_ref()).await;
         self.last_applied_log = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+        // Persist the installed snapshot + the new resume point durably (disk-backed
+        // SM only) so a subsequent restart serves this snapshot and resumes at the
+        // right log id without replaying the now-superseded prefix.
+        Self::persist_snapshot(
+            self.durable_dir.as_deref(),
+            meta.last_log_id,
+            &meta.last_membership,
+            &meta.snapshot_id,
+            snapshot.get_ref(),
+        )
+        .map_err(|e| StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e)))?;
+        self.persist_meta()
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+        // Disk-backed SM: if a snapshot was previously built/installed, serve THAT
+        // persisted snapshot (with its own coverage meta), so a restart can satisfy
+        // an InstallSnapshot for a lagging follower even though the covered log
+        // prefix has been purged. Falls through to a fresh dump only when none was
+        // ever persisted (or in the in-memory `new_temp` path).
+        if let Some(rec) = self
+            .load_snapshot()
+            .map_err(|e| StorageError::from(StorageIOError::read_snapshot(None, &e)))?
+        {
+            let meta = SnapshotMeta {
+                last_log_id: rec.last_log_id,
+                last_membership: rec.last_membership,
+                snapshot_id: rec.snapshot_id,
+            };
+            return Ok(Some(Snapshot {
+                meta,
+                snapshot: Box::new(Cursor::new(rec.payload)),
+            }));
+        }
+
         let bytes = self.dump().await;
         self.snapshot_idx += 1;
         let snapshot_id = match self.last_applied_log {
@@ -598,6 +835,107 @@ mod tests {
             LedgeResp::RefUpdated(e) => assert_eq!(e.version, 4, "CAS after install continues version"),
             other => panic!("expected RefUpdated, got {other:?}"),
         }
+    }
+
+    /// RESTART DURABILITY (the core fix). Open a disk-backed SM, apply RefUpdate
+    /// entries, record the last-applied log id, drop the SM, then reopen at the
+    /// SAME dir. After reopen: (1) the applied refs are present via ReadHandle,
+    /// and (2) `applied_state()` returns the SAME last_applied_log (not None) —
+    /// so openraft resumes at the right point instead of replaying purged entries.
+    #[tokio::test]
+    async fn open_persists_applied_state_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let last_before;
+        {
+            let mut sm = StateMachineStore::open(data_dir.clone(), Arc::new(HLC::new()))
+                .await
+                .unwrap();
+            // Fresh boot: no applied state yet.
+            assert!(
+                sm.applied_state().await.unwrap().0.is_none(),
+                "fresh durable SM has no last_applied_log"
+            );
+            let _ = sm.apply(entries_for(ops())).await.unwrap();
+            last_before = sm.applied_state().await.unwrap().0;
+            assert_eq!(last_before.unwrap().index, 3, "three entries applied");
+            // Read the applied ref through the SHARED handle (no Raft round-trip).
+            let read = sm.read_handle();
+            let main = read.applied_ref("refs/heads/main").await.expect("ref present");
+            assert_eq!(main.target, ledge_core::ObjectId::from_bytes([2u8; 32]));
+            assert_eq!(main.hlc, 200);
+        } // drop ⇒ all files closed/flushed.
+
+        // Reopen at the same dir: applied refs AND applied-state metadata survive.
+        let mut sm2 = StateMachineStore::open(data_dir, Arc::new(HLC::new()))
+            .await
+            .unwrap();
+        let main = sm2
+            .read_handle()
+            .applied_ref("refs/heads/main")
+            .await
+            .expect("applied ref durable across reopen");
+        assert_eq!(main.target, ledge_core::ObjectId::from_bytes([2u8; 32]));
+        assert_eq!(main.hlc, 200, "applied hlc durable");
+
+        let last_after = sm2.applied_state().await.unwrap().0;
+        assert_eq!(
+            last_after, last_before,
+            "applied_state().last_applied_log must survive restart (else openraft replays purged log)"
+        );
+        assert_eq!(last_after.unwrap().index, 3);
+    }
+
+    /// SNAPSHOT DURABILITY. Build a snapshot in a disk-backed SM, drop it, reopen
+    /// at the same dir, and assert `get_current_snapshot()` returns that snapshot
+    /// (correct meta + payload) — so openraft can serve it to a lagging follower
+    /// after a restart even though the covered log prefix has been purged.
+    #[tokio::test]
+    async fn open_snapshot_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let (built_id, built_last_log);
+        {
+            let mut sm = StateMachineStore::open(data_dir.clone(), Arc::new(HLC::new()))
+                .await
+                .unwrap();
+            let _ = sm.apply(entries_for(ops())).await.unwrap();
+            let mut builder = sm.get_snapshot_builder().await;
+            let snap = builder.build_snapshot().await.unwrap();
+            built_id = snap.meta.snapshot_id.clone();
+            built_last_log = snap.meta.last_log_id;
+            assert_eq!(built_last_log.unwrap().index, 3);
+        } // drop ⇒ persisted snapshot file is closed.
+
+        let mut sm2 = StateMachineStore::open(data_dir, Arc::new(HLC::new()))
+            .await
+            .unwrap();
+        let got = sm2
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("persisted snapshot served after reopen");
+        assert_eq!(
+            got.meta.snapshot_id, built_id,
+            "get_current_snapshot returns the persisted snapshot's id"
+        );
+        assert_eq!(
+            got.meta.last_log_id, built_last_log,
+            "persisted snapshot retains its coverage meta"
+        );
+
+        // The payload must reconstruct the applied refs: install it into a fresh
+        // in-memory SM and verify the ref is reproduced byte-for-byte.
+        let mut dst = StateMachineStore::new_temp().await;
+        dst.install_snapshot(&got.meta, got.snapshot).await.unwrap();
+        let main = RefName::new("refs/heads/main").unwrap();
+        assert_eq!(
+            dst.refs_get(&main).await.unwrap().target,
+            ledge_core::ObjectId::from_bytes([2u8; 32]),
+            "persisted snapshot payload reconstructs applied state"
+        );
     }
 
     #[tokio::test]

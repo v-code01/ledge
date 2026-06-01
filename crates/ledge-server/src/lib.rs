@@ -87,9 +87,11 @@ pub struct ClusterStack {
 /// `Raft::metrics()`.
 ///
 /// # Phase 3 scope notes
-/// - The state machine is built with [`StateMachineStore::new_temp`] (the only
-///   public constructor today; a durable disk-backed SM constructor is a
-///   follow-up). The Raft **log** IS disk-durable via `WalLogStore`.
+/// - The state machine is built with [`StateMachineStore::open`]: applied
+///   ref/lease state, the last-applied log id + membership, and the current
+///   snapshot all persist under `shard-{s}/sm`, so a node survives restart even
+///   after openraft purges the snapshotted log prefix. The Raft **log** IS also
+///   disk-durable via `WalLogStore`.
 /// - `ReplicatedObjectStore` is constructed with **no peers** here (a node knows
 ///   its own local store; cross-node object peering is wired with the same HTTP
 ///   transport as the ref Raft in a follow-up). The git/object wire path is
@@ -113,7 +115,11 @@ pub async fn build_cluster_stack(
         let shard_dir = data_dir.join(format!("shard-{s}"));
         let log = WalLogStore::open(shard_dir.join("raft-log"))
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
-        let sm = StateMachineStore::new_temp().await;
+        // Durable, restart-safe state machine: applied ref/lease state + the
+        // last-applied log id + the current snapshot all persist under
+        // `shard-{s}/sm`. Without this the SM was tempdir-backed, so a restart
+        // after openraft purged the snapshotted log prefix lost committed state.
+        let sm = StateMachineStore::open(shard_dir.join("sm"), hlc.clone()).await?;
         // Capture the read handle BEFORE the SM moves into Raft::new (the SM is
         // not Clone; the handle shares its ArcSwap'd applied state).
         let read = sm.read_handle();
