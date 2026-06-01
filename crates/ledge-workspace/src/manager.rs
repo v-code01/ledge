@@ -535,4 +535,27 @@ mod tests {
 
         assert!(mgr.get(view.id).await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn get_returns_client_facing_ref_names() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        let tag = r("refs/tags/v1");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+        mgr.refs.update(&tag, oid(2), None).await.unwrap();
+        let view = mgr
+            .fork(&[main, tag], Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let got = mgr.get(view.id).await.unwrap().expect("present");
+        let mut names: Vec<&str> = got.refs.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["refs/heads/main", "refs/tags/v1"]);
+
+        // No stored/workspace-prefixed form leaks into the view.
+        for (n, _) in &got.refs {
+            assert!(!n.contains("workspaces"), "leaked storage name: {n}");
+        }
+    }
 }
