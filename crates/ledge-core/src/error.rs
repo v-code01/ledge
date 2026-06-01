@@ -30,6 +30,14 @@ pub enum LedgeError {
     /// checksum, truncated record, unexpected magic bytes, …).
     #[error("data corruption: {0}")]
     Corruption(String),
+
+    /// A transient infrastructure fault prevented the operation from completing,
+    /// but the data is intact and the request is safe to retry: no shard leader
+    /// elected yet, an unreachable peer, a failed linearizability barrier, or a
+    /// transient Raft `client_write` error. Distinct from [`Self::Corruption`],
+    /// which signals a fatal integrity failure that retrying cannot fix.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// Shorthand `Result` type alias used throughout the Ledge crates.
@@ -78,6 +86,14 @@ mod tests {
     fn test_corruption_display() {
         let err = LedgeError::Corruption("bad crc".to_string());
         assert!(err.to_string().contains("data corruption"));
+    }
+
+    #[test]
+    fn test_unavailable_display() {
+        let err = LedgeError::Unavailable("no leader elected".to_string());
+        let msg = err.to_string();
+        assert!(msg.starts_with("service unavailable:"), "got: {msg}");
+        assert!(msg.contains("no leader elected"), "got: {msg}");
     }
 
     #[test]

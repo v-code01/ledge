@@ -80,13 +80,16 @@ pub enum ConsistencyMode {
 /// Maximum leader-discovery polling attempts before giving up.
 const LEADER_POLL_ATTEMPTS: usize = 50;
 
-/// Internal error → `LedgeError`. `LedgeError` has no dedicated internal/
-/// unavailable variant, so we funnel infrastructure failures through
-/// `Corruption` (the only free-form string variant), which is correct in spirit:
-/// an unreachable shard / failed barrier is an integrity-of-availability fault
-/// the caller must surface, not silently swallow.
+/// Transient infrastructure fault → `LedgeError::Unavailable` (retryable).
+///
+/// Every fault funnelled through here is an *availability* failure, not a data
+/// integrity failure: no shard leader elected yet, an unreachable shard/peer, a
+/// failed linearizability barrier, or a transient Raft `client_write` error. The
+/// data is intact, so the caller must learn this is retryable (→ HTTP 503) and
+/// must NOT mistake it for [`LedgeError::Corruption`], which signals a fatal,
+/// non-retryable integrity failure.
 fn infra(msg: impl Into<String>) -> LedgeError {
-    LedgeError::Corruption(msg.into())
+    LedgeError::Unavailable(msg.into())
 }
 
 /// Resolve the current leader handle of `shard` from a replica set, polling the
@@ -98,9 +101,12 @@ fn infra(msg: impl Into<String>) -> LedgeError {
 async fn leader_handle(replicas: &[ShardHandle], shard: ShardId) -> Result<&ShardHandle> {
     for attempt in 0..LEADER_POLL_ATTEMPTS {
         for h in replicas {
-            // V4: `current_leader` field on RaftMetrics in 0.9.24.
-            let leader = *h.raft.metrics().borrow().current_leader.as_ref().unwrap_or(&0);
-            if leader != 0 {
+            // V4: `current_leader: Option<NodeId>` on RaftMetrics in 0.9.24.
+            // Match the Option directly: `Some(id)` is a real elected leader for
+            // ANY id value, `None` means no leader yet. (The old code aliased
+            // `Some(0)` to "no leader" via `unwrap_or(&0)` + `!= 0`, conflating a
+            // node whose id is 0 with the no-leader case.)
+            if let Some(leader) = h.raft.metrics().borrow().current_leader {
                 if let Some(lead) = replicas.iter().find(|r| r.node_id == leader) {
                     return Ok(lead);
                 }

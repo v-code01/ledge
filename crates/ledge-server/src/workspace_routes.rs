@@ -135,8 +135,16 @@ fn parse_id(id: &str) -> Option<WorkspaceId> {
     WorkspaceId::from_hex(id).ok()
 }
 
-/// Map a manager lookup error to 404 (unknown) / 410 (tombstoned|expired) / 500.
+/// Map a manager lookup error to a status: a transient cluster fault is
+/// retryable → 503; tombstoned|expired → 410; unknown → 404; everything else
+/// (genuine corruption / I/O) is a non-retryable server fault → 500.
 fn map_lookup_err(e: ledge_core::LedgeError) -> Response {
+    // A retryable cluster-availability fault must surface as 503, NOT 500, so
+    // clients know to back off and retry rather than treat it as terminal.
+    if matches!(e, ledge_core::LedgeError::Unavailable(_)) {
+        warn!(error = %e, "workspace op unavailable (retryable)");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let msg = e.to_string();
     if msg.contains("tombstoned") || msg.contains("expired") {
         StatusCode::GONE.into_response()
@@ -422,6 +430,36 @@ mod tests {
     fn renew_request_parses_ttl() {
         let v: RenewRequest = serde_json::from_str(r#"{"ttl_seconds":120}"#).unwrap();
         assert_eq!(v.ttl_seconds, 120);
+    }
+
+    #[test]
+    fn unavailable_maps_to_503_retryable() {
+        // A transient cluster fault must be retryable (503), never confused with
+        // a terminal 500 or a 404/410.
+        let resp = map_lookup_err(ledge_core::LedgeError::Unavailable(
+            "shard Shard(0): no leader elected".into(),
+        ));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn lookup_err_status_classification() {
+        use ledge_core::{LedgeError, ObjectId};
+        // tombstoned|expired → 410 Gone
+        assert_eq!(
+            map_lookup_err(LedgeError::Corruption("ws tombstoned".into())).status(),
+            StatusCode::GONE,
+        );
+        // unknown|not found → 404
+        assert_eq!(
+            map_lookup_err(LedgeError::NotFound(ObjectId::from_bytes([0u8; 32]))).status(),
+            StatusCode::NOT_FOUND,
+        );
+        // anything else (genuine corruption) → 500, non-retryable
+        assert_eq!(
+            map_lookup_err(LedgeError::Corruption("bad crc".into())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 }
 
