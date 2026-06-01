@@ -35,7 +35,9 @@ pub async fn rpc(State(state): State<AppState>, body: Bytes) -> Response {
     let span = tracing::info_span!("rpc", method);
 
     let ctx = RpcCtx {
-        objects: state.objects.clone(),
+        // RpcCtx needs the concrete DiskObjectStore (writeObject uses
+        // write_git_object, not on the ObjectStore trait); refs is the dyn seam.
+        objects: state.objects_disk.clone(),
         refs: state.refs.clone(),
         workspaces: state.workspaces.clone(),
         gc: state.gc.clone(),
@@ -80,13 +82,15 @@ mod tests {
         let (workspaces, leases, gc) =
             crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
         AppState {
-            objects,
-            refs,
+            objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as std::sync::Arc<dyn ledge_core::RefStore>,
             workspaces,
             leases,
             gc,
             default_ttl_secs: 3600,
             data_dir: p,
+            raft_shards: None,
         }
     }
 

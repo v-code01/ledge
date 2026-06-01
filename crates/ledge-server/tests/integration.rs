@@ -15,7 +15,7 @@ async fn start_server() -> (String, TempDir) {
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
         data_dir.path().to_path_buf(), objects.clone(), refs.clone(), hlc,
     ).unwrap();
-    let app     = build_app(AppState { objects, refs, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf() });
+    let app     = build_app(AppState { objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>, objects_disk: objects.clone(), refs: refs.clone() as Arc<dyn ledge_core::RefStore>, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf(), raft_shards: None });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
@@ -145,4 +145,66 @@ async fn git_push_and_reclone() {
     let cloned_file = clone_root.path().join("fresh-clone").join("hello.txt");
     assert!(cloned_file.exists(), "hello.txt must exist in fresh clone");
     assert_eq!(std::fs::read(&cloned_file).unwrap(), b"ledge integration test payload\n");
+}
+
+/// 7A seam proof: an `AppState` whose `refs` is an `Arc<dyn RefStore>` (backed
+/// by a concrete `RefStoreImpl`) and whose `objects` is an `Arc<dyn ObjectStore>`
+/// drives a full workspace create + commit end-to-end through the trait-object
+/// seam. This is the structural guarantee that the cluster `ClusterRefStore`
+/// (also `dyn RefStore`) can be injected without touching the control plane.
+#[tokio::test]
+async fn appstate_holds_trait_objects() {
+    use ledge_core::{ObjectId, RefName, RefStore};
+
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(HLC::new());
+    let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
+    let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    let (workspaces, leases, gc) =
+        ledge_server::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+
+    // Build AppState with the ref/object trait-object seams explicitly typed.
+    let refs_dyn: Arc<dyn RefStore> = refs.clone();
+    let state = AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs_dyn.clone(),
+        workspaces: workspaces.clone(),
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards: None,
+    };
+
+    // Seed a durable ref through the dyn seam, fork a workspace from it, and
+    // commit the workspace ref back to a new durable ref — all trait calls.
+    let main = RefName::new("refs/heads/main").unwrap();
+    let target = ObjectId::from_bytes([7u8; 32]);
+    state.refs.update(&main, target, None).await.unwrap();
+
+    let view = state
+        .workspaces
+        .fork(std::slice::from_ref(&main), Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(view.refs.len(), 1);
+
+    let ws_ref = RefName::new(&format!(
+        "refs/workspaces/{}/heads/main",
+        view.id.to_hex()
+    ))
+    .unwrap();
+    let durable = RefName::new("refs/heads/promoted").unwrap();
+    let outcomes = state
+        .workspaces
+        .commit(view.id, &[(ws_ref, durable.clone())])
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+
+    // The promotion landed, read back through the dyn RefStore seam.
+    let promoted = state.refs.get(&durable).await.unwrap().expect("promoted ref");
+    assert_eq!(promoted.target, target);
 }

@@ -23,6 +23,10 @@ ledge-git          = { path = "../ledge-git" }
 ledge-workspace    = { path = "../ledge-workspace" }
 ledge-cow          = { path = "../ledge-cow" }
 ledge-rpc          = { path = "../ledge-rpc" }
+ledge-cluster      = { path = "../ledge-cluster" }
+ledge-raft         = { path = "../ledge-raft" }
+openraft.workspace          = true
+bincode.workspace           = true
 axum.workspace              = true
 tower.workspace             = true
 tower-http.workspace        = true

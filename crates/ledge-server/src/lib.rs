@@ -12,22 +12,42 @@ use std::time::Duration;
 use axum::Router;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
-use ledge_core::HLC;
+use ledge_core::{HLC, RefStore};
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, LeaseStore, WorkspaceManager};
 
 /// Open the lease store and assemble the workspace control-plane trio
 /// (manager, lease store, GC) from already-open object/ref stores.
+///
+/// Single-node path: takes the concrete `Arc<RefStoreImpl>` and up-casts it to
+/// the `Arc<dyn RefStore>` seam internally. The GC keeps the concrete
+/// `Arc<DiskObjectStore>` (it needs `DiskObjectStore`-only methods). Behavior is
+/// byte-identical to Phase 1/2 — the trait object is the same `RefStoreImpl`.
 pub fn build_workspace_stack(
     data_dir: std::path::PathBuf,
     objects: Arc<DiskObjectStore>,
     refs: Arc<RefStoreImpl>,
     hlc: Arc<HLC>,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
+    build_workspace_stack_dyn(data_dir, objects, refs as Arc<dyn RefStore>, hlc)
+}
+
+/// Cluster path: assemble the workspace control-plane trio over an arbitrary
+/// `Arc<dyn RefStore>` (the clustered `ClusterRefStore`) and the node-local
+/// `Arc<DiskObjectStore>`. The GC always GCs the local disk store (distributed
+/// GC is per-node-local in Phase 3; see [`ledge_workspace::Gc`]). The single-node
+/// [`build_workspace_stack`] is a thin wrapper that up-casts a concrete
+/// `RefStoreImpl` into this.
+pub fn build_workspace_stack_dyn(
+    data_dir: std::path::PathBuf,
+    objects_disk: Arc<DiskObjectStore>,
+    refs: Arc<dyn RefStore>,
+    hlc: Arc<HLC>,
+) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     let leases = Arc::new(LeaseStore::open(data_dir, hlc.clone())?);
     let manager = Arc::new(WorkspaceManager::new(refs.clone(), leases.clone(), hlc));
-    let gc = Arc::new(Gc::new(refs, leases.clone(), objects));
+    let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk));
     Ok((manager, leases, gc))
 }
 

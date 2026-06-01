@@ -9,10 +9,35 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use crate::metrics;
 
+/// Per-shard Raft handles for the cluster control plane. `None` in single-node
+/// mode (the `/raft/*` and `/cluster/*` handlers see `None` → 503), `Some` only
+/// when `cluster.enabled`. Carried in [`AppState`] so the cluster route handlers
+/// can reach the local node's per-shard Raft handle without touching any
+/// single-node path. Defined here (not `cluster_routes`) so `AppState` does not
+/// depend on a module that is itself stateful.
+pub type ClusterHandles =
+    std::collections::BTreeMap<ledge_cluster::ShardId, openraft::Raft<ledge_raft::TypeConfig>>;
+
 #[derive(Clone)]
 pub struct AppState {
-    pub objects: Arc<ledge_object_store::DiskObjectStore>,
-    pub refs: Arc<ledge_ref_store::RefStoreImpl>,
+    /// Object-store **trait seam** (`dyn ObjectStore`): the git/workspace read
+    /// paths route through this. Single-node injects `Arc<DiskObjectStore>`;
+    /// cluster injects `Arc<ReplicatedObjectStore>` (both up-cast). The concrete
+    /// disk store is still available as `objects_disk` for the paths that need
+    /// `DiskObjectStore`-only methods.
+    pub objects: Arc<dyn ledge_core::ObjectStore>,
+    /// Concrete on-disk object store, retained for the paths that need methods
+    /// NOT on the [`ledge_core::ObjectStore`] trait: the git wire `Sha1Provider`
+    /// (`sha1_of`/`git_type_of`/`write_git_object`), the capnp RPC `writeObject`,
+    /// and per-node-local GC (`list_all_ids`/`delete`). In cluster mode this is
+    /// the node-local disk store underneath `ReplicatedObjectStore` — the git
+    /// protocol + object wire path operate on the local node's object store,
+    /// while ref replication goes through the Raft `dyn RefStore` (Phase 3 scope).
+    pub objects_disk: Arc<ledge_object_store::DiskObjectStore>,
+    /// Ref-store **trait seam** (`dyn RefStore`): every ref mutation/read for git
+    /// and the workspace control plane routes through this. Single-node injects
+    /// `Arc<RefStoreImpl>`; cluster injects `Arc<ClusterRefStore>` (both up-cast).
+    pub refs: Arc<dyn ledge_core::RefStore>,
     pub workspaces: Arc<ledge_workspace::WorkspaceManager>,
     pub leases: Arc<ledge_workspace::LeaseStore>,
     pub gc: Arc<ledge_workspace::Gc>,
@@ -22,6 +47,10 @@ pub struct AppState {
     /// On-disk root of this repo's data (objects + refs + leases). Source of
     /// the CoW snapshot at `POST /admin/snapshot` (Phase 2d).
     pub data_dir: std::path::PathBuf,
+    /// Per-shard Raft handles when `cluster.enabled`, else `None`. Read only by
+    /// the `/raft/*` and `/cluster/*` handlers; single-node leaves it `None` so
+    /// those handlers report not-clustered (503) and nothing else is affected.
+    pub raft_shards: Option<Arc<ClusterHandles>>,
 }
 
 #[derive(Deserialize)]
@@ -51,9 +80,9 @@ pub async fn info_refs(
         "git-upload-pack" => {
             metrics::record_git_request("upload-pack");
             let result = ledge_git::fetch::handle_upload_pack_discovery(
-                state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
-                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-                state.objects.as_ref(),
+                state.objects.clone(),
+                state.refs.clone(),
+                state.objects_disk.as_ref(),
                 "",
             )
             .await;
@@ -69,8 +98,8 @@ pub async fn info_refs(
         "git-receive-pack" => {
             metrics::record_git_request("receive-pack");
             let result = ledge_git::push::handle_receive_pack_discovery(
-                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-                state.objects.as_ref(),
+                state.refs.clone(),
+                state.objects_disk.as_ref(),
                 "",
             )
             .await;
@@ -100,9 +129,9 @@ pub async fn upload_pack(
     metrics::record_git_request("upload-pack");
     let result = ledge_git::fetch::handle_upload_pack(
         body,
-        state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
-        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-        state.objects.as_ref(),
+        state.objects.clone(),
+        state.refs.clone(),
+        state.objects_disk.as_ref(),
         "",
     )
     .await;
@@ -126,8 +155,8 @@ pub async fn receive_pack(
     metrics::record_git_request("receive-pack");
     let result = ledge_git::push::handle_receive_pack(
         body,
-        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-        state.objects.as_ref(),
+        state.refs.clone(),
+        state.objects_disk.as_ref(),
         "",
     )
     .await;
@@ -154,9 +183,9 @@ pub async fn ws_info_refs(
         "git-upload-pack" => {
             metrics::record_git_request("upload-pack");
             let r = ledge_git::fetch::handle_upload_pack_discovery(
-                state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
-                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-                state.objects.as_ref(),
+                state.objects.clone(),
+                state.refs.clone(),
+                state.objects_disk.as_ref(),
                 &segment,
             )
             .await;
@@ -172,8 +201,8 @@ pub async fn ws_info_refs(
         "git-receive-pack" => {
             metrics::record_git_request("receive-pack");
             let r = ledge_git::push::handle_receive_pack_discovery(
-                state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-                state.objects.as_ref(),
+                state.refs.clone(),
+                state.objects_disk.as_ref(),
                 &segment,
             )
             .await;
@@ -204,9 +233,9 @@ pub async fn ws_upload_pack(
     metrics::record_git_request("upload-pack");
     let r = ledge_git::fetch::handle_upload_pack(
         body,
-        state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
-        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-        state.objects.as_ref(),
+        state.objects.clone(),
+        state.refs.clone(),
+        state.objects_disk.as_ref(),
         &segment,
     )
     .await;
@@ -231,8 +260,8 @@ pub async fn ws_receive_pack(
     metrics::record_git_request("receive-pack");
     let r = ledge_git::push::handle_receive_pack(
         body,
-        state.refs.clone() as Arc<dyn ledge_core::RefStore>,
-        state.objects.as_ref(),
+        state.refs.clone(),
+        state.objects_disk.as_ref(),
         &segment,
     )
     .await;

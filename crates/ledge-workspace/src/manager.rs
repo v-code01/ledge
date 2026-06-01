@@ -22,18 +22,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ledge_core::{LedgeError, RefEntry, RefName, RefStore, Result, HLC};
-use ledge_ref_store::RefStoreImpl;
 
 use crate::id::WorkspaceId;
 use crate::lease::{Lease, LeaseStore};
 
 /// Orchestrates the workspace lifecycle over a ref store and a lease store.
 ///
-/// Holds the concrete [`RefStoreImpl`] (the only implementation; server routes
-/// need the concrete type) but every method body calls only [`RefStore`] trait
-/// methods, so the logic is implementation-agnostic.
+/// Holds an `Arc<dyn RefStore>` (single-node [`ledge_ref_store::RefStoreImpl`]
+/// or clustered `ledge_cluster::ClusterRefStore`); every method body calls only
+/// [`RefStore`] trait methods, so the logic is implementation-agnostic and the
+/// concrete backing store is injected by the server at assembly time.
 pub struct WorkspaceManager {
-    refs: Arc<RefStoreImpl>,
+    refs: Arc<dyn RefStore>,
     leases: Arc<LeaseStore>,
     hlc: Arc<HLC>,
 }
@@ -90,7 +90,7 @@ fn client_ref(id: &WorkspaceId, stored: &str) -> String {
 
 impl WorkspaceManager {
     /// Construct a manager over a ref store, lease store, and shared clock.
-    pub fn new(refs: Arc<RefStoreImpl>, leases: Arc<LeaseStore>, hlc: Arc<HLC>) -> Self {
+    pub fn new(refs: Arc<dyn RefStore>, leases: Arc<LeaseStore>, hlc: Arc<HLC>) -> Self {
         Self { refs, leases, hlc }
     }
 
@@ -299,6 +299,7 @@ impl WorkspaceManager {
 mod tests {
     use super::*;
     use ledge_core::ObjectId;
+    use ledge_ref_store::RefStoreImpl;
     use tempfile::TempDir;
 
     /// A deterministic, distinct ObjectId for seeding refs. `n` varies the last

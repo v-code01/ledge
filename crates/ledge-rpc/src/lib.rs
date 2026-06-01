@@ -16,8 +16,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ledge_core::RefStore;
 use ledge_object_store::DiskObjectStore;
-use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, WorkspaceManager};
 
 /// Generated Cap'n Proto types for `sdk/schema/ledge.capnp`. The capnpc-emitted
@@ -39,8 +39,15 @@ pub use dispatch::{dispatch, method_name};
 /// server's `AppState`.
 #[derive(Clone)]
 pub struct RpcCtx {
+    /// Concrete object store: the dispatcher's `writeObject` path needs
+    /// `DiskObjectStore::write_git_object` (the git type-tagged write), which is
+    /// not on the [`ledge_core::ObjectStore`] trait. In cluster mode this is the
+    /// node-local disk store (the git/object wire path is node-local in Phase 3).
     pub objects: Arc<DiskObjectStore>,
-    pub refs: Arc<RefStoreImpl>,
+    /// Ref store seam: `Arc<dyn RefStore>` so the clustered `ClusterRefStore`
+    /// slots in unchanged. (The dispatcher reaches refs only via `workspaces`;
+    /// this handle is carried for symmetry / future direct-ref RPCs.)
+    pub refs: Arc<dyn RefStore>,
     pub workspaces: Arc<WorkspaceManager>,
     pub gc: Arc<Gc>,
     /// Fallback TTL (seconds) applied when a `fork` request sends `ttlSeconds == 0`.

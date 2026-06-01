@@ -32,13 +32,15 @@ async fn start_server() -> (String, TempDir) {
     )
     .unwrap();
     let app = build_app(AppState {
-        objects,
-        refs,
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
         workspaces,
         leases,
         gc,
         default_ttl_secs: 3600,
         data_dir: data_dir.path().to_path_buf(),
+        raft_shards: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

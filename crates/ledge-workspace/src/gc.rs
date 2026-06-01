@@ -14,13 +14,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ledge_core::{ObjectId, RefStore, Result};
 use ledge_object_store::{graph, DiskObjectStore};
-use ledge_ref_store::RefStoreImpl;
 
 use crate::lease::LeaseStore;
 
 /// Mark-and-sweep GC engine. Holds shared handles only; no per-pass state.
+///
+/// `refs` is an `Arc<dyn RefStore>` (GC only *lists* refs to build the root set,
+/// a trait method), so it works against either the single-node `RefStoreImpl` or
+/// the clustered `ClusterRefStore`. `objects` stays a concrete
+/// [`DiskObjectStore`] because mark-and-sweep needs `list_all_ids`/`delete`/
+/// on-disk sizing, which are not on the [`ledge_core::ObjectStore`] trait.
+///
+/// # Distributed GC is per-node-local in Phase 3
+/// In cluster mode each node runs GC against *its own* on-disk
+/// [`DiskObjectStore`] using *its own* applied ref state (read through the
+/// `dyn RefStore`) as the root set. This is correct because objects are
+/// content-addressed and a node's applied ref set is a superset-safe root set
+/// for that node's local objects (over-keeping is always safe; a later pass
+/// reclaims). Cluster-wide GC coordination is intentionally out of scope.
 pub struct Gc {
-    refs: Arc<RefStoreImpl>,
+    refs: Arc<dyn RefStore>,
     leases: Arc<LeaseStore>,
     objects: Arc<DiskObjectStore>,
 }
@@ -58,7 +71,7 @@ fn now_ms() -> u64 {
 
 impl Gc {
     pub fn new(
-        refs: Arc<RefStoreImpl>,
+        refs: Arc<dyn RefStore>,
         leases: Arc<LeaseStore>,
         objects: Arc<DiskObjectStore>,
     ) -> Self {

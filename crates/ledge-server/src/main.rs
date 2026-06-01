@@ -121,13 +121,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = build_app(AppState {
-        objects,
-        refs,
+        // Single-node: the object/ref trait seams are the same concrete stores,
+        // up-cast. raft_shards = None ⇒ the /raft and /cluster handlers report
+        // not-clustered (503); every existing path is byte-identical to Phase 2.
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
         workspaces,
         leases,
         gc,
         default_ttl_secs: cfg.workspace.default_ttl_secs,
         data_dir: data_dir.clone(),
+        raft_shards: None,
     });
     let addr: SocketAddr = cfg
         .server

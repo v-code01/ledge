@@ -481,13 +481,15 @@ mod route_tests {
         let (workspaces, leases, gc) =
             crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
         AppState {
-            objects,
-            refs,
+            objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as std::sync::Arc<dyn ledge_core::RefStore>,
             workspaces,
             leases,
             gc,
             default_ttl_secs: 3600,
             data_dir: p,
+            raft_shards: None,
         }
     }
 

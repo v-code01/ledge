@@ -150,13 +150,15 @@ mod route_tests {
         let (workspaces, leases, gc) =
             crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
         AppState {
-            objects,
-            refs,
+            objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as std::sync::Arc<dyn ledge_core::RefStore>,
             workspaces,
             leases,
             gc,
             default_ttl_secs: 3600,
             data_dir: p,
+            raft_shards: None,
         }
     }
 
@@ -172,7 +174,7 @@ mod route_tests {
         // Seed: write a git blob object and a ref pointing at it.
         let content = bytes::Bytes::from_static(b"snapshot payload object");
         let oid = state
-            .objects
+            .objects_disk
             .write_git_object(3, content.clone())
             .await
             .unwrap();

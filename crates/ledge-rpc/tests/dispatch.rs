@@ -7,7 +7,7 @@ use std::sync::Arc;
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 
-use ledge_core::{ObjectStore, RefName, RefStore, HLC};
+use ledge_core::{ObjectStore, RefName, HLC};
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_rpc::ledge_capnp::{request, response};
