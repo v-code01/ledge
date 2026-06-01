@@ -131,3 +131,91 @@ mod tests {
         assert_eq!(back, resp);
     }
 }
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use ledge_core::{HLC, ObjectStore, RefName, RefStore};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tower::ServiceExt; // oneshot
+
+    fn state_over(dir: &TempDir) -> AppState {
+        let p = dir.path().to_path_buf();
+        let hlc = Arc::new(HLC::new());
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+        let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+        let (workspaces, leases, gc) =
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+        AppState {
+            objects,
+            refs,
+            workspaces,
+            leases,
+            gc,
+            default_ttl_secs: 3600,
+            data_dir: p,
+        }
+    }
+
+    /// Seed a data dir with one object + one ref, snapshot it to a fresh
+    /// destination, then open `DiskObjectStore` + `RefStoreImpl` from the
+    /// destination and read both back — proving the snapshot is an independent,
+    /// valid Ledge repo.
+    #[tokio::test]
+    async fn snapshot_produces_independent_valid_repo() {
+        let src_dir = TempDir::new().unwrap();
+        let state = state_over(&src_dir);
+
+        // Seed: write a git blob object and a ref pointing at it.
+        let content = bytes::Bytes::from_static(b"snapshot payload object");
+        let oid = state
+            .objects
+            .write_git_object(3, content.clone())
+            .await
+            .unwrap();
+        let ref_name = RefName::new("refs/heads/main").unwrap();
+        state.refs.update(&ref_name, oid, None).await.unwrap();
+
+        // Destination: a child of a tempdir that does not yet exist (the handler
+        // creates it; clone_tree refuses a pre-existing dest).
+        let dest_parent = TempDir::new().unwrap();
+        let dest = dest_parent.path().join("snap");
+        let dest_str = dest.to_str().unwrap().to_string();
+
+        let app = crate::build_app(state.clone());
+        let body = serde_json::to_string(&SnapshotRequest { dest: dest_str }).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/snapshot")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: SnapshotResponse = serde_json::from_slice(&b).unwrap();
+        assert!(out.files > 0, "snapshot must have cloned files: {out:?}");
+
+        // Open the snapshot as an independent repo and read back the seeded data.
+        let hlc2 = Arc::new(HLC::new());
+        let snap_objects = ledge_object_store::DiskObjectStore::new(dest.clone()).unwrap();
+        let snap_refs = ledge_ref_store::RefStoreImpl::open(dest.clone(), hlc2).unwrap();
+
+        let read_back = snap_objects.read(oid).await.unwrap();
+        assert_eq!(read_back, content, "object content must survive the snapshot");
+
+        let ref_entry = snap_refs
+            .get(&ref_name)
+            .await
+            .unwrap()
+            .expect("ref must exist in the snapshot");
+        assert_eq!(ref_entry.target, oid, "ref target must survive the snapshot");
+    }
+}
