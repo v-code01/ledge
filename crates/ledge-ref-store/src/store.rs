@@ -20,12 +20,12 @@
 //! accepting any new writes.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use ledge_core::{HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::art::{art_delete, art_insert, art_lookup, art_prefix_iter, ArtNode};
 use crate::snapshot::ArtSnapshot;
@@ -47,6 +47,8 @@ pub struct RefStoreImpl {
     hlc: Arc<HLC>,
     /// Write-ahead log for durability.
     wal: Arc<Wal>,
+    /// WAL size threshold (bytes) above which background compaction fires.
+    wal_compact_threshold_bytes: u64,
     /// Data directory (unused after open, kept for diagnostics).
     #[allow(dead_code)]
     data_dir: PathBuf,
@@ -59,9 +61,26 @@ impl RefStoreImpl {
     /// `data_dir/refs/wal`, replays it to reconstruct in-memory state,
     /// and returns a ready-to-use store.
     ///
+    /// Uses a default compaction threshold of 64 MiB.
+    ///
     /// # Errors
     /// Propagates any WAL I/O or corruption error.
     pub fn open(data_dir: PathBuf, hlc: Arc<HLC>) -> Result<Self> {
+        Self::open_with_compaction_threshold(data_dir, hlc, 64 * 1024 * 1024)
+    }
+
+    /// Open (or create) the ref store with an explicit WAL compaction threshold.
+    ///
+    /// The background compaction task (launched via `spawn_compaction_task`) will
+    /// trigger `compact_wal()` whenever the WAL file exceeds `threshold_bytes`.
+    ///
+    /// # Errors
+    /// Propagates any WAL I/O or corruption error.
+    pub fn open_with_compaction_threshold(
+        data_dir: PathBuf,
+        hlc: Arc<HLC>,
+        threshold_bytes: u64,
+    ) -> Result<Self> {
         let refs_dir = data_dir.join("refs");
         std::fs::create_dir_all(&refs_dir).map_err(LedgeError::Io)?;
 
@@ -93,8 +112,54 @@ impl RefStoreImpl {
             root: ArcSwap::new(Arc::new(root)),
             hlc,
             wal: Arc::new(wal),
+            wal_compact_threshold_bytes: threshold_bytes,
             data_dir,
         })
+    }
+
+    /// Compact the WAL by snapshotting all current refs into a single
+    /// `Checkpoint` frame, truncating everything before it.
+    ///
+    /// Subsequent `append()` calls land after the checkpoint, so on the next
+    /// `open()` only the checkpoint plus subsequent entries are replayed.
+    ///
+    /// # Errors
+    /// Propagates WAL encode or I/O errors.
+    pub async fn compact_wal(&self) -> Result<()> {
+        // Take an O(1) snapshot of the current ART root.
+        let snap = self.snapshot();
+        // Collect all leaves from the snapshot for the checkpoint payload.
+        let leaves: Vec<(String, RefEntry)> = snap
+            .list("")
+            .into_iter()
+            .map(|(name, entry)| (name.as_str().to_string(), entry))
+            .collect();
+        self.wal.compact(leaves).await
+    }
+
+    /// Spawn a background tokio task that periodically checks the WAL size
+    /// and calls `compact_wal()` when it exceeds the configured threshold.
+    ///
+    /// Uses a `Weak` reference so the task exits automatically once the store
+    /// is dropped — no explicit cancellation needed.
+    ///
+    /// The task polls every 100 ms.
+    pub fn spawn_compaction_task(self: &Arc<Self>) {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let Some(store) = weak.upgrade() else {
+                    // Store has been dropped; exit the task.
+                    break;
+                };
+                if store.wal.file_size_bytes() > store.wal_compact_threshold_bytes {
+                    if let Err(e) = store.compact_wal().await {
+                        warn!("background WAL compaction failed: {e:?}");
+                    }
+                }
+            }
+        });
     }
 }
 

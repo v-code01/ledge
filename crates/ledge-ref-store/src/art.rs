@@ -157,14 +157,14 @@ pub fn art_lookup<'a>(node: &'a ArtNode, key: &[u8], depth: usize) -> Option<&'a
                 return None;
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return None;
-            }
-            let byte = key[after];
+            // Key exhausted at inner-node boundary: look for the null-byte child
+            // which holds the entry for this exact prefix key.
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             for i in 0..n.count as usize {
                 if n.keys[i] == byte {
                     if let Some(child) = &n.children[i] {
-                        return art_lookup(child, key, after + 1);
+                        return art_lookup(child, key, next_depth);
                     }
                 }
             }
@@ -177,14 +177,12 @@ pub fn art_lookup<'a>(node: &'a ArtNode, key: &[u8], depth: usize) -> Option<&'a
                 return None;
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return None;
-            }
-            let byte = key[after];
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             for i in 0..n.count as usize {
                 if n.keys[i] == byte {
                     if let Some(child) = &n.children[i] {
-                        return art_lookup(child, key, after + 1);
+                        return art_lookup(child, key, next_depth);
                     }
                 }
             }
@@ -197,16 +195,14 @@ pub fn art_lookup<'a>(node: &'a ArtNode, key: &[u8], depth: usize) -> Option<&'a
                 return None;
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return None;
-            }
-            let byte = key[after];
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             let idx = n.key_index[byte as usize];
             if idx == 0xFF {
                 return None;
             }
             if let Some(child) = &n.children[idx as usize] {
-                art_lookup(child, key, after + 1)
+                art_lookup(child, key, next_depth)
             } else {
                 None
             }
@@ -218,12 +214,10 @@ pub fn art_lookup<'a>(node: &'a ArtNode, key: &[u8], depth: usize) -> Option<&'a
                 return None;
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return None;
-            }
-            let byte = key[after] as usize;
-            if let Some(child) = &n.children[byte] {
-                art_lookup(child, key, after + 1)
+            let byte = if after >= key.len() { 0x00u8 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
+            if let Some(child) = &n.children[byte as usize] {
+                art_lookup(child, key, next_depth)
             } else {
                 None
             }
@@ -387,22 +381,48 @@ pub fn art_insert(
             let common: Vec<u8> = key[depth..depth + cp].to_vec();
             let mut new_node4 = Node4::new(common);
 
-            let existing_byte = existing_key[depth + cp];
-            let new_byte = key[depth + cp];
-
             let existing_leaf = Arc::clone(&node);
             let new_leaf = Arc::new(ArtNode::Leaf(LeafNode {
                 key: key.into(),
                 entry,
             }));
 
-            // Place into sorted order.
-            let (pos_existing, pos_new) = if existing_byte < new_byte { (0, 1) } else { (1, 0) };
-            new_node4.keys[pos_existing] = existing_byte;
-            new_node4.children[pos_existing] = Some(existing_leaf);
-            new_node4.keys[pos_new] = new_byte;
-            new_node4.children[pos_new] = Some(new_leaf);
-            new_node4.count = 2;
+            // Handle the case where one key is a strict prefix of the other.
+            // The shorter key is stored under the null-byte discriminant (0x00)
+            // to match the convention used in inner-node traversal.
+            let existing_exhausted = depth + cp >= existing_key.len();
+            let new_exhausted = depth + cp >= key.len();
+
+            if existing_exhausted {
+                // existing_key is a prefix of new key — existing leaf goes under 0x00,
+                // new leaf is rooted one level deeper under new_byte.
+                let new_byte = key[depth + cp];
+                let (p0, p1) = if 0x00u8 < new_byte { (0, 1) } else { (1, 0) };
+                new_node4.keys[p0] = 0x00;
+                new_node4.children[p0] = Some(existing_leaf);
+                new_node4.keys[p1] = new_byte;
+                new_node4.children[p1] = Some(new_leaf);
+                new_node4.count = 2;
+            } else if new_exhausted {
+                // new key is a prefix of existing_key — new leaf goes under 0x00.
+                let existing_byte = existing_key[depth + cp];
+                let (p0, p1) = if 0x00u8 < existing_byte { (0, 1) } else { (1, 0) };
+                new_node4.keys[p0] = 0x00;
+                new_node4.children[p0] = Some(new_leaf);
+                new_node4.keys[p1] = existing_byte;
+                new_node4.children[p1] = Some(existing_leaf);
+                new_node4.count = 2;
+            } else {
+                let existing_byte = existing_key[depth + cp];
+                let new_byte = key[depth + cp];
+                // Place into sorted order.
+                let (pos_existing, pos_new) = if existing_byte < new_byte { (0, 1) } else { (1, 0) };
+                new_node4.keys[pos_existing] = existing_byte;
+                new_node4.children[pos_existing] = Some(existing_leaf);
+                new_node4.keys[pos_new] = new_byte;
+                new_node4.children[pos_new] = Some(new_leaf);
+                new_node4.count = 2;
+            }
             Arc::new(ArtNode::Node4(new_node4))
         }
 
