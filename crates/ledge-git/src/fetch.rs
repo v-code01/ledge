@@ -224,17 +224,25 @@ pub async fn handle_upload_pack_discovery(
     _objects: Arc<dyn ObjectStore>,
     refs: Arc<dyn RefStore>,
     sha1_store: &dyn Sha1Provider,
+    segment: &str,
 ) -> ledge_core::Result<Vec<u8>> {
     let mut out = Vec::new();
     // Service line + flush (required by git smart HTTP spec §3).
     out.extend_from_slice(&encode(b"# service=git-upload-pack\n"));
     out.extend_from_slice(&encode_flush());
 
-    let mut all_refs = refs.list("refs/").await?;
-    // Deterministic order so HEAD selection and the advertisement are stable.
-    all_refs.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    // List only the segment's namespace. segment=="" ⇒ "refs/" (Phase 1).
+    let list_prefix = format!("refs/{segment}");
+    let mut all_refs = refs.list(&list_prefix).await?;
+    // Present client-facing names; sort on the PRESENTED name so HEAD selection
+    // and advertisement order match what the client will see.
+    let mut presented: Vec<(String, ledge_core::RefEntry)> = all_refs
+        .drain(..)
+        .map(|(n, e)| (present_ref(n.as_str(), segment), e))
+        .collect();
+    presented.sort_by(|a, b| a.0.cmp(&b.0));
 
-    if all_refs.is_empty() {
+    if presented.is_empty() {
         // No refs yet — emit the null-id capabilities advertisement.
         out.extend_from_slice(&encode(
             b"0000000000000000000000000000000000000000 capabilities^{}\0\n",
@@ -244,12 +252,13 @@ pub async fn handle_upload_pack_discovery(
         // refs/heads/main, then refs/heads/master, else the first ref.
         // The advertisement leads with HEAD (same SHA-1 as the default
         // branch) plus a `symref=HEAD:<branch>` capability so the client
-        // knows which branch to check out after clone.
-        let default_ref = all_refs
+        // knows which branch to check out after clone. Selection keys off the
+        // PRESENTED (client-facing) name.
+        let default_ref = presented
             .iter()
-            .find(|(n, _)| n.as_str() == "refs/heads/main")
-            .or_else(|| all_refs.iter().find(|(n, _)| n.as_str() == "refs/heads/master"))
-            .unwrap_or(&all_refs[0]);
+            .find(|(n, _)| n == "refs/heads/main")
+            .or_else(|| presented.iter().find(|(n, _)| n == "refs/heads/master"))
+            .unwrap_or(&presented[0]);
         let head_sha1 = sha1_store.sha1_of(default_ref.1.target).await.ok_or_else(|| {
             LedgeError::Corruption(format!(
                 "no SHA-1 for HEAD target object {}",
@@ -257,7 +266,7 @@ pub async fn handle_upload_pack_discovery(
             ))
         })?;
         let head_sha1_hex = hex::encode(head_sha1);
-        let default_name = default_ref.0.as_str().to_string();
+        let default_name = default_ref.0.clone();
 
         // HEAD line carries the capabilities, including the symref hint.
         out.extend_from_slice(&encode(
@@ -268,16 +277,16 @@ pub async fn handle_upload_pack_discovery(
             .as_bytes(),
         ));
 
-        for (ref_name, entry) in &all_refs {
+        for (ref_name, entry) in &presented {
             let sha1 = sha1_store.sha1_of(entry.target).await.ok_or_else(|| {
                 LedgeError::Corruption(format!(
                     "no SHA-1 for object {} (ref {})",
                     entry.target.to_hex(),
-                    ref_name.as_str()
+                    ref_name
                 ))
             })?;
             out.extend_from_slice(
-                &encode(format!("{} {}\n", hex::encode(sha1), ref_name.as_str()).as_bytes()),
+                &encode(format!("{} {}\n", hex::encode(sha1), ref_name).as_bytes()),
             );
         }
     }
@@ -586,6 +595,7 @@ mod tests {
             objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
@@ -608,6 +618,7 @@ mod tests {
             objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
@@ -630,6 +641,47 @@ mod tests {
             }
         }
         assert!(found, "discovery must contain SHA-1 and ref name");
+    }
+
+    #[tokio::test]
+    async fn discovery_workspace_segment_presents_stripped_names() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x07);
+        let id = objects.seed(Bytes::from_static(b"ws blob"), sha1);
+        // Stored under the workspace namespace.
+        refs.insert("refs/workspaces/abc/heads/main", id);
+        // A durable ref that must NOT appear in the workspace advertisement.
+        let other = objects.seed(Bytes::from_static(b"durable blob"), make_sha1(0x08));
+        refs.insert("refs/heads/main", other);
+
+        let response = handle_upload_pack_discovery(
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            "workspaces/abc/",
+        )
+        .await
+        .unwrap();
+
+        let sha1_hex = hex::encode(sha1);
+        let mut saw_presented = false;
+        let mut saw_stored = false;
+        let mut saw_head_symref = false;
+        let mut cursor: &[u8] = &response;
+        while !cursor.is_empty() {
+            let (line, rem) = crate::pkt_line::decode_line(cursor).unwrap();
+            cursor = rem;
+            if let crate::pkt_line::PktLine::Data(d) = line {
+                let s = String::from_utf8_lossy(&d);
+                if s.contains(&sha1_hex) && s.contains("refs/heads/main") { saw_presented = true; }
+                if s.contains("refs/workspaces/abc/") { saw_stored = true; }
+                if s.contains("symref=HEAD:refs/heads/main") { saw_head_symref = true; }
+            }
+        }
+        assert!(saw_presented, "must advertise the stripped client name refs/heads/main");
+        assert!(!saw_stored, "must NOT leak the stored workspace-prefixed name");
+        assert!(saw_head_symref, "HEAD symref must point at the stripped name");
     }
 
     #[tokio::test]
