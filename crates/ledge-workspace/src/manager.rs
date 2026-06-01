@@ -157,6 +157,55 @@ impl WorkspaceManager {
         self.leases.put(lease.clone()).await?;
         Ok(lease)
     }
+
+    /// Promote workspace refs to durable targets via CAS. For each
+    /// `(ws_ref, durable_ref)` mapping:
+    ///   - read the workspace ref entry; skip the mapping if it is absent
+    ///     (nothing to promote — not an error, mirrors git's silent no-op);
+    ///   - read the current durable entry:
+    ///       * absent  => `update(durable, target, None)`            (create)
+    ///       * present => `update(durable, target, Some(cur.target))` (CAS)
+    ///   - `Ok`                => [`CommitOutcome::Ok`]
+    ///   - `Err(Conflict{..})` => [`CommitOutcome::Conflict`] (the durable ref
+    ///     moved under us — surface, do not overwrite)
+    ///   - any other error propagates.
+    ///
+    /// Does NOT release the workspace.
+    ///
+    /// Complexity: O(m) for m mappings (2 reads + 1 write each, worst case).
+    pub async fn commit(
+        &self,
+        _id: WorkspaceId,
+        mappings: &[(RefName, RefName)],
+    ) -> Result<Vec<CommitOutcome>> {
+        let mut outcomes = Vec::with_capacity(mappings.len());
+
+        for (ws_ref, durable_ref) in mappings {
+            let ws_entry = match self.refs.get(ws_ref).await? {
+                Some(e) => e,
+                None => continue, // nothing to promote from this workspace ref
+            };
+
+            let current = self.refs.get(durable_ref).await?;
+            let expected = current.as_ref().map(|c| c.target);
+
+            match self.refs.update(durable_ref, ws_entry.target, expected).await {
+                Ok(entry) => outcomes.push(CommitOutcome::Ok {
+                    target: durable_ref.as_str().to_string(),
+                    entry,
+                }),
+                Err(LedgeError::Conflict { current }) => {
+                    outcomes.push(CommitOutcome::Conflict {
+                        target: durable_ref.as_str().to_string(),
+                        current,
+                    });
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        Ok(outcomes)
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +339,50 @@ mod tests {
         let persisted = mgr.leases.get(view.id).await.unwrap().expect("lease");
         assert_eq!(persisted.generation, renewed.generation);
         assert_eq!(persisted.expires_at_ms, renewed.expires_at_ms);
+    }
+
+    #[tokio::test]
+    async fn commit_promotes_to_new_durable_ref() {
+        let (mgr, _dir) = setup();
+        // Seed a source; fork; the workspace ref target == source target.
+        let src = r("refs/heads/main");
+        let src_target = oid(1);
+        mgr.refs.update(&src, src_target, None).await.unwrap();
+        let view = mgr
+            .fork(&[src.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // Durable target ref does NOT exist yet.
+        let durable = r("refs/heads/feature");
+        assert!(mgr.refs.get(&durable).await.unwrap().is_none());
+
+        let ws = workspace_ref(&view.id, &src).unwrap();
+        let outcomes = mgr
+            .commit(view.id, &[(ws.clone(), durable.clone())])
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            CommitOutcome::Ok { target, entry } => {
+                assert_eq!(target, "refs/heads/feature");
+                assert_eq!(entry.target, src_target);
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+
+        // Durable ref now resolves to the promoted target.
+        let now = mgr
+            .refs
+            .get(&durable)
+            .await
+            .unwrap()
+            .expect("durable now present");
+        assert_eq!(now.target, src_target);
+
+        // Commit does NOT release the workspace: its refs and lease persist.
+        assert!(mgr.refs.get(&ws).await.unwrap().is_some());
+        assert!(mgr.leases.get(view.id).await.unwrap().is_some());
     }
 }
