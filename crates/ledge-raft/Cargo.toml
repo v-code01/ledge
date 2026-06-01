@@ -8,6 +8,7 @@ ledge-core = { path = "../ledge-core" }
 ledge-ref-store = { path = "../ledge-ref-store" }
 ledge-workspace = { path = "../ledge-workspace" }
 openraft = { workspace = true, features = ["serde", "storage-v2"] }
+arc-swap = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }

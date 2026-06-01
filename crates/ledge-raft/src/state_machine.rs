@@ -23,6 +23,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use ledge_core::{RefEntry, RefName, HLC};
 use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::lease::{Lease, LeaseStore};
@@ -43,12 +44,24 @@ struct StateDump {
     leases: Vec<Lease>,
 }
 
-/// The Ledge state machine: applied ref + lease state plus Raft bookkeeping.
-pub struct StateMachineStore {
+/// The applied stores, swapped atomically as a unit on snapshot install so a
+/// shared [`ReadHandle`] always observes a consistent (refs, leases) pair and
+/// never a torn mix of pre- and post-install state. `_dir` is held here so the
+/// backing tempdir lives exactly as long as the stores it backs.
+struct Stores {
     refs: Arc<RefStoreImpl>,
     leases: Arc<LeaseStore>,
-    /// Held so the tempdir lives as long as the SM (test/in-memory mode).
+    /// Held so the tempdir lives as long as the stores (test/in-memory mode).
     _dir: Option<TempDir>,
+}
+
+/// The Ledge state machine: applied ref + lease state plus Raft bookkeeping.
+pub struct StateMachineStore {
+    /// Shared, atomically-swappable stores. `Raft` owns the SM and mutates
+    /// through `&mut self`, but a cloned [`ReadHandle`] shares this same cell,
+    /// so tests can read each replica's applied state directly. `ArcSwap` makes
+    /// the snapshot-install replacement visible to those handles.
+    stores: Arc<ArcSwap<Stores>>,
     /// Last applied log id (`None` until the first entry is applied).
     last_applied_log: Option<LogId<u64>>,
     /// Last applied membership config.
@@ -69,24 +82,45 @@ impl StateMachineStore {
         let refs = Arc::new(RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone()).unwrap());
         let leases = Arc::new(LeaseStore::open(dir.path().to_path_buf(), hlc).unwrap());
         Self {
-            refs,
-            leases,
-            _dir: Some(dir),
+            stores: Arc::new(ArcSwap::from_pointee(Stores {
+                refs,
+                leases,
+                _dir: Some(dir),
+            })),
             last_applied_log: None,
             last_membership: StoredMembership::default(),
             snapshot_idx: 0,
         }
     }
 
+    /// A cloneable, read-only handle onto this SM's applied state. The handle
+    /// shares the same `ArcSwap` cell as the SM, so reads observe every applied
+    /// entry and survive a snapshot-install store swap. Used by cluster tests to
+    /// assert per-replica convergence without routing through Raft.
+    pub fn read_handle(&self) -> ReadHandle {
+        ReadHandle {
+            stores: self.stores.clone(),
+        }
+    }
+
+    /// Snapshot the current stores (a cheap `ArcSwap` load + `Arc` clones).
+    fn refs_arc(&self) -> Arc<RefStoreImpl> {
+        self.stores.load().refs.clone()
+    }
+
+    fn leases_arc(&self) -> Arc<LeaseStore> {
+        self.stores.load().leases.clone()
+    }
+
     /// Test/read helper: current ref entry.
     pub async fn refs_get(&self, name: &RefName) -> Option<RefEntry> {
         use ledge_core::RefStore;
-        self.refs.get(name).await.unwrap()
+        self.refs_arc().get(name).await.unwrap()
     }
 
     /// Test/read helper: live leases (all non-expired-at-0, i.e. effectively all).
     pub async fn leases_all(&self) -> Vec<Lease> {
-        self.leases.live(0).await.unwrap_or_default()
+        self.leases_arc().live(0).await.unwrap_or_default()
     }
 
     /// Apply a single op through the proven storage path, returning its response.
@@ -101,10 +135,13 @@ impl StateMachineStore {
                     .to_applied()
                     .expect("ref op converts")
                     .expect("committed ref name is valid");
-                outcome_to_resp(self.refs.apply_op(&applied).await)
+                outcome_to_resp(self.refs_arc().apply_op(&applied).await)
             }
             LedgeOp::LeasePut { lease } => {
-                self.leases.put(lease.clone()).await.expect("lease put");
+                self.leases_arc()
+                    .put(lease.clone())
+                    .await
+                    .expect("lease put");
                 LedgeResp::LeaseOk
             }
             LedgeOp::LeaseTombstone { id, .. } => {
@@ -112,7 +149,10 @@ impl StateMachineStore {
                 // An explicit-hlc tombstone path (mirroring apply_op) is Task 6;
                 // until then the determinism guarantee is exercised on the ref
                 // path (the safety core).
-                self.leases.tombstone(*id).await.expect("lease tombstone");
+                self.leases_arc()
+                    .tombstone(*id)
+                    .await
+                    .expect("lease tombstone");
                 LedgeResp::LeaseOk
             }
         }
@@ -121,13 +161,14 @@ impl StateMachineStore {
     /// Serialize the full applied state for a snapshot.
     async fn dump(&self) -> Vec<u8> {
         use ledge_core::RefStore;
-        let snap = self.refs.snapshot();
+        let refs_arc = self.refs_arc();
+        let snap = refs_arc.snapshot();
         let refs: Vec<(String, RefEntry)> = snap
             .list("")
             .into_iter()
             .map(|(n, e)| (n.as_str().to_string(), e))
             .collect();
-        let leases = self.leases.live(0).await.unwrap_or_default();
+        let leases = self.leases_arc().live(0).await.unwrap_or_default();
         let dump = StateDump { refs, leases };
         bincode::serde::encode_to_vec(&dump, bincode::config::standard()).unwrap()
     }
@@ -159,9 +200,39 @@ impl StateMachineStore {
         for lease in dump.leases {
             leases.put(lease).await.expect("restore lease");
         }
-        self.refs = refs;
-        self.leases = leases;
-        self._dir = Some(dir);
+        // Atomically swap the whole store set so any shared ReadHandle observes
+        // the restored state as one consistent unit, never a torn pair.
+        self.stores.store(Arc::new(Stores {
+            refs,
+            leases,
+            _dir: Some(dir),
+        }));
+    }
+}
+
+/// A cloneable, read-only view of a [`StateMachineStore`]'s applied state.
+///
+/// Shares the SM's `ArcSwap<Stores>` cell, so it always reflects the latest
+/// applied refs/leases — including after a snapshot install swaps the backing
+/// stores. Cluster tests hold one per replica to assert convergence directly.
+#[derive(Clone)]
+pub struct ReadHandle {
+    stores: Arc<ArcSwap<Stores>>,
+}
+
+impl ReadHandle {
+    /// Current applied ref entry for `name`, or `None` if absent.
+    pub async fn applied_ref(&self, name: &str) -> Option<RefEntry> {
+        use ledge_core::RefStore;
+        let refs = self.stores.load().refs.clone();
+        let rn = RefName::new(name).ok()?;
+        refs.get(&rn).await.unwrap()
+    }
+
+    /// All currently-live leases.
+    pub async fn applied_leases(&self) -> Vec<Lease> {
+        let leases = self.stores.load().leases.clone();
+        leases.live(0).await.unwrap_or_default()
     }
 }
 
@@ -252,8 +323,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             None => format!("--{}", self.snapshot_idx),
         };
         LedgeSnapshotBuilder {
-            refs: self.refs.clone(),
-            leases: self.leases.clone(),
+            refs: self.refs_arc(),
+            leases: self.leases_arc(),
             last_applied_log: self.last_applied_log,
             last_membership: self.last_membership.clone(),
             snapshot_id,

@@ -24,5 +24,10 @@ pub mod type_config;
 
 pub use log_store::LogStore;
 pub use op::{outcome_to_resp, LedgeOp, LedgeResp};
-pub use state_machine::StateMachineStore;
+pub use state_machine::{ReadHandle, StateMachineStore};
 pub use type_config::TypeConfig;
+
+/// Raft node id type for the Ledge cluster (re-exported for downstream crates).
+pub type NodeId = u64;
+/// Address-bearing node descriptor (openraft `BasicNode`).
+pub use openraft::BasicNode as Node;

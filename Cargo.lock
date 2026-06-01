@@ -1577,6 +1577,7 @@ dependencies = [
 name = "ledge-raft"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bincode",
  "ledge-core",
  "ledge-ref-store",
