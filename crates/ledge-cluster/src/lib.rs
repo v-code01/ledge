@@ -5,9 +5,11 @@
 //! [`testkit`] harness that proves per-shard linearizability and crash
 //! fault-tolerance against `openraft 0.9.24`.
 pub mod net_mem;
+pub mod ref_store;
 pub mod router;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
-pub use router::{ShardId, ShardRouter};
+pub use ref_store::{ClusterLeaseStore, ClusterRefStore, ConsistencyMode, ShardHandle};
+pub use router::{ShardId, ShardRouter, ShardSpan};
