@@ -16,6 +16,9 @@ pub struct AppState {
     pub workspaces: Arc<ledge_workspace::WorkspaceManager>,
     pub leases: Arc<ledge_workspace::LeaseStore>,
     pub gc: Arc<ledge_workspace::Gc>,
+    /// Fallback TTL (seconds) for `POST /workspaces` when the request omits
+    /// `ttl_seconds`. Sourced from `workspace.default_ttl_secs` config.
+    pub default_ttl_secs: u64,
 }
 
 #[derive(Deserialize)]

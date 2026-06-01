@@ -43,7 +43,10 @@ impl StringOrVec {
 #[derive(Debug, Deserialize)]
 pub struct ForkRequest {
     pub source: StringOrVec,
-    pub ttl_seconds: u64,
+    /// Optional. When omitted, the server falls back to `default_ttl_secs`
+    /// (config `workspace.default_ttl_secs`).
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,9 +173,10 @@ pub async fn create_workspace(
             }
         }
     }
+    let ttl_secs = req.ttl_seconds.unwrap_or(state.default_ttl_secs);
     match state
         .workspaces
-        .fork(&sources, Duration::from_secs(req.ttl_seconds))
+        .fork(&sources, Duration::from_secs(ttl_secs))
         .await
     {
         Ok(view) => {
@@ -369,7 +373,7 @@ mod tests {
         let v: ForkRequest =
             serde_json::from_str(r#"{"source":"refs/heads/main","ttl_seconds":3600}"#).unwrap();
         assert_eq!(v.source.into_vec(), vec!["refs/heads/main".to_string()]);
-        assert_eq!(v.ttl_seconds, 3600);
+        assert_eq!(v.ttl_seconds, Some(3600));
     }
 
     #[test]
@@ -444,6 +448,7 @@ mod route_tests {
             workspaces,
             leases,
             gc,
+            default_ttl_secs: 3600,
         }
     }
 
@@ -485,6 +490,91 @@ mod route_tests {
         let b2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b2).unwrap();
         assert_eq!(v["id"], id);
+    }
+
+    /// POST /workspaces with no `ttl_seconds` is accepted and the lease expiry
+    /// reflects the configured default (here 3600s → ~3.6e6 ms in the future).
+    #[tokio::test]
+    async fn create_without_ttl_uses_default() {
+        let dir = TempDir::new().unwrap();
+        let state = test_state(&dir);
+        let default_ttl_ms = state.default_ttl_secs * 1000;
+        let app = crate::build_app(state);
+
+        let before_ms = wall_now_ms();
+        let body = r#"{"source":[]}"#; // no ttl_seconds
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let id = j["id"].as_str().unwrap().to_string();
+        let expires = j["expires_at_ms"].as_u64().unwrap();
+        // Expiry must be in the future, and consistent with the default TTL.
+        assert!(expires > before_ms, "expiry {expires} not after {before_ms}");
+        // Lower-bound: at least the default TTL out from when we started.
+        assert!(
+            expires >= before_ms + default_ttl_ms - 1000,
+            "expiry {expires} short of default TTL window (base {before_ms}, ttl_ms {default_ttl_ms})"
+        );
+
+        // GET shows the same future expiry (200, not 410).
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/workspaces/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let b2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b2).unwrap();
+        assert!(v["lease"]["expires_at_ms"].as_u64().unwrap() > wall_now_ms());
+    }
+
+    /// An explicit `ttl_seconds` is honored over the default. A tiny TTL yields
+    /// an expiry well below the (much larger) default window.
+    #[tokio::test]
+    async fn create_with_explicit_ttl_is_honored() {
+        let dir = TempDir::new().unwrap();
+        let app = crate::build_app(test_state(&dir));
+
+        let before_ms = wall_now_ms();
+        let body = r#"{"source":[],"ttl_seconds":60}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let expires = j["expires_at_ms"].as_u64().unwrap();
+        // 60s TTL → expiry within [before, before + ~120s], far below the 3600s default.
+        assert!(expires > before_ms, "expiry {expires} not after {before_ms}");
+        assert!(
+            expires < before_ms + 120_000,
+            "explicit 60s TTL not honored: expiry {expires} too far from base {before_ms}"
+        );
     }
 
     #[tokio::test]
