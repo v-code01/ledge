@@ -286,7 +286,7 @@ async fn fork_commit_promotes_durable_ref() {
 }
 
 #[tokio::test]
-async fn commit_conflict_yields_ok_false() {
+async fn commit_foreign_workspace_ref_rejected() {
     // A true CAS conflict in `commit`: the workspace ref carries work, but a
     // SECOND committer races and CAS-promotes the same durable ref first. The
     // manager re-reads the live durable, then its CAS is rejected because the

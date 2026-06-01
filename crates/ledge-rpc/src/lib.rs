@@ -21,8 +21,9 @@ use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, WorkspaceManager};
 
 /// Generated Cap'n Proto types for `sdk/schema/ledge.capnp`. The capnpc-emitted
-/// code is the only `unsafe`-containing code in this crate (we `#![forbid]` it
-/// in our own module tree); it is generated, reviewed-by-construction code.
+/// code is the only `unsafe`-containing code in this crate (we `#![deny]` it —
+/// `deny` not `forbid`, so this generated module can scope an
+/// `#[allow(unsafe_code)]`); it is generated, reviewed-by-construction code.
 #[allow(clippy::all)]
 #[allow(unsafe_code)]
 pub mod ledge_capnp {
