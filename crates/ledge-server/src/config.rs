@@ -7,6 +7,7 @@ pub struct LedgeConfig {
     pub object_store: ObjectStoreConfig,
     pub ref_store: RefStoreConfig,
     pub metrics: MetricsConfig,
+    pub workspace: WorkspaceConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -31,6 +32,13 @@ pub struct MetricsConfig {
     pub addr: String,
 }
 
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct WorkspaceConfig {
+    pub expiry_interval_secs: u64,
+    pub gc_interval_secs: u64,
+    pub default_ttl_secs: u64,
+}
+
 impl LedgeConfig {
     pub fn load(config_path: Option<&PathBuf>) -> ledge_core::Result<Self> {
         use config::{Config, Environment, File};
@@ -40,7 +48,10 @@ impl LedgeConfig {
             .set_default("object_store.fanout_depth",          2i64).map_err(map_cfg)?
             .set_default("ref_store.wal_compact_threshold_mb", 64i64).map_err(map_cfg)?
             .set_default("metrics.enabled",                    true).map_err(map_cfg)?
-            .set_default("metrics.addr",                       "0.0.0.0:9090").map_err(map_cfg)?;
+            .set_default("metrics.addr",                       "0.0.0.0:9090").map_err(map_cfg)?
+            .set_default("workspace.expiry_interval_secs",     30i64).map_err(map_cfg)?
+            .set_default("workspace.gc_interval_secs",         300i64).map_err(map_cfg)?
+            .set_default("workspace.default_ttl_secs",         3600i64).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -78,6 +89,15 @@ mod tests {
         assert_eq!(cfg.ref_store.wal_compact_threshold_mb, 64);
         assert!(cfg.metrics.enabled);
         assert_eq!(cfg.metrics.addr, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn workspace_defaults_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert_eq!(cfg.workspace.expiry_interval_secs, 30);
+        assert_eq!(cfg.workspace.gc_interval_secs, 300);
+        assert_eq!(cfg.workspace.default_ttl_secs, 3600);
     }
 
     #[test]
