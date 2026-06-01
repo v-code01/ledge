@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 
 import pytest
 
@@ -19,7 +20,7 @@ from server import RunningServer, build_server, start_server  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def client() -> LedgeClient:
+def client() -> Iterator[LedgeClient]:
     build_server()
     server: RunningServer = start_server()
     try:

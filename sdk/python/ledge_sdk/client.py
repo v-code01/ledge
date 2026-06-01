@@ -16,6 +16,19 @@ errors arrive in the ``Response.error`` variant and are raised as
 :class:`LedgeRpcError`; non-2xx HTTP responses raise :class:`LedgeTransportError`.
 """
 
+# pyright: reportAttributeAccessIssue=false
+#
+# pycapnp builds message/reader classes (``Request``, ``Response``, and every
+# struct/union arm) at *runtime* from the dynamically loaded ``ledge.capnp``
+# schema (see ``capnp.load`` below). There is no static type information for any
+# of those generated classes, so every field access on a capnp builder/reader
+# (``req.init(...)``, ``resp.which()``, ``resp.error``, ``w.expiresAtMs``, ...)
+# is invisible to a static checker. The builder/reader params are deliberately
+# typed ``object`` for documentation; the accesses are correct against the
+# schema and are exercised by the smoke test against the live server. This
+# pragma scopes the suppression to exactly this category (dynamic capnp
+# attribute access) for this module only; all other diagnostics stay on.
+
 from __future__ import annotations
 
 import os

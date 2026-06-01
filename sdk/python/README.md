@@ -54,3 +54,18 @@ the real server:
 .venv/bin/python -m pytest -q        # pytest suite (tests/test_smoke.py)
 .venv/bin/python -m ledge_sdk.smoke  # standalone runner (no pytest required)
 ```
+
+## Type checking
+
+`pyrightconfig.json` points Pyright at the project `.venv` (so `capnp` resolves)
+and adds `tests/` to the import path (so the in-tree `server` harness resolves).
+Install the deps into `.venv` first (see [Install](#install)), then:
+
+```bash
+pyright .                            # 0 errors
+```
+
+Every field access on a pycapnp builder/reader is a *runtime* attribute on a
+class generated from the dynamically loaded `ledge.capnp` schema, invisible to a
+static checker. `client.py` carries a scoped `# pyright: reportAttributeAccessIssue=false`
+pragma for exactly that category; all other diagnostics remain enabled.

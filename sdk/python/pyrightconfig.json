@@ -1,0 +1,7 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["tests"],
+  "include": ["ledge_sdk", "tests"],
+  "exclude": ["**/__pycache__", ".venv", ".pytest_cache"]
+}
