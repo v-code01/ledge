@@ -4,8 +4,9 @@ A runnable, **model-checked** TLA+ formalization of the Ledge ref store's
 concurrency and the Phase 2a garbage-collector safety guard. These are not
 merely *published* specs — `make check` runs TLC and reports **zero invariant
 violations** on the configured finite instances, and each headline invariant
-has been validated against a deliberately-broken model (the "negative
-control") to prove it is not vacuously true.
+has been validated against a deliberately-broken model (a "negative control")
+to prove it is not vacuously true — three are documented below
+(`NoLostUpdate`, `SnapshotIsolation`, `GCSafety`).
 
 ```
 formal/
@@ -41,6 +42,13 @@ Toolchain (override via env if needed):
 - N concurrent writer threads, each cycling: read root (capture `gen`) →
   compute new map → attempt CAS → on failure (root changed) retry. This is the
   Phase 1 `RefStoreImpl::update`/`delete` loop verbatim at protocol altitude.
+  Both flows are modeled: `BeginUpdate`/`BeginDelete` capture the read
+  generation; `CommitCAS` commits either a new entry (update) or `NONE`
+  (delete) under the same gen-guard + precondition + HLC stamp.
+- The precise abort taxonomy of `RefStoreImpl::update`/`delete`:
+  `ConflictAbort` (ref present, wrong target → `LedgeError::Conflict`),
+  `NotFoundAbort` (ref absent but a concrete target expected →
+  `LedgeError::NotFound`), and `RetryCAS` (root generation advanced → retry).
 - A monotonic Hybrid Logical Clock as a strictly-increasing global counter;
   every committed `RefEntry` is stamped with a fresh, unique, strictly-greater
   `hlc`.
@@ -63,40 +71,94 @@ data structure that cannot violate safety on its own.
 
 ## Module `RefStore.tla`
 
-**Instance** (`RefStore.cfg`): `RefNames = {r1, r2}`, `ObjectIds = {o1, o2}`,
+**Instance** (`RefStore.cfg`): `RefNames = {r1}`, `ObjectIds = {o1, o2}`,
 `Writers = {w1, w2}`, `MaxVersion = 2`, `NONE`. The state constraint bounds
-per-ref version ≤ `MaxVersion`, the global `hlc`, the `committed` log length,
-and snapshot count, so TLC's reachable graph is finite and the exhaustive BFS
-completes in ~36 s.
+per-ref version ≤ `MaxVersion`, the global `hlc`, the `committed` log length
+(`MaxCommits = MaxVersion·|RefNames| + |RefNames|`, accounting for deletes that
+let a ref be recreated), and snapshot count, so TLC's reachable graph is finite
+and the exhaustive BFS completes in ~1 s.
 
-This instance fully exercises the CAS protocol: create-if-absent, conflicting
-CAS (expected mismatch → `ConflictAbort`), generation races between the two
-writers (`RetryCAS`), and the +1 version progression per ref. Larger object /
-version bounds add only target-choice and log-length multiplicity, not new
-protocol behaviours, while exploding the graph past the sub-minute budget.
+**Why a single ref name.** The original instance used `RefNames = {r1, r2}`.
+Adding the `Delete` flow (a ref can go absent then be recreated, restarting its
+version at 1), the `NotFoundAbort` branch, and the richer snapshot record
+(frozen map + independent live witnesses) expands the per-ref state graph
+substantially; with two refs the exhaustive check exceeds the sub-minute budget
+(>6.5M distinct states and still climbing past 5 minutes). Reduced to one ref
+name, the check finishes in ~1 s. A single ref with two concurrent writers
+still fully exercises *every* modeled behaviour:
+
+- create-if-absent (`expected = NONE` on an absent ref);
+- update CAS (`expected =` matching `ObjectId`), +1 version progression;
+- conflicting CAS → `ConflictAbort` (present, wrong target → `Conflict`);
+- absent ref + concrete `expected` → `NotFoundAbort` (the `NotFound` branch,
+  distinct from `Conflict`);
+- delete (`expected =` current target) → `refs[name] := NONE`;
+- recreate after delete (version restarts at 1, clock keeps advancing);
+- generation races between the two writers → `RetryCAS`;
+- snapshot isolation across both update *and* delete commits.
+
+A second ref name adds only independent-namespace multiplicity (CAS is on the
+whole root, but per-ref safety is identical), not new protocol behaviour, while
+multiplying the state graph past budget. Coverage statistics from a
+`-coverage 60` run confirm every action — including `BeginDelete`, the delete
+case of `CommitCAS`, and `NotFoundAbort` — fires with non-zero distinct-state
+contribution (see "Delete coverage" below).
 
 ### Invariants
 
 | Invariant | One-line meaning |
 |---|---|
-| `TypeOK` | Every variable is well-typed (refs, hlc, gen, pc, local, committed, snapshots). |
-| `MonotonicVersion` | The k-th commit of a ref (in commit order) has version exactly k — +1 per commit, never decreasing, create = 1. |
-| `HLCMonotonic` | Committed hlcs are strictly increasing in commit order and pairwise unique; the global hlc only increases (the linearizability witness: a total order on writes consistent with real-time commit order). |
-| `NoLostUpdate` | No two commits win against the same root generation (`NoTwoCommitsSameReadGen`); adjacent same-ref commits differ by exactly 1 version (no skipped/duplicated version); commit stamps are unique. |
-| `SnapshotIsolation` | A captured snapshot is a frozen value — its reads never change regardless of intervening commits. |
+| `TypeOK` | Every variable is well-typed (refs, hlc, gen, pc, local, committed, snapshots), including the `op` tag (`update`/`delete`) on each commit and the snapshot's frozen-map + live-witness fields. |
+| `MonotonicVersion` | Each *update* commit of a ref has version equal to its 1-based position counted **since the most recent delete** of that ref (or since the start) — +1 per update, and a delete **resets** the count so a recreate starts at version 1 again. |
+| `HLCMonotonic` | Committed hlcs are strictly increasing in commit order and pairwise unique (deletes stamp the clock too); the global hlc only increases (the linearizability witness: a total order on writes consistent with real-time commit order). |
+| `NoLostUpdate` | No two commits win against the same root generation (`NoTwoCommitsSameReadGen`); adjacent same-ref **update** commits with no commit of that ref between them differ by exactly 1 version (no skipped/duplicated version); commit stamps are unique. |
+| `SnapshotIsolation` | A captured snapshot is a **frozen value**: reading its frozen map always yields exactly what was observed live at capture time (recorded in independent `liveTargets`/`liveVersions` witnesses), regardless of any later commit — update *or* delete — that moves live `refs` on. Falsifiable; see negative control below. |
+
+> **On `SnapshotIsolation` (was vacuous, now has teeth).** The earlier
+> formulation asserted `SnapshotGet(s, name) = s.map[name]`, where `SnapshotGet`
+> was *defined* as `s.map[name]` — a tautology testing nothing. The current
+> invariant captures, atomically with the frozen map, an independent witness of
+> each ref's live target/version at snapshot time (`liveTargets`/`liveVersions`,
+> computed via the `TargetOf`/`VersionOf` paths, not the raw map copy) and
+> asserts the frozen map *still reads that witness* at every later state. This
+> can only hold if the snapshot is a frozen value rather than a live re-read —
+> proven by the `BrokenSnapshot` negative control below.
 
 ### TLC output (clean run, `make check`)
 
 ```
 Model checking completed. No error has been found.
-4172879 states generated, 1138254 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 12.
+121949 states generated, 30888 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 10.
 ```
 
-- States generated: **4,172,879**
-- Distinct states: **1,138,254**
-- Search depth: **12**
+- States generated: **121,949**
+- Distinct states: **30,888**
+- Search depth: **10**
 - Invariant violations: **0**
+- Wall time: **~1 s**
+
+### Delete coverage (confirmation the delete commit fires)
+
+A `-coverage 60` run reports non-zero distinct-state contribution for every
+action, including the delete path: `BeginDelete` (6,112 distinct states),
+`CommitCAS` (which folds both update and delete commits), and `NotFoundAbort`
+(10,536 transitions). To prove the **delete commit itself** fires (not merely
+`BeginDelete`), a temporary probe invariant `committed[i].op # "delete"` was
+checked and TLC produced the expected counterexample — a create at version 1
+followed by a `delete` commit recording `target |-> NONE, version |-> 0`:
+
+```
+State 4: <CommitCAS(w1)>   \* the DELETE commit
+  committed = << [name|->r1, op|->"update", entry|->[target|->o1, hlc|->1, version|->1]],
+                 [name|->r1, op|->"delete", entry|->[target|->NONE, hlc|->2, version|->0]] >>
+```
+
+A second probe (`recreate after delete must not produce version 1`) likewise
+fired, exhibiting create → delete → recreate with the version **reset to 1**
+(`hlc |-> 3, version |-> 1`), confirming `MonotonicVersion`'s delete-reset
+clause is exercised and remains non-vacuous. Both probes were removed after
+confirmation; the committed module contains no probe invariants.
 
 ---
 
@@ -139,13 +201,18 @@ The depth of the complete state graph search is 22.
 
 ---
 
-## Negative control (proving the invariants have teeth)
+## Negative controls (proving the invariants have teeth)
 
 TLA+ has no unit tests — the invariants *are* the tests, and TLC is the runner.
 The TDD analogue is: introduce the known bug and confirm TLC produces the
 expected counterexample, proving the invariant actually constrains the model
 (is not vacuously true). This is the formal-methods equivalent of "watch the
 test fail first."
+
+Three negative controls are documented below, one per headline invariant:
+`NoLostUpdate` (RefStore), `SnapshotIsolation` (RefStore), and `GCSafety`
+(GcReachability). Each broken variant is built as a throwaway copy under `/tmp`
+and is **not** committed; the modules in this directory are the clean ones.
 
 ### RefStore — headline invariant `NoLostUpdate`
 
@@ -176,31 +243,27 @@ loop exists to prevent.
 > `readGen` in each committed record and add `NoTwoCommitsSameReadGen` — no two
 > commits may win against the same observed root generation. This clause depends
 > directly on the `gen` guard, so it genuinely tests it. The corrected model
-> still checks clean (4,172,879 states / 1,138,254 distinct), and the negative
-> control now fires.
+> still checks clean, and the negative control fires.
 
 **Counterexample TLC produced** (`Error: Invariant NoLostUpdate is violated`,
-exit 12, depth-5 trace):
+depth-5 trace, single-ref instance):
 
 ```
-State 3: <BeginUpdate(w2,r1,o1,NONE)>
-  /\ refs = (r1 :> NONE @@ r2 :> NONE)
-  /\ pc   = (w1 :> "trying" @@ w2 :> "trying")
+State 2: <BeginUpdate(w1,r1,o1,o1)>      \* w1 reads root at gen 0
+State 3: <BeginUpdate(w2,r1,o1,NONE)>    \* w2 also reads root at gen 0
   /\ gen  = 0
   /\ local = ( w1 :> [name|->r1, newTarget|->o1, expected|->o1,   readGen|->0]
             @@ w2 :> [name|->r1, newTarget|->o1, expected|->NONE, readGen|->0] )
 
 State 4: <CommitCAS(w2)>                  \* w2 wins against readGen 0
-  /\ refs = (r1 :> [target|->o1, hlc|->1, version|->1] @@ r2 :> NONE)
   /\ gen  = 1
-  /\ committed = << [name|->r1, hlc|->1, readGen|->0, entry|->[..version|->1]] >>
+  /\ committed = << [name|->r1, op|->"update", hlc|->1, readGen|->0,
+                     entry|->[target|->o1, hlc|->1, version|->1]] >>
 
 State 5: <CommitCAS(w1)>                  \* w1 ALSO commits against stale readGen 0
-  /\ refs = (r1 :> [target|->o1, hlc|->2, version|->2] @@ r2 :> NONE)
   /\ gen  = 2
-  /\ committed = << [name|->r1, hlc|->1, readGen|->0, entry|->[..version|->1]],
-                    [name|->r1, hlc|->2, readGen|->0, entry|->[..version|->2]] >>
-                  \* two commits both carry readGen 0  ->  NoTwoCommitsSameReadGen FALSE
+  /\ committed = << [..readGen|->0..], [..readGen|->0..] >>
+                  \* two commits both carry readGen 0 -> NoTwoCommitsSameReadGen FALSE
 ```
 
 Both writers read the root at `gen = 0`; w2 commits (gen → 1); w1 then commits
@@ -208,17 +271,66 @@ against the now-stale `readGen = 0` because the guard is gone. Two commits carry
 `readGen = 0` → a lost update. With the guard restored, every commit consumes a
 distinct generation (0, 1, 2, …) and the violation is unreachable.
 
-The broken model is **not** committed; restoring the one deleted line returns
-the clean module in this directory.
+### RefStore — headline invariant `SnapshotIsolation`
 
-### GcReachability — `GCSafety` (sanity negative control)
+**The break:** make the snapshot store a **live reference** instead of a frozen
+value — i.e. have the snapshot-read helpers re-read live `refs` rather than the
+frozen `s.map` captured at snapshot time:
 
-As an additional teeth-check, breaking `GcMark` to mark only the roots
-themselves instead of their closure (`reachable' = frozenRoots`) makes a
-reachable child (e.g. `o2`, reachable from rooted `o1`) fall into the sweep set.
-TLC reports `Error: Invariant GCSafety is violated` (exit 12), confirming
-`GCSafety` is non-vacuous. Restoring `reachable' = ReachableClosure(frozenRoots)`
-returns the clean module.
+```diff
+ (* Frozen read against a captured snapshot: read the FROZEN map by value. *)
+ SnapshotTargetOf(s, name) ==
+-    IF s.map[name] = NONE THEN NONE ELSE s.map[name].target
++    IF refs[name] = NONE THEN NONE ELSE refs[name].target   \* BROKEN: live re-read
+ SnapshotVersionOf(s, name) ==
+-    IF s.map[name] = NONE THEN 0 ELSE s.map[name].version
++    IF refs[name] = NONE THEN 0 ELSE refs[name].version     \* BROKEN: live re-read
+```
+
+This is exactly the bug `O(1)` snapshot must not have: returning a view that
+tracks live writes instead of the point-in-time root captured by
+`ArcSwap::load_full`. The `liveTargets`/`liveVersions` witnesses recorded at
+capture stay fixed, so once any later commit moves `refs` on, the broken live
+re-read diverges from the witness.
+
+**Counterexample TLC produced** (`Error: Invariant SnapshotIsolation is
+violated`, depth-3 trace):
+
+```
+State 2: <BeginUpdate(w1,r1,o1,NONE)>    \* r1 still absent
+State 3: <Snapshot>                      \* capture while r1 = NONE
+  /\ refs = (r1 :> NONE)
+  /\ snapshots = << [ map|->(r1 :> NONE), atGen|->0,
+                      liveTargets|->(r1 :> NONE), liveVersions|->(r1 :> 0) ] >>
+
+State 4: <CommitCAS(w1)>                  \* commit makes r1 = o1 (live moves on)
+  /\ refs = (r1 :> [target|->o1, hlc|->1, version|->1])
+  \* broken SnapshotTargetOf re-reads live refs -> o1, but liveTargets witness = NONE
+  \* o1 # NONE -> SnapshotIsolation FALSE
+```
+
+The snapshot was captured with `r1` absent (`liveTargets = NONE`). After the
+commit sets `r1 = o1`, the broken live re-read yields `o1`, which no longer
+matches the frozen witness `NONE` → violation. The frozen-by-value reader (the
+committed module) keeps reading `NONE` and the invariant holds. This also fires
+across a *delete* commit (snapshot of a present ref, then delete → live read
+becomes `NONE` while the witness is the old `ObjectId`).
+
+### GcReachability — `GCSafety`
+
+Breaking `GcMark` to mark only the roots themselves instead of their closure
+(`reachable' = frozenRoots`) makes a reachable child (`o2`, reachable from
+rooted `o1`) fall into the sweep set. TLC reports `Error: Invariant GCSafety is
+violated`, confirming `GCSafety` is non-vacuous:
+
+```
+State 5: <GcFreeze>   /\ candidates = {o1, o2}  /\ frozenRoots = {o1}
+State 6: <GcMark>     /\ reachable  = {o1}      \* BROKEN: should be {o1, o2}
+  \* sweep set candidates \ reachable = {o2}, but o2 is reachable from root o1
+  \* {o2} \cap ReachableClosure({o1}) = {o2} # {} -> GCSafety FALSE
+```
+
+Restoring `reachable' = ReachableClosure(frozenRoots)` returns the clean module.
 
 ---
 
