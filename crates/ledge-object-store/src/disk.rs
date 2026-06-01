@@ -22,8 +22,9 @@ use ledge_core::{LedgeError, ObjectId, ObjectStore, Result};
 ///
 /// # Object file format
 /// ```text
-/// bytes  0..20  — SHA-1 of "blob <len>\0<content>"  (Git-compatible)
-/// bytes 20..24  — reserved, always zero
+/// bytes  0..20  — SHA-1 of "<typename> <len>\0<content>"  (Git-compatible)
+/// byte     20   — git object type (1=commit, 2=tree, 3=blob, 4=tag)
+/// bytes 21..24  — reserved, always zero
 /// bytes 24..    — raw content
 /// ```
 ///
@@ -86,6 +87,165 @@ impl DiskObjectStore {
         Ok(header[..20].try_into().unwrap())
     }
 
+    /// Git object type tags (pack/loose object kinds).
+    /// 1=commit, 2=tree, 3=blob, 4=tag.
+    ///
+    /// Write `content` tagged with its git object `git_type`. The stored 20-byte
+    /// header SHA-1 is the canonical git object id: SHA1("<typename> <len>\0<content>").
+    /// The type byte is stored in the first reserved header byte so the fetch path
+    /// can reconstruct a correctly-typed pack and serve the correct SHA-1.
+    pub async fn write_git_object(
+        &self,
+        git_type: u8,
+        content: bytes::Bytes,
+    ) -> ledge_core::Result<ObjectId> {
+        let type_name = match git_type {
+            1 => "commit",
+            2 => "tree",
+            3 => "blob",
+            4 => "tag",
+            other => {
+                return Err(ledge_core::LedgeError::Corruption(format!(
+                    "unknown git object type {other}"
+                )))
+            }
+        };
+        // BLAKE3 address over raw content.
+        let blake3_hash: [u8; 32] = blake3::hash(&content).into();
+        let id = ObjectId::from_bytes(blake3_hash);
+        // Canonical git SHA-1 over "<type> <len>\0<content>".
+        let mut sha1_hasher = sha1::Sha1::new();
+        sha1::Digest::update(
+            &mut sha1_hasher,
+            format!("{type_name} {}\0", content.len()).as_bytes(),
+        );
+        sha1::Digest::update(&mut sha1_hasher, &content);
+        let sha1_hash: [u8; 20] = sha1::Digest::finalize(sha1_hasher).into();
+
+        let mut payload = Vec::with_capacity(24 + content.len());
+        payload.extend_from_slice(&sha1_hash);
+        payload.push(git_type); // reserved[0] = git type
+        payload.extend_from_slice(&[0u8; 3]); // reserved[1..4]
+        payload.extend_from_slice(&content);
+
+        let tmp = self.tmp_path();
+        let final_path = self.object_path(&id);
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(ledge_core::LedgeError::Io)?;
+        }
+        tokio::fs::write(&tmp, &payload)
+            .await
+            .map_err(ledge_core::LedgeError::Io)?;
+        tokio::fs::rename(&tmp, &final_path)
+            .await
+            .map_err(ledge_core::LedgeError::Io)?;
+        Ok(id)
+    }
+
+    /// Build a `git-SHA-1 → ObjectId` index by scanning every loose object.
+    ///
+    /// Walks `<data_dir>/objects/<XX>/<YY>/<id>` (skipping the `tmp/` staging
+    /// dir) and reads each object's 24-byte header to recover the git SHA-1.
+    /// This is the reverse map needed by the fetch path to resolve child git
+    /// SHA-1s discovered while walking a commit's reachable object graph
+    /// (commit → tree → blob), since the store is BLAKE3-addressed and git
+    /// references objects by SHA-1.
+    ///
+    /// Complexity is O(N) in the number of stored objects; acceptable for the
+    /// clone/fetch use case where a repo's object count is bounded.
+    pub async fn sha1_index(
+        &self,
+    ) -> ledge_core::Result<std::collections::HashMap<[u8; 20], ObjectId>> {
+        use tokio::io::AsyncReadExt as _;
+        let mut map = std::collections::HashMap::new();
+        let objects_dir = self.data_dir.join("objects");
+        let mut lvl1 = match tokio::fs::read_dir(&objects_dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(map),
+            Err(e) => return Err(ledge_core::LedgeError::Io(e)),
+        };
+        while let Some(d1) = lvl1.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+            let name1 = d1.file_name();
+            // Skip the write-staging directory; only 2-hex fan-out dirs hold objects.
+            if name1 == std::ffi::OsStr::new("tmp") {
+                continue;
+            }
+            if !d1
+                .file_type()
+                .await
+                .map_err(ledge_core::LedgeError::Io)?
+                .is_dir()
+            {
+                continue;
+            }
+            let mut lvl2 = tokio::fs::read_dir(d1.path())
+                .await
+                .map_err(ledge_core::LedgeError::Io)?;
+            while let Some(d2) = lvl2.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+                if !d2
+                    .file_type()
+                    .await
+                    .map_err(ledge_core::LedgeError::Io)?
+                    .is_dir()
+                {
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(d2.path())
+                    .await
+                    .map_err(ledge_core::LedgeError::Io)?;
+                while let Some(f) = files.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+                    let hex = f.file_name();
+                    let hex = match hex.to_str() {
+                        Some(h) if h.len() == 64 => h,
+                        _ => continue,
+                    };
+                    let id = match ObjectId::from_hex(hex) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    let mut file = tokio::fs::File::open(f.path())
+                        .await
+                        .map_err(ledge_core::LedgeError::Io)?;
+                    let mut header = [0u8; 24];
+                    let n = file.read(&mut header).await.map_err(ledge_core::LedgeError::Io)?;
+                    if n < 24 {
+                        continue;
+                    }
+                    let sha1: [u8; 20] = header[..20].try_into().unwrap();
+                    map.insert(sha1, id);
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Read the git object type byte from the header (reserved[0]).
+    pub async fn git_type_of(&self, id: ObjectId) -> ledge_core::Result<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let path = self.object_path(&id);
+        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ledge_core::LedgeError::NotFound(id)
+            } else {
+                ledge_core::LedgeError::Io(e)
+            }
+        })?;
+        let mut header = [0u8; 24];
+        let n = file
+            .read(&mut header)
+            .await
+            .map_err(ledge_core::LedgeError::Io)?;
+        if n < 24 {
+            return Err(ledge_core::LedgeError::Corruption(format!(
+                "object {} header truncated",
+                id.to_hex()
+            )));
+        }
+        Ok(header[20])
+    }
+
     /// Generate a unique temporary file path inside the staging directory.
     fn tmp_path(&self) -> PathBuf {
         let suffix: u64 = rand::thread_rng().gen();
@@ -95,56 +255,6 @@ impl DiskObjectStore {
             .join(suffix.to_string())
     }
 
-    /// Core write logic shared by [`write`] and [`write_batch`].
-    ///
-    /// Algorithm:
-    /// 1. Hash the content with BLAKE3 (object id) and SHA-1 (header).
-    /// 2. Build the 24-byte header followed by raw content.
-    /// 3. Write to a random tmp path, then `rename` to the canonical path.
-    ///    POSIX `rename(2)` is atomic; concurrent writers produce identical
-    ///    data so the last rename wins without corruption.
-    async fn write_inner(&self, content: &[u8]) -> Result<ObjectId> {
-        // Compute both digests in a single pass over content.
-        let mut blake3_hasher = blake3::Hasher::new();
-        let mut sha1_hasher = sha1::Sha1::new();
-        // SHA-1 uses Git's blob header: "blob <len>\0"
-        sha1_hasher.update(format!("blob {}\0", content.len()).as_bytes());
-        blake3_hasher.update(content);
-        sha1_hasher.update(content);
-
-        let blake3_bytes: [u8; 32] = blake3_hasher.finalize().into();
-        let sha1_bytes: [u8; 20] = sha1_hasher.finalize().into();
-        let id = ObjectId::from_bytes(blake3_bytes);
-
-        // Build the on-disk payload: [sha1:20][reserved:4][content]
-        let mut payload = Vec::with_capacity(24 + content.len());
-        payload.extend_from_slice(&sha1_bytes);
-        payload.extend_from_slice(&[0u8; 4]); // reserved, always zero
-        payload.extend_from_slice(content);
-
-        let tmp = self.tmp_path();
-        let final_path = self.object_path(&id);
-
-        // Ensure the two-level fan-out directory exists.
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(LedgeError::Io)?;
-        }
-
-        // Write to tmp, then atomically rename to final path.
-        // If the final path already exists (idempotent write), rename replaces
-        // it with identical data — safe because content-addressed objects are
-        // immutable.  The tmp file is always cleaned up by the OS on rename.
-        tokio::fs::write(&tmp, &payload)
-            .await
-            .map_err(LedgeError::Io)?;
-        tokio::fs::rename(&tmp, &final_path)
-            .await
-            .map_err(LedgeError::Io)?;
-
-        Ok(id)
-    }
 }
 
 #[async_trait]
@@ -153,8 +263,11 @@ impl ObjectStore for DiskObjectStore {
     ///
     /// Content-addressed deduplication: if the object already exists this is a
     /// no-op (the rename overwrites an identical file) and the same id is returned.
+    ///
+    /// Plain `write` stores raw content as a git blob (type=3), keeping the
+    /// blob SHA-1 / header layout used by the existing object-store callers.
     async fn write(&self, content: Bytes) -> Result<ObjectId> {
-        self.write_inner(&content).await
+        self.write_git_object(3, content).await
     }
 
     /// Write multiple objects, returning their ids in input order.
@@ -287,7 +400,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw.len(), 24 + content.len());
-        assert_eq!(&raw[20..24], &[0u8; 4]);
+        // reserved[0] now holds the git object type byte (3 = blob for `write`).
+        assert_eq!(raw[20], 3);
+        assert_eq!(&raw[21..24], &[0u8; 3]);
         assert_eq!(&raw[24..], content as &[u8]);
     }
 

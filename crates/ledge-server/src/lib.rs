@@ -12,13 +12,13 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(routes::healthz))
         .route("/metrics", axum::routing::get(routes::metrics_handler))
-        .route("/:repo/info/refs", axum::routing::get(routes::info_refs))
+        .route("/{repo}/info/refs", axum::routing::get(routes::info_refs))
         .route(
-            "/:repo/git-upload-pack",
+            "/{repo}/git-upload-pack",
             axum::routing::post(routes::upload_pack),
         )
         .route(
-            "/:repo/git-receive-pack",
+            "/{repo}/git-receive-pack",
             axum::routing::post(routes::receive_pack),
         )
         .with_state(state)

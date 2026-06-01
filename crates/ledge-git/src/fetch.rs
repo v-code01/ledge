@@ -14,27 +14,150 @@ pub enum GitObjectKind {
     Tag = 4,
 }
 
-/// Provides SHA-1 lookup for a given BLAKE3-addressed object.
+/// Object-store capability needed by the git fetch/push handlers.
 ///
-/// This decouples the fetch handler from the concrete `DiskObjectStore` so that
-/// tests can supply an in-memory implementation.
+/// This decouples the handlers from the concrete `DiskObjectStore` so that
+/// tests can supply an in-memory implementation.  It exposes the canonical
+/// git SHA-1, the git object type, and a typed write so that pushed objects
+/// are persisted with their true type and served back with correct typed
+/// SHA-1s and pack entries.
 #[async_trait]
 pub trait Sha1Provider: Send + Sync {
-    /// Return the Git-compatible SHA-1 (blob header hash) for `id`, or `None`
+    /// Return the Git-compatible SHA-1 (typed header hash) for `id`, or `None`
     /// if the object is not present in the store.
     async fn sha1_of(&self, id: ObjectId) -> Option<[u8; 20]>;
+
+    /// Git object type byte (1=commit, 2=tree, 3=blob, 4=tag), or `None` if
+    /// unknown / object missing.
+    async fn git_type_of(&self, id: ObjectId) -> Option<u8>;
+
+    /// Persist `content` tagged with its git object `git_type`, returning the
+    /// BLAKE3-addressed [`ObjectId`].
+    async fn write_git_object(
+        &self,
+        git_type: u8,
+        content: bytes::Bytes,
+    ) -> ledge_core::Result<ObjectId>;
+
+    /// Build a `git-SHA-1 → ObjectId` index over all stored objects.
+    ///
+    /// Used by the fetch path to resolve child SHA-1s found while walking a
+    /// commit's reachable object graph (commit → tree → blob).
+    async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId>;
 }
 
-/// Bridge `DiskObjectStore::sha1_of` to the `Sha1Provider` trait.
+/// Bridge `DiskObjectStore` to the `Sha1Provider` trait.
 ///
-/// `DiskObjectStore::sha1_of` reads the 20-byte SHA-1 stored in the object
-/// file header and returns `Result<[u8;20]>`.  We map `Err` to `None` so the
-/// fetch handler can treat a missing SHA-1 the same as a missing object.
+/// `DiskObjectStore::sha1_of` / `git_type_of` read the typed header stored in
+/// the object file and return `Result`.  We map `Err` to `None` so the
+/// handlers can treat a missing value the same as a missing object.
 #[async_trait]
 impl Sha1Provider for DiskObjectStore {
     async fn sha1_of(&self, id: ObjectId) -> Option<[u8; 20]> {
         self.sha1_of(id).await.ok()
     }
+    async fn git_type_of(&self, id: ObjectId) -> Option<u8> {
+        self.git_type_of(id).await.ok()
+    }
+    async fn write_git_object(
+        &self,
+        git_type: u8,
+        content: bytes::Bytes,
+    ) -> ledge_core::Result<ObjectId> {
+        self.write_git_object(git_type, content).await
+    }
+    async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId> {
+        self.sha1_index().await.unwrap_or_default()
+    }
+}
+
+/// Map a git object type byte to its pack [`GitObjectKind`].
+///
+/// Unknown / out-of-range bytes default to [`GitObjectKind::Blob`] so a
+/// malformed type never aborts pack encoding (it degrades to raw bytes).
+fn kind_from_type_byte(type_byte: u8) -> GitObjectKind {
+    match type_byte {
+        1 => GitObjectKind::Commit,
+        2 => GitObjectKind::Tree,
+        4 => GitObjectKind::Tag,
+        _ => GitObjectKind::Blob,
+    }
+}
+
+/// Decode a 40-char lowercase hex SHA-1 into 20 raw bytes.
+fn parse_hex_sha1(hex_str: &str) -> Option<[u8; 20]> {
+    if hex_str.len() != 40 {
+        return None;
+    }
+    let bytes = hex::decode(hex_str).ok()?;
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Extract the `tree` SHA-1 from a git commit object body.
+///
+/// A commit body is a header block of `key SP value LF` lines (the first line
+/// is always `tree <40-hex-sha1>`), a blank line, then the message.
+fn commit_tree_sha1(content: &[u8]) -> Option<[u8; 20]> {
+    let text = std::str::from_utf8(content).ok()?;
+    for line in text.lines() {
+        if line.is_empty() {
+            break; // end of header block
+        }
+        if let Some(rest) = line.strip_prefix("tree ") {
+            return parse_hex_sha1(rest.trim());
+        }
+    }
+    None
+}
+
+/// Extract all `parent` SHA-1s from a git commit object body (0+ entries).
+fn commit_parent_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
+    let mut parents = Vec::new();
+    if let Ok(text) = std::str::from_utf8(content) {
+        for line in text.lines() {
+            if line.is_empty() {
+                break; // end of header block
+            }
+            if let Some(rest) = line.strip_prefix("parent ") {
+                if let Some(sha1) = parse_hex_sha1(rest.trim()) {
+                    parents.push(sha1);
+                }
+            }
+        }
+    }
+    parents
+}
+
+/// Extract all child SHA-1s referenced by a git tree object body.
+///
+/// A tree body is a packed sequence of entries:
+/// ```text
+/// <mode-ascii> SP <name> NUL <20-byte-raw-sha1>
+/// ```
+/// Both sub-trees and blobs are returned; the BFS resolves each by SHA-1.
+fn tree_child_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
+    let mut children = Vec::new();
+    let mut pos = 0usize;
+    while pos < content.len() {
+        // Find the NUL terminating "<mode> <name>".
+        let nul = match content[pos..].iter().position(|&b| b == 0) {
+            Some(n) => pos + n,
+            None => break,
+        };
+        // The 20-byte SHA-1 immediately follows the NUL.
+        let sha1_start = nul + 1;
+        let sha1_end = sha1_start + 20;
+        if sha1_end > content.len() {
+            break;
+        }
+        let mut sha1 = [0u8; 20];
+        sha1.copy_from_slice(&content[sha1_start..sha1_end]);
+        children.push(sha1);
+        pos = sha1_end;
+    }
+    children
 }
 
 /// Encode the git pack object type-and-size varint.
@@ -89,9 +212,10 @@ fn zlib_deflate(data: &[u8]) -> Vec<u8> {
 
 /// Build a non-delta packfile from `objects`.
 ///
-/// Each object is stored as a `Blob` (type 3) regardless of the git object
-/// type — this is correct for ledge's use case where all stored bytes are raw
-/// content blobs.  The packfile layout is:
+/// Each object carries its true git type (1=commit, 2=tree, 3=blob, 4=tag) so
+/// that a real `git` client can validate the object graph after clone — a
+/// commit advertised on `refs/heads/main` must arrive as a commit, not a blob.
+/// The packfile layout is:
 ///
 /// ```text
 /// magic:   "PACK"                       4 bytes
@@ -104,9 +228,9 @@ fn zlib_deflate(data: &[u8]) -> Vec<u8> {
 /// ```
 ///
 /// # Arguments
-/// * `objects` — slice of `(sha1: &[u8;20], content: Bytes)` pairs.
-///   The SHA-1 is the Git blob SHA-1 stored in the object's on-disk header.
-pub fn encode_pack(objects: &[(&[u8; 20], Bytes)]) -> Vec<u8> {
+/// * `objects` — slice of `(git_type: u8, content: Bytes)` pairs, where
+///   `git_type` is the git object type byte.
+pub fn encode_pack(objects: &[(u8, Bytes)]) -> Vec<u8> {
     use sha1::{Digest, Sha1};
     let mut pack = Vec::new();
     // Pack header
@@ -114,8 +238,9 @@ pub fn encode_pack(objects: &[(&[u8; 20], Bytes)]) -> Vec<u8> {
     pack.extend_from_slice(&2u32.to_be_bytes()); // version 2
     pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
     // Object entries
-    for (_, content) in objects {
-        pack.extend_from_slice(&encode_type_size_varint(GitObjectKind::Blob, content.len()));
+    for (git_type, content) in objects {
+        let kind = kind_from_type_byte(*git_type);
+        pack.extend_from_slice(&encode_type_size_varint(kind, content.len()));
         pack.extend_from_slice(&zlib_deflate(content));
     }
     // SHA-1 checksum of the whole pack (excluding the trailing 20 bytes).
@@ -148,15 +273,44 @@ pub async fn handle_upload_pack_discovery(
     out.extend_from_slice(&encode(b"# service=git-upload-pack\n"));
     out.extend_from_slice(&encode_flush());
 
-    let all_refs = refs.list("refs/").await?;
+    let mut all_refs = refs.list("refs/").await?;
+    // Deterministic order so HEAD selection and the advertisement are stable.
+    all_refs.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
     if all_refs.is_empty() {
         // No refs yet — emit the null-id capabilities advertisement.
         out.extend_from_slice(&encode(
-            b"0000000000000000000000000000000000000000 capabilities^{}\0 side-band-64k\n",
+            b"0000000000000000000000000000000000000000 capabilities^{}\0\n",
         ));
     } else {
-        // First ref gets the NUL-separated capabilities appended.
-        let mut first = true;
+        // Determine the branch HEAD points at. Convention: prefer
+        // refs/heads/main, then refs/heads/master, else the first ref.
+        // The advertisement leads with HEAD (same SHA-1 as the default
+        // branch) plus a `symref=HEAD:<branch>` capability so the client
+        // knows which branch to check out after clone.
+        let default_ref = all_refs
+            .iter()
+            .find(|(n, _)| n.as_str() == "refs/heads/main")
+            .or_else(|| all_refs.iter().find(|(n, _)| n.as_str() == "refs/heads/master"))
+            .unwrap_or(&all_refs[0]);
+        let head_sha1 = sha1_store.sha1_of(default_ref.1.target).await.ok_or_else(|| {
+            LedgeError::Corruption(format!(
+                "no SHA-1 for HEAD target object {}",
+                default_ref.1.target.to_hex()
+            ))
+        })?;
+        let head_sha1_hex = hex::encode(head_sha1);
+        let default_name = default_ref.0.as_str().to_string();
+
+        // HEAD line carries the capabilities, including the symref hint.
+        out.extend_from_slice(&encode(
+            format!(
+                "{} HEAD\0symref=HEAD:{}\n",
+                head_sha1_hex, default_name
+            )
+            .as_bytes(),
+        ));
+
         for (ref_name, entry) in &all_refs {
             let sha1 = sha1_store.sha1_of(entry.target).await.ok_or_else(|| {
                 LedgeError::Corruption(format!(
@@ -165,14 +319,9 @@ pub async fn handle_upload_pack_discovery(
                     ref_name.as_str()
                 ))
             })?;
-            let sha1_hex = hex::encode(sha1);
-            let line = if first {
-                first = false;
-                format!("{} {}\0 side-band-64k\n", sha1_hex, ref_name.as_str())
-            } else {
-                format!("{} {}\n", sha1_hex, ref_name.as_str())
-            };
-            out.extend_from_slice(&encode(line.as_bytes()));
+            out.extend_from_slice(
+                &encode(format!("{} {}\n", hex::encode(sha1), ref_name.as_str()).as_bytes()),
+            );
         }
     }
     out.extend_from_slice(&encode_flush());
@@ -231,36 +380,67 @@ pub async fn handle_upload_pack(
         }
     }
 
-    // ── Build SHA-1 → ObjectId reverse map from all refs ─────────────────────
-    // We enumerate every ref the server knows about and ask the SHA-1 store
-    // for each target's SHA-1.  This O(|refs|) lookup is acceptable for the
-    // clone/fetch use case where ref counts are bounded.
-    let all_refs = refs.list("refs/").await?;
-    let mut sha1_to_obj: std::collections::HashMap<[u8; 20], ObjectId> =
-        std::collections::HashMap::new();
-    for (_, entry) in &all_refs {
-        if let Some(sha1) = sha1_store.sha1_of(entry.target).await {
-            sha1_to_obj.insert(sha1, entry.target);
-        }
-    }
+    // ── Build the global SHA-1 → ObjectId index ──────────────────────────────
+    // A clone must receive the full object closure reachable from each wanted
+    // commit (commit → tree(s) → blob(s)), not just the wanted objects
+    // themselves.  Children are referenced by git SHA-1, so we need a reverse
+    // map from SHA-1 to the BLAKE3-addressed ObjectId for every stored object.
+    let _ = refs;
+    let sha1_to_obj = sha1_store.sha1_index().await;
 
-    // ── Collect content for each wanted object ────────────────────────────────
-    let mut pack_objects: Vec<([u8; 20], Bytes)> = Vec::new();
-    for sha1 in &wanted_sha1s {
-        if let Some(obj_id) = sha1_to_obj.get(sha1) {
-            if let Ok(content) = objects.read(*obj_id).await {
-                pack_objects.push((*sha1, content));
-            }
+    // ── Walk the reachable object closure (BFS) ───────────────────────────────
+    // Starting from the wanted SHA-1s, traverse commit/tree references,
+    // collecting each object exactly once.  `seen` guards against cycles and
+    // shared sub-trees; `queue` drives the breadth-first traversal.
+    let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<[u8; 20]> = wanted_sha1s.iter().copied().collect();
+
+    while let Some(sha1) = queue.pop_front() {
+        if !seen.insert(sha1) {
+            continue;
         }
+        let Some(obj_id) = sha1_to_obj.get(&sha1).copied() else {
+            // Unknown SHA-1: skip rather than abort (client may `want` an id we
+            // do not have; git will report the missing object).
+            continue;
+        };
+        let Ok(content) = objects.read(obj_id).await else {
+            continue;
+        };
+        // Default to blob (3) if the type byte is somehow unavailable.
+        let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
+
+        // Enqueue children so the entire reachable graph is packed.
+        match git_type {
+            1 => {
+                if let Some(tree) = commit_tree_sha1(&content) {
+                    queue.push_back(tree);
+                }
+                for parent in commit_parent_sha1s(&content) {
+                    queue.push_back(parent);
+                }
+            }
+            2 => {
+                for child in tree_child_sha1s(&content) {
+                    queue.push_back(child);
+                }
+            }
+            _ => {}
+        }
+
+        pack_objects.push((git_type, content));
     }
 
     // ── Encode and return ─────────────────────────────────────────────────────
-    let refs_for_pack: Vec<(&[u8; 20], Bytes)> =
-        pack_objects.iter().map(|(s, c)| (s, c.clone())).collect();
-    let pack = encode_pack(&refs_for_pack);
+    let pack = encode_pack(&pack_objects);
 
-    let mut response = Vec::with_capacity(4 + pack.len());
-    response.extend_from_slice(b"NAK\n");
+    // Smart-HTTP upload-pack response: the NAK acknowledgement is pkt-line
+    // framed ("0008NAK\n"); the pack data follows directly as raw bytes (no
+    // side-band negotiated in Phase 1).
+    let nak = encode(b"NAK\n");
+    let mut response = Vec::with_capacity(nak.len() + pack.len());
+    response.extend_from_slice(&nak);
     response.extend_from_slice(&pack);
     Ok(response)
 }
@@ -277,12 +457,14 @@ mod tests {
     struct MemObjectStore {
         objects: Mutex<HashMap<[u8; 32], Bytes>>,
         sha1s: Mutex<HashMap<[u8; 32], [u8; 20]>>,
+        types: Mutex<HashMap<[u8; 32], u8>>,
     }
     impl MemObjectStore {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 objects: Mutex::new(HashMap::new()),
                 sha1s: Mutex::new(HashMap::new()),
+                types: Mutex::new(HashMap::new()),
             })
         }
         fn seed(&self, content: Bytes, sha1: [u8; 20]) -> ObjectId {
@@ -290,6 +472,7 @@ mod tests {
             let id = ObjectId::from_bytes(hash);
             self.objects.lock().unwrap().insert(hash, content);
             self.sha1s.lock().unwrap().insert(hash, sha1);
+            self.types.lock().unwrap().insert(hash, 3); // blob
             id
         }
     }
@@ -297,6 +480,28 @@ mod tests {
     impl Sha1Provider for MemObjectStore {
         async fn sha1_of(&self, id: ObjectId) -> Option<[u8; 20]> {
             self.sha1s.lock().unwrap().get(id.as_bytes()).copied()
+        }
+        async fn git_type_of(&self, id: ObjectId) -> Option<u8> {
+            self.types.lock().unwrap().get(id.as_bytes()).copied()
+        }
+        async fn write_git_object(
+            &self,
+            git_type: u8,
+            content: bytes::Bytes,
+        ) -> ledge_core::Result<ObjectId> {
+            let hash = *blake3::hash(&content).as_bytes();
+            let id = ObjectId::from_bytes(hash);
+            self.objects.lock().unwrap().insert(hash, content);
+            self.types.lock().unwrap().insert(hash, git_type);
+            Ok(id)
+        }
+        async fn sha1_index(&self) -> HashMap<[u8; 20], ObjectId> {
+            self.sha1s
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
+                .collect()
         }
     }
     #[async_trait]
@@ -480,7 +685,7 @@ mod tests {
         let sha1_hex = hex::encode(sha1);
         let mut req = Vec::new();
         req.extend_from_slice(&crate::pkt_line::encode(
-            format!("want {} side-band-64k\n", sha1_hex).as_bytes(),
+            format!("want {}\n", sha1_hex).as_bytes(),
         ));
         req.extend_from_slice(&crate::pkt_line::encode_flush());
         req.extend_from_slice(&crate::pkt_line::encode(b"done\n"));
@@ -492,8 +697,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(pack.starts_with(b"NAK\n"));
-        assert!(pack[4..].starts_with(b"PACK"));
+        // NAK is pkt-line framed: "0008NAK\n" (8 bytes), then pack data.
+        assert!(pack.starts_with(b"0008NAK\n"));
+        assert!(pack[8..].starts_with(b"PACK"));
     }
 
     #[tokio::test]
@@ -523,8 +729,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(pack.starts_with(b"NAK\n"));
-        let pd = &pack[4..];
+        assert!(pack.starts_with(b"0008NAK\n"));
+        let pd = &pack[8..];
         assert_eq!(&pd[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(pd[4..8].try_into().unwrap()), 2u32);
         assert_eq!(u32::from_be_bytes(pd[8..12].try_into().unwrap()), 2u32);
@@ -541,8 +747,7 @@ mod tests {
 
     #[test]
     fn encode_pack_one_object() {
-        let sha1_a = make_sha1(0x10);
-        let p = encode_pack(&[(&sha1_a, Bytes::from(b"hello world".to_vec()))]);
+        let p = encode_pack(&[(3u8, Bytes::from(b"hello world".to_vec()))]);
         assert_eq!(&p[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(p[8..12].try_into().unwrap()), 1u32);
         assert!(p.len() > 32);

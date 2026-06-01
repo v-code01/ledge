@@ -88,7 +88,10 @@ async fn test_wal_recovery_arbitrary_truncation() {
     assert!(!all.is_empty(), "at least some refs must survive truncation recovery");
     for (name, entry) in &all {
         let name_str = name.as_str();
-        let original = written.iter().find(|(n, _)| n == name_str).expect(&format!("unknown ref {name_str}"));
+        let original = written
+            .iter()
+            .find(|(n, _)| n == name_str)
+            .unwrap_or_else(|| panic!("unknown ref {name_str}"));
         assert_eq!(&entry.target, &original.1);
     }
 }

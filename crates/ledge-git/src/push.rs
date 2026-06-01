@@ -13,7 +13,7 @@
 use crate::pkt_line::{decode_line, encode, encode_flush, PktLine};
 use bytes::Bytes;
 use flate2::read::ZlibDecoder;
-use ledge_core::{LedgeError, ObjectId, ObjectStore, RefName, RefStore};
+use ledge_core::{LedgeError, ObjectId, RefName, RefStore};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -131,7 +131,7 @@ pub async fn handle_receive_pack_discovery(
     if all_refs.is_empty() {
         // No refs yet — emit the null-id capabilities advertisement.
         out.extend_from_slice(&encode(
-            b"0000000000000000000000000000000000000000 capabilities^{}\0 delete-refs side-band-64k\n",
+            b"0000000000000000000000000000000000000000 capabilities^{}\0 report-status delete-refs\n",
         ));
     } else {
         let mut first = true;
@@ -147,7 +147,7 @@ pub async fn handle_receive_pack_discovery(
             let line = if first {
                 first = false;
                 format!(
-                    "{} {}\0 delete-refs side-band-64k\n",
+                    "{} {}\0 report-status delete-refs\n",
                     sha1_hex,
                     ref_name.as_str()
                 )
@@ -179,8 +179,8 @@ pub async fn handle_receive_pack_discovery(
 /// the response, not as `Err`.
 pub async fn handle_receive_pack(
     body: Bytes,
-    objects: Arc<dyn ObjectStore>,
     refs: Arc<dyn RefStore>,
+    sha1_store: &dyn Sha1Provider,
 ) -> ledge_core::Result<Vec<u8>> {
     // ── Step 1: parse ref commands until flush ─────────────────────────────
     let mut cursor: &[u8] = &body;
@@ -239,7 +239,7 @@ pub async fn handle_receive_pack(
     if !pack_bytes.is_empty() {
         let decoded = decode_pack_objects(pack_bytes)?;
         for (kind_byte, content) in decoded {
-            // Build the git blob header for SHA-1 calculation.
+            // Compute the canonical git SHA-1 over "<type> <size>\0<content>".
             let type_name = git_type_name(kind_byte);
             let header = format!("{} {}\0", type_name, content.len());
             let mut sha1_input = Vec::with_capacity(header.len() + content.len());
@@ -249,8 +249,10 @@ pub async fn handle_receive_pack(
             use sha1::{Digest, Sha1};
             let sha1: [u8; 20] = Sha1::digest(&sha1_input).into();
 
+            // Persist the object together with its git type so the fetch path
+            // can serve the correct typed SHA-1 and reconstruct a typed pack.
             let obj_bytes = Bytes::from(content);
-            let obj_id = objects.write(obj_bytes).await?;
+            let obj_id = sha1_store.write_git_object(kind_byte, obj_bytes).await?;
             sha1_to_obj.insert(sha1, obj_id);
         }
     }
@@ -521,12 +523,14 @@ mod tests {
     struct MemObjectStore {
         objects: Mutex<HashMap<[u8; 32], Bytes>>,
         sha1s: Mutex<HashMap<[u8; 32], [u8; 20]>>,
+        types: Mutex<HashMap<[u8; 32], u8>>,
     }
     impl MemObjectStore {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 objects: Mutex::new(HashMap::new()),
                 sha1s: Mutex::new(HashMap::new()),
+                types: Mutex::new(HashMap::new()),
             })
         }
     }
@@ -534,6 +538,28 @@ mod tests {
     impl Sha1Provider for MemObjectStore {
         async fn sha1_of(&self, id: ObjectId) -> Option<[u8; 20]> {
             self.sha1s.lock().unwrap().get(id.as_bytes()).copied()
+        }
+        async fn git_type_of(&self, id: ObjectId) -> Option<u8> {
+            self.types.lock().unwrap().get(id.as_bytes()).copied()
+        }
+        async fn write_git_object(
+            &self,
+            git_type: u8,
+            content: bytes::Bytes,
+        ) -> ledge_core::Result<ObjectId> {
+            let hash = *blake3::hash(&content).as_bytes();
+            let id = ObjectId::from_bytes(hash);
+            self.objects.lock().unwrap().insert(hash, content);
+            self.types.lock().unwrap().insert(hash, git_type);
+            Ok(id)
+        }
+        async fn sha1_index(&self) -> HashMap<[u8; 20], ObjectId> {
+            self.sha1s
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
+                .collect()
         }
     }
     #[async_trait]
@@ -797,10 +823,9 @@ mod tests {
         use sha1::{Digest, Sha1};
         let blob_sha1: [u8; 20] = Sha1::digest(&sha1_input).into();
 
-        // encode_pack uses make_sha1 placeholder — but for decode round-trip
-        // we need the pack to contain a real blob, so we build it manually
-        // using the same format as crate::fetch::encode_pack but with blob_sha1.
-        let pack = crate::fetch::encode_pack(&[(&blob_sha1, blob_content.clone())]);
+        // Build a single-blob pack carrying the true git type (3 = blob) so the
+        // decode round-trip recomputes the same blob SHA-1.
+        let pack = crate::fetch::encode_pack(&[(3u8, blob_content.clone())]);
 
         // Build receive-pack body: one ref create command + flush + pack.
         let null = null_sha1();
@@ -811,8 +836,8 @@ mod tests {
 
         let response = handle_receive_pack(
             Bytes::from(body),
-            objects.clone() as Arc<dyn ObjectStore>,
             refs.clone() as Arc<dyn RefStore>,
+            objects.as_ref(),
         )
         .await
         .unwrap();
@@ -859,7 +884,7 @@ mod tests {
         use sha1::{Digest, Sha1};
         let blob_sha1: [u8; 20] = Sha1::digest(&sha1_input).into();
 
-        let pack = crate::fetch::encode_pack(&[(&blob_sha1, blob_content.clone())]);
+        let pack = crate::fetch::encode_pack(&[(3u8, blob_content.clone())]);
 
         // old_sha1=null → create-if-absent; ref already exists → Conflict.
         let null = null_sha1();
@@ -870,8 +895,8 @@ mod tests {
 
         let response = handle_receive_pack(
             Bytes::from(body),
-            objects.clone() as Arc<dyn ObjectStore>,
             refs.clone() as Arc<dyn RefStore>,
+            objects.as_ref(),
         )
         .await
         .unwrap();

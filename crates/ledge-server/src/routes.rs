@@ -114,8 +114,8 @@ pub async fn receive_pack(
     metrics::record_git_request("receive-pack");
     let result = ledge_git::push::handle_receive_pack(
         body,
-        state.objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         state.refs.clone() as Arc<dyn ledge_core::RefStore>,
+        state.objects.as_ref(),
     )
     .await;
     metrics::record_git_request_duration("receive-pack", start.elapsed());
