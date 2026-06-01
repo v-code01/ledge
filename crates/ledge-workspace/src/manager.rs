@@ -140,6 +140,23 @@ impl WorkspaceManager {
             refs: view_refs,
         })
     }
+
+    /// Extend a workspace's lease by `ttl` from *now*. Bumps `generation` and the
+    /// HLC stamp so a concurrent GC pass orders this mutation last-writer-wins.
+    /// Errors if the lease is unknown (Corruption naming the id).
+    ///
+    /// Complexity: one lease get + one lease put. Side effect: one lease WAL append.
+    pub async fn renew(&self, id: WorkspaceId, ttl: Duration) -> Result<Lease> {
+        let mut lease = self.leases.get(id).await?.ok_or_else(|| {
+            LedgeError::Corruption(format!("renew: unknown workspace {}", id.to_hex()))
+        })?;
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        lease.expires_at_ms = now_ms().saturating_add(ttl_ms);
+        lease.generation += 1;
+        lease.hlc = self.hlc.tick();
+        self.leases.put(lease.clone()).await?;
+        Ok(lease)
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +264,31 @@ mod tests {
         let ws_tag = workspace_ref(&view.id, &tag).unwrap();
         assert!(ws_tag.as_str().contains("/tags/v1"));
         assert!(ws_tag.as_str().starts_with("refs/workspaces/"));
+    }
+
+    #[tokio::test]
+    async fn renew_bumps_expiry_and_generation() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+        let view = mgr.fork(&[main], Duration::from_secs(1)).await.unwrap();
+        let before = view.lease.clone();
+
+        let renewed = mgr.renew(view.id, Duration::from_secs(3600)).await.unwrap();
+
+        assert_eq!(renewed.id, before.id);
+        assert_eq!(renewed.generation, before.generation + 1);
+        assert!(
+            renewed.expires_at_ms > before.expires_at_ms,
+            "renew must extend expiry: {} !> {}",
+            renewed.expires_at_ms,
+            before.expires_at_ms
+        );
+        assert!(renewed.hlc > before.hlc, "renew must advance the HLC stamp");
+
+        // The bump is persisted, not just returned.
+        let persisted = mgr.leases.get(view.id).await.unwrap().expect("lease");
+        assert_eq!(persisted.generation, renewed.generation);
+        assert_eq!(persisted.expires_at_ms, renewed.expires_at_ms);
     }
 }
