@@ -1,0 +1,37 @@
+[package]
+name        = "ledge-bench"
+description = "Criterion benchmark suite for Ledge"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+authors.workspace     = true
+publish = false
+
+[dev-dependencies]
+ledge-core          = { path = "../ledge-core" }
+ledge-object-store  = { path = "../ledge-object-store" }
+ledge-ref-store     = { path = "../ledge-ref-store" }
+criterion.workspace = true
+tokio.workspace     = true
+bytes.workspace     = true
+tempfile.workspace  = true
+blake3.workspace    = true
+sha1.workspace      = true
+sha2.workspace      = true
+
+[[bench]]
+name = "blake3_vs_sha1"
+harness = false
+
+[[bench]]
+name = "object_write"
+harness = false
+
+[[bench]]
+name = "ref_update"
+harness = false
+
+[[bench]]
+name = "git_roundtrip"
+harness = false
