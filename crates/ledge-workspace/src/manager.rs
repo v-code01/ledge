@@ -180,9 +180,24 @@ impl WorkspaceManager {
     /// Complexity: O(m) for m mappings (2 reads + 1 write each, worst case).
     pub async fn commit(
         &self,
-        _id: WorkspaceId,
+        id: WorkspaceId,
         mappings: &[(RefName, RefName)],
     ) -> Result<Vec<CommitOutcome>> {
+        // Authorization: every source ref MUST live under this workspace's
+        // namespace. Promoting a ref from a *different* workspace would let a
+        // caller leak another workspace's work into a durable ref. Reject the
+        // whole batch (no partial promotion) before any write touches storage.
+        let ws_prefix = Self::ws_prefix(&id);
+        for mapping in mappings {
+            if !mapping.0.as_str().starts_with(&ws_prefix) {
+                return Err(LedgeError::Corruption(format!(
+                    "commit: ref {} does not belong to workspace {}",
+                    mapping.0.as_str(),
+                    id.to_hex()
+                )));
+            }
+        }
+
         let mut outcomes = Vec::with_capacity(mappings.len());
 
         for (ws_ref, durable_ref) in mappings {
@@ -519,6 +534,47 @@ mod tests {
             oid(2)
         );
         let _ = (ws2, view2); // second workspace intentionally left for release tests
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_foreign_workspace_ref() {
+        let (mgr, _dir) = setup();
+        let src = r("refs/heads/main");
+        mgr.refs.update(&src, oid(1), None).await.unwrap();
+
+        // Workspace A: the target of the commit call.
+        let view_a = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .await
+            .unwrap();
+        // Workspace B: a DIFFERENT workspace whose ref we maliciously pass to A.
+        let view_b = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // A ref that belongs to workspace B, not A.
+        let b_ws_ref = r(&format!(
+            "refs/workspaces/{}/heads/main",
+            view_b.id.to_hex()
+        ));
+        let durable = r("refs/heads/feature");
+
+        // Promoting B's ref through A's commit must be rejected.
+        let err = mgr
+            .commit(view_a.id, &[(b_ws_ref.clone(), durable.clone())])
+            .await
+            .unwrap_err();
+        match err {
+            LedgeError::Corruption(msg) => {
+                assert!(msg.contains(b_ws_ref.as_str()), "msg names the foreign ref: {msg}");
+                assert!(msg.contains(&view_a.id.to_hex()), "msg names the target ws: {msg}");
+            }
+            other => panic!("expected Corruption rejecting the foreign ref, got {other:?}"),
+        }
+
+        // No clobber: the durable target was never created.
+        assert!(mgr.refs.get(&durable).await.unwrap().is_none());
     }
 
     #[tokio::test]
