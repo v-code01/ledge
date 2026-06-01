@@ -217,4 +217,35 @@ mod tests {
             other => panic!("expected Corruption naming the ref, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn fork_multiple_sources_copies_all() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        let dev = r("refs/heads/dev");
+        let tag = r("refs/tags/v1");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+        mgr.refs.update(&dev, oid(2), None).await.unwrap();
+        mgr.refs.update(&tag, oid(3), None).await.unwrap();
+
+        let view = mgr
+            .fork(
+                &[main.clone(), dev.clone(), tag.clone()],
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(view.refs.len(), 3);
+        // Each stored workspace ref shares the matching source target.
+        for (src, want) in [(&main, oid(1)), (&dev, oid(2)), (&tag, oid(3))] {
+            let ws = workspace_ref(&view.id, src).unwrap();
+            let got = mgr.refs.get(&ws).await.unwrap().expect("ws ref");
+            assert_eq!(got.target, want);
+        }
+        // tags/ segment is preserved under the workspace prefix (rebase rule).
+        let ws_tag = workspace_ref(&view.id, &tag).unwrap();
+        assert!(ws_tag.as_str().contains("/tags/v1"));
+        assert!(ws_tag.as_str().starts_with("refs/workspaces/"));
+    }
 }
