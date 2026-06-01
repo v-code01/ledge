@@ -254,6 +254,22 @@ impl WorkspaceManager {
             .collect();
         Ok(Some(WorkspaceView { id, lease, refs }))
     }
+
+    /// List all live workspaces. Drives off the lease store's `live(now_ms)`
+    /// partition (unexpired, non-tombstoned), then resolves each to a view.
+    /// A lease that vanished between `live` and `get` is skipped (race-safe).
+    ///
+    /// Complexity: one `live` scan + O(w) `get`s for w live workspaces.
+    pub async fn list(&self) -> Result<Vec<WorkspaceView>> {
+        let live = self.leases.live(now_ms()).await?;
+        let mut views = Vec::with_capacity(live.len());
+        for lease in live {
+            if let Some(view) = self.get(lease.id).await? {
+                views.push(view);
+            }
+        }
+        Ok(views)
+    }
 }
 
 #[cfg(test)]
@@ -557,5 +573,43 @@ mod tests {
         for (n, _) in &got.refs {
             assert!(!n.contains("workspaces"), "leaked storage name: {n}");
         }
+    }
+
+    #[tokio::test]
+    async fn list_returns_only_live_workspaces() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+
+        // Live workspace (long TTL).
+        let live = mgr
+            .fork(&[main.clone()], Duration::from_secs(3600))
+            .await
+            .unwrap();
+        // Released workspace (tombstoned -> not live).
+        let released = mgr
+            .fork(&[main.clone()], Duration::from_secs(3600))
+            .await
+            .unwrap();
+        mgr.release(released.id).await.unwrap();
+        // Expired workspace (TTL already elapsed). expires_at_ms == created_at_ms;
+        // `live` uses `expires_at_ms > now_ms`, so a 0ms TTL is not live.
+        let expired = mgr
+            .fork(&[main.clone()], Duration::from_millis(0))
+            .await
+            .unwrap();
+
+        let listed = mgr.list().await.unwrap();
+        let ids: Vec<WorkspaceId> = listed.iter().map(|v| v.id).collect();
+
+        assert!(ids.contains(&live.id), "live workspace must be listed");
+        assert!(
+            !ids.contains(&released.id),
+            "released workspace must not be listed"
+        );
+        assert!(
+            !ids.contains(&expired.id),
+            "expired workspace must not be listed"
+        );
     }
 }
