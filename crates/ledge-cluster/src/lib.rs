@@ -4,6 +4,7 @@
 //! [`net_mem`] Raft network for cluster tests, and a 3-node single-shard
 //! [`testkit`] harness that proves per-shard linearizability and crash
 //! fault-tolerance against `openraft 0.9.24`.
+pub mod net_http;
 pub mod net_mem;
 pub mod object_store;
 pub mod ref_store;
