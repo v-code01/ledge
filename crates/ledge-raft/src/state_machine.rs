@@ -328,13 +328,14 @@ impl StateMachineStore {
                     .expect("lease put");
                 LedgeResp::LeaseOk
             }
-            LedgeOp::LeaseTombstone { id, .. } => {
-                // NOTE: LeaseStore::tombstone stamps its own hlc internally today.
-                // An explicit-hlc tombstone path (mirroring apply_op) is Task 6;
-                // until then the determinism guarantee is exercised on the ref
-                // path (the safety core).
+            LedgeOp::LeaseTombstone { id, hlc } => {
+                // Use the op-carried hlc (leader-assigned at propose time), NOT a
+                // local `self.hlc.tick()`, so every replica records the identical
+                // tombstone frame — mirroring the ref path's explicit-hlc
+                // determinism. (LeasePut above already applies the full Lease
+                // verbatim, including its own leader-assigned hlc.)
                 self.leases_arc()
-                    .tombstone(*id)
+                    .tombstone_with_hlc(*id, *hlc)
                     .await
                     .expect("lease tombstone");
                 LedgeResp::LeaseOk
@@ -960,5 +961,71 @@ mod tests {
         let r = sm.apply([tomb]).await.unwrap();
         assert_eq!(r, vec![LedgeResp::LeaseOk]);
         assert_eq!(sm.leases_all().await.len(), 0);
+    }
+
+    /// LEASE APPLY DETERMINISM. Two fresh replicas applying the IDENTICAL lease
+    /// op sequence (LeasePut then LeaseTombstone, with fixed hlcs) must reach
+    /// identical queryable lease state — proving no `self.hlc.tick()` leaks into
+    /// the replicated lease apply path (which would make the recorded tombstone
+    /// hlc replica-dependent). The op-carried hlc is the sole source of truth.
+    #[tokio::test]
+    async fn lease_tombstone_apply_is_deterministic_across_replicas() {
+        use ledge_workspace::id::WorkspaceId;
+
+        let id = WorkspaceId::from_bytes([3u8; 16]);
+        let lease = Lease {
+            id,
+            source_refs: vec!["refs/heads/main".into()],
+            created_at_ms: 1,
+            expires_at_ms: 10_000,
+            hlc: 5,
+            generation: 1,
+        };
+        // Fixed sequence: identical for both replicas, identical hlcs.
+        let seq = vec![
+            LedgeOp::LeasePut {
+                lease: lease.clone(),
+            },
+            LedgeOp::LeaseTombstone { id, hlc: 42 },
+        ];
+
+        let mut sm_a = StateMachineStore::new_temp().await;
+        let mut sm_b = StateMachineStore::new_temp().await;
+
+        let resp_a = sm_a.apply(entries_for(seq.clone())).await.unwrap();
+        let resp_b = sm_b.apply(entries_for(seq)).await.unwrap();
+
+        // Same log prefix → identical responses.
+        assert_eq!(resp_a, resp_b);
+        assert_eq!(resp_a, vec![LedgeResp::LeaseOk, LedgeResp::LeaseOk]);
+
+        // Both replicas have the lease absent (tombstoned) and identical
+        // queryable state — no replica-local hlc divergence.
+        assert!(sm_a.read_handle().applied_lease(id).await.is_none());
+        assert!(sm_b.read_handle().applied_lease(id).await.is_none());
+        assert_eq!(sm_a.leases_all().await, sm_b.leases_all().await);
+        assert_eq!(sm_a.leases_all().await.len(), 0);
+    }
+
+    /// Applying the SAME LeaseTombstone op (same id, same hlc) to two fresh SMs
+    /// yields identical lease-absent state on both — the tombstone is a pure
+    /// function of the op, with no internal clock tick.
+    #[tokio::test]
+    async fn identical_lease_tombstone_op_yields_identical_state() {
+        use ledge_workspace::id::WorkspaceId;
+
+        let id = WorkspaceId::from_bytes([8u8; 16]);
+        let tomb = LedgeOp::LeaseTombstone { id, hlc: 7 };
+
+        let mut sm_a = StateMachineStore::new_temp().await;
+        let mut sm_b = StateMachineStore::new_temp().await;
+
+        let r_a = sm_a.apply([entry(1, 1, tomb.clone())]).await.unwrap();
+        let r_b = sm_b.apply([entry(1, 1, tomb)]).await.unwrap();
+
+        assert_eq!(r_a, r_b);
+        assert_eq!(r_a, vec![LedgeResp::LeaseOk]);
+        assert!(sm_a.read_handle().applied_lease(id).await.is_none());
+        assert!(sm_b.read_handle().applied_lease(id).await.is_none());
     }
 }

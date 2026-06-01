@@ -182,8 +182,21 @@ impl LeaseStore {
 
     /// Append a `Tombstone` frame and remove the lease from the live index.
     /// Idempotent: tombstoning an absent id is a no-op write + no-op remove.
+    ///
+    /// Single-node path: stamps the tombstone with a freshly ticked hlc. The
+    /// replicated Raft apply path must use [`tombstone_with_hlc`](Self::tombstone_with_hlc)
+    /// instead, so every replica records the identical tombstone frame.
     pub async fn tombstone(&self, id: WorkspaceId) -> Result<()> {
         let hlc = self.hlc.tick();
+        self.tombstone_with_hlc(id, hlc).await
+    }
+
+    /// Tombstone with a caller-supplied hlc (deterministic — used by the Raft
+    /// apply path so all replicas record the identical tombstone frame). Mirrors
+    /// [`tombstone`](Self::tombstone) but does NOT call `self.hlc.tick()`.
+    ///
+    /// Idempotent: tombstoning an absent id is a no-op write + no-op remove.
+    pub async fn tombstone_with_hlc(&self, id: WorkspaceId, hlc: u64) -> Result<()> {
         let frame = encode_frame(&LeaseWalEntry::Tombstone { id, hlc })?;
         {
             let mut file = self.file.lock().await;
