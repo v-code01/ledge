@@ -1,0 +1,236 @@
+//! Cluster control-plane route tests (Phase 3, Task 7B).
+//!
+//! Covers three properties:
+//! 1. `cluster_routes_503_when_disabled` — a default (single-node) `AppState`
+//!    (`raft_shards = None`) returns `503` from `/cluster/status` and `/raft/*`,
+//!    proving the cluster routes are inert in single-node mode.
+//! 2. `cluster_status_shape_when_enabled` — an `AppState` carrying a 1-shard
+//!    in-process `Raft<TypeConfig>` (initialized + elected) returns a
+//!    `/cluster/status` with one shard, `leader == Some(node)`, `term >= 1`.
+//! 3. `raft_append_endpoint_feeds_local_raft` — a bincode heartbeat
+//!    `AppendEntriesRequest` POSTed to `/raft/0/append` round-trips a decodable
+//!    `AppendEntriesResponse` (the server side of the Task 6 HTTP transport).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use tempfile::TempDir;
+use tower::ServiceExt; // oneshot
+
+use ledge_cluster::testkit::MultiShardCluster;
+use ledge_cluster::ShardId;
+use ledge_raft::{NodeId, TypeConfig};
+use ledge_server::routes::{AppState, ClusterHandles};
+use ledge_server::{build_app, build_workspace_stack};
+
+use ledge_core::HLC;
+use ledge_object_store::DiskObjectStore;
+use ledge_ref_store::RefStoreImpl;
+
+/// Build an `AppState` over fresh tempdir stores. `raft_shards` controls cluster
+/// mode: `None` = single-node, `Some(map)` = clustered with those shard handles.
+fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) -> AppState {
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(HLC::new());
+    let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
+    let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    let (workspaces, leases, gc) =
+        build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+    AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards,
+    }
+}
+
+#[tokio::test]
+async fn cluster_routes_503_when_disabled() {
+    let dir = TempDir::new().unwrap();
+    let app = build_app(state_with_shards(&dir, None));
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/cluster/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "single-node /cluster/status must be 503 (not clustered)"
+    );
+
+    let vote = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/raft/0/vote")
+                .body(Body::from(vec![0u8; 4]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        vote.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "single-node /raft/*/vote must be 503 (not clustered)"
+    );
+}
+
+/// Extract a `ShardId -> Raft<TypeConfig>` map from a started in-process cluster:
+/// for each shard pick this node's replica's Raft handle (clone — `Raft` is
+/// `Arc`-backed and cheap to clone).
+fn handles_for_node(cluster: &MultiShardCluster, node: NodeId) -> ClusterHandles {
+    let mut map: ClusterHandles = BTreeMap::new();
+    for s in 0..cluster.num_shards {
+        let shard = ShardId(s);
+        let raft = cluster
+            .replicas_of(shard)
+            .iter()
+            .find(|r| r.node == node)
+            .expect("node hosts this shard")
+            .raft
+            .clone();
+        map.insert(shard, raft);
+    }
+    map
+}
+
+#[tokio::test]
+async fn cluster_status_shape_when_enabled() {
+    // A single-node, single-shard in-process cluster (initialized + elected).
+    let cluster = MultiShardCluster::start(1, &[1]).await;
+    let handles = Arc::new(handles_for_node(&cluster, 1));
+
+    let dir = TempDir::new().unwrap();
+    let app = build_app(state_with_shards(&dir, Some(handles)));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/cluster/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let shards = j["shards"].as_array().expect("shards array");
+    assert_eq!(shards.len(), 1, "exactly one shard");
+    assert_eq!(shards[0]["shard"].as_u64(), Some(0));
+    assert_eq!(
+        shards[0]["leader"].as_u64(),
+        Some(1),
+        "the sole node must be its own leader"
+    );
+    assert!(
+        shards[0]["term"].as_u64().unwrap() >= 1,
+        "an elected term is >= 1"
+    );
+    let members: Vec<u64> = shards[0]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert_eq!(members, vec![1]);
+}
+
+/// Build a single, *uninitialized* (no leader) `Raft<TypeConfig>` for shard 0,
+/// so an external heartbeat is a valid append (mirrors `net_http`'s test peer).
+async fn one_uninitialized_raft() -> openraft::Raft<TypeConfig> {
+    use ledge_cluster::net_mem::{MemNetworkFactory, Registry};
+    use ledge_raft::{LogStore, StateMachineStore};
+    let log = LogStore::default();
+    let sm = StateMachineStore::new_temp().await;
+    let net = MemNetworkFactory::new(ShardId(0), Registry::new());
+    let cfg = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    openraft::Raft::new(1, cfg, net, log, sm)
+        .await
+        .expect("Raft::new")
+}
+
+#[tokio::test]
+async fn raft_append_endpoint_feeds_local_raft() {
+    use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
+    use openraft::Vote;
+
+    // An uninitialized node: it has no leader, so an external heartbeat from a
+    // term-1 leader is accepted (Success). Using an already-elected leader here
+    // would be an invalid append (a leader does not receive heartbeats for its
+    // own term) and openraft would reject it — not what this route test covers.
+    let raft = one_uninitialized_raft().await;
+    let mut map: ClusterHandles = BTreeMap::new();
+    map.insert(ShardId(0), raft.clone());
+    let dir = TempDir::new().unwrap();
+    let app = build_app(state_with_shards(&dir, Some(Arc::new(map))));
+
+    let req = AppendEntriesRequest::<TypeConfig> {
+        vote: Vote::new_committed(1, 1),
+        prev_log_id: None,
+        entries: vec![],
+        leader_commit: None,
+    };
+    let body = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/raft/0/append")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The 200 body is the bincode `WireResult` envelope (private to net_http).
+    // bincode-standard encodes the enum discriminant as a leading varint u32
+    // (0 = Ok, 1 = Err) followed by the payload `Vec<u8>`; decode that public
+    // shape, then decode the inner `AppendEntriesResponse`.
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let (env, _len): ((u32, Vec<u8>), usize) =
+        bincode::serde::decode_from_slice(&out, bincode::config::standard())
+            .expect("decode WireResult envelope as (tag, payload)");
+    assert_eq!(env.0, 0, "WireResult::Ok discriminant (a served heartbeat)");
+    let resp: AppendEntriesResponse<NodeId> =
+        bincode::serde::decode_from_slice(&env.1, bincode::config::standard())
+            .expect("decode AppendEntriesResponse")
+            .0;
+    assert!(
+        matches!(
+            resp,
+            AppendEntriesResponse::Success | AppendEntriesResponse::PartialSuccess(_)
+        ),
+        "external heartbeat to an uninitialized node should succeed, got {resp:?}"
+    );
+
+    raft.shutdown().await.ok();
+}

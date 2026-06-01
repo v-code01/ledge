@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod cluster_routes;
 pub mod config;
 pub mod metrics;
 pub mod routes;
@@ -12,10 +13,17 @@ use std::time::Duration;
 use axum::Router;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
-use ledge_core::{HLC, RefStore};
+use ledge_core::{HLC, ObjectStore, RefStore};
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, LeaseStore, WorkspaceManager};
+
+use std::collections::{BTreeMap, HashMap};
+use ledge_cluster::net_http::HttpRaftNetworkFactory;
+use ledge_cluster::ref_store::ShardHandle;
+use ledge_cluster::{ClusterRefStore, ReplicatedObjectStore, ShardId, ShardRouter};
+use ledge_raft::{StateMachineStore, TypeConfig, WalLogStore};
+use routes::ClusterHandles;
 
 /// Open the lease store and assemble the workspace control-plane trio
 /// (manager, lease store, GC) from already-open object/ref stores.
@@ -51,6 +59,98 @@ pub fn build_workspace_stack_dyn(
     Ok((manager, leases, gc))
 }
 
+/// The assembled cluster storage stack: the `dyn RefStore` seam
+/// (`ClusterRefStore`), the `dyn ObjectStore` seam (`ReplicatedObjectStore`
+/// over the node-local disk store), the node-local concrete `DiskObjectStore`
+/// (for git/RPC/GC), and the per-shard Raft handles (for the `/raft` + `/cluster`
+/// routes and the metrics poller).
+pub struct ClusterStack {
+    /// `Arc<ClusterRefStore>` up-cast — `AppState.refs`.
+    pub refs: Arc<dyn RefStore>,
+    /// `Arc<ReplicatedObjectStore>` up-cast — `AppState.objects`.
+    pub objects: Arc<dyn ObjectStore>,
+    /// Node-local concrete disk store — `AppState.objects_disk` (git/RPC/GC).
+    pub objects_disk: Arc<DiskObjectStore>,
+    /// Per-shard Raft handles for this node — `AppState.raft_shards`.
+    pub shards: Arc<ClusterHandles>,
+}
+
+/// Assemble the clustered storage stack: one Raft group per shard over a
+/// disk-backed [`WalLogStore`], wired to a [`ClusterRefStore`] (`dyn RefStore`
+/// seam) and a [`ReplicatedObjectStore`] (`dyn ObjectStore` seam) atop the
+/// node-local [`DiskObjectStore`].
+///
+/// This runs ONLY when `cluster.enabled` (gated in `main.rs`); the single-node
+/// path is byte-identical to Phase 1/2 and never touches this. The per-shard
+/// Raft handles are returned so the `/raft/*` + `/cluster/*` routes can feed
+/// inbound RPCs into the local node and the metrics poller can read each shard's
+/// `Raft::metrics()`.
+///
+/// # Phase 3 scope notes
+/// - The state machine is built with [`StateMachineStore::new_temp`] (the only
+///   public constructor today; a durable disk-backed SM constructor is a
+///   follow-up). The Raft **log** IS disk-durable via `WalLogStore`.
+/// - `ReplicatedObjectStore` is constructed with **no peers** here (a node knows
+///   its own local store; cross-node object peering is wired with the same HTTP
+///   transport as the ref Raft in a follow-up). The git/object wire path is
+///   node-local in Phase 3 (see [`AppState`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_cluster_stack(
+    data_dir: std::path::PathBuf,
+    objects_disk: Arc<DiskObjectStore>,
+    hlc: Arc<HLC>,
+    node_id: u64,
+    num_shards: u32,
+    peers: HashMap<u64, String>,
+    raft_config: Arc<openraft::Config>,
+) -> ledge_core::Result<ClusterStack> {
+    let router = ShardRouter::new(num_shards);
+    let mut shard_handles: BTreeMap<ShardId, Vec<ShardHandle>> = BTreeMap::new();
+    let mut raft_handles: ClusterHandles = BTreeMap::new();
+
+    for s in 0..num_shards {
+        let shard = ShardId(s);
+        let shard_dir = data_dir.join(format!("shard-{s}"));
+        let log = WalLogStore::open(shard_dir.join("raft-log"))
+            .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
+        let sm = StateMachineStore::new_temp().await;
+        // Capture the read handle BEFORE the SM moves into Raft::new (the SM is
+        // not Clone; the handle shares its ArcSwap'd applied state).
+        let read = sm.read_handle();
+        let net = HttpRaftNetworkFactory::new(shard, peers.clone());
+        let raft = openraft::Raft::<TypeConfig>::new(node_id, raft_config.clone(), net, log, sm)
+            .await
+            .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Each node holds only its OWN replica handle here (production shape):
+        // peers are reached by the HTTP Raft network, not an in-process registry.
+        shard_handles.insert(
+            shard,
+            vec![ShardHandle {
+                shard,
+                node_id,
+                raft: raft.clone(),
+                sm: read,
+                hlc: hlc.clone(),
+            }],
+        );
+        raft_handles.insert(shard, raft);
+    }
+
+    let cluster_refs = Arc::new(ClusterRefStore::new(node_id, router, shard_handles));
+    // No object peers in Phase 3 bootstrap: replication of objects across nodes
+    // uses the same HTTP transport as the ref Raft and is a follow-up; the local
+    // store is the single replica for now (content-addressed, so safe).
+    let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), Vec::new()));
+
+    Ok(ClusterStack {
+        refs: cluster_refs as Arc<dyn RefStore>,
+        objects: replicated as Arc<dyn ObjectStore>,
+        objects_disk,
+        shards: Arc::new(raft_handles),
+    })
+}
+
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(routes::healthz))
@@ -80,6 +180,19 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/admin/snapshot",
             axum::routing::post(admin_routes::admin_snapshot),
+        )
+        // ── Cluster control plane (spec §7) — inert (503) in single-node mode ──
+        .route(
+            "/raft/{shard}/{kind}",
+            axum::routing::post(cluster_routes::raft_rpc),
+        )
+        .route(
+            "/cluster/init",
+            axum::routing::post(cluster_routes::cluster_init),
+        )
+        .route(
+            "/cluster/status",
+            axum::routing::get(cluster_routes::cluster_status),
         )
         // ── Workspace-scoped git (segment = workspaces/{id}/) ──────────────
         .route("/ws/{id}/info/refs", axum::routing::get(routes::ws_info_refs))

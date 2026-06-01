@@ -30,6 +30,15 @@ pub const SNAPSHOT_DURATION: &str = "ledge_snapshot_duration_seconds";
 pub const RPC_REQUESTS_TOTAL: &str = "ledge_rpc_requests_total";
 pub const RPC_REQUEST_DURATION: &str = "ledge_rpc_request_duration_seconds";
 
+// ── Per-shard Raft gauges/counters (spec §7). Populated ONLY in cluster mode by
+//    `record_raft_metrics`; single-node never emits these series, so `/metrics`
+//    output for a single-node server is unchanged. ─────────────────────────────
+pub const RAFT_LEADER: &str = "ledge_raft_leader";
+pub const RAFT_TERM: &str = "ledge_raft_term";
+pub const RAFT_LAST_APPLIED: &str = "ledge_raft_last_applied";
+pub const RAFT_COMMIT_INDEX: &str = "ledge_raft_commit_index";
+pub const RAFT_ELECTIONS_TOTAL: &str = "ledge_raft_elections_total";
+
 pub fn install_recorder() -> ledge_core::Result<()> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
@@ -85,9 +94,55 @@ pub fn record_rpc_request(method: &'static str, d: std::time::Duration) {
     metrics::histogram!(RPC_REQUEST_DURATION, "method" => method).record(d.as_secs_f64());
 }
 
+/// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
+///
+/// Called from the cluster-mode metrics poller (one task per shard, started in
+/// `main.rs` only when `cluster.enabled`). The `shard` is the label value; all
+/// series are tagged `shard="<n>"`. The election counter is recorded as the
+/// current term (term monotonically increases by at least one per election, so
+/// the term is a faithful lower bound / proxy for cumulative elections).
+///
+/// `leader` carries the leader's node id as a gauge when this shard has a
+/// leader, else `0` (with `current_leader == None`); callers distinguishing
+/// "no leader" from "leader is node 0" should consult `current_leader` directly,
+/// but in Ledge node ids start at 1 so `0` unambiguously means "no leader".
+pub fn record_raft_metrics(
+    shard: u32,
+    current_leader: Option<u64>,
+    current_term: u64,
+    last_applied: Option<u64>,
+    commit_index: Option<u64>,
+) {
+    let shard_label = shard.to_string();
+    metrics::gauge!(RAFT_LEADER, "shard" => shard_label.clone())
+        .set(current_leader.unwrap_or(0) as f64);
+    metrics::gauge!(RAFT_TERM, "shard" => shard_label.clone()).set(current_term as f64);
+    metrics::gauge!(RAFT_LAST_APPLIED, "shard" => shard_label.clone())
+        .set(last_applied.unwrap_or(0) as f64);
+    metrics::gauge!(RAFT_COMMIT_INDEX, "shard" => shard_label.clone())
+        .set(commit_index.unwrap_or(0) as f64);
+    // Term as the cumulative-elections proxy (absolute gauge, not delta): a fresh
+    // election strictly raises the term, so this is monotone and re-derivable.
+    metrics::gauge!(RAFT_ELECTIONS_TOTAL, "shard" => shard_label).set(current_term as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raft_metric_name_constants_correct() {
+        assert_eq!(RAFT_LEADER, "ledge_raft_leader");
+        assert_eq!(RAFT_TERM, "ledge_raft_term");
+        assert_eq!(RAFT_LAST_APPLIED, "ledge_raft_last_applied");
+    }
+
+    #[test]
+    fn record_raft_metrics_no_panic() {
+        // Safe to call without a recorder installed (mirrors the other helpers).
+        record_raft_metrics(0, Some(1), 3, Some(7), Some(7));
+        record_raft_metrics(1, None, 0, None, None);
+    }
 
     #[test]
     fn metric_name_constants_correct() {
