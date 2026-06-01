@@ -121,13 +121,16 @@ pub fn parse_ref_commands(data: &[u8]) -> ledge_core::Result<Vec<RefCommand>> {
 pub async fn handle_receive_pack_discovery(
     refs: Arc<dyn RefStore>,
     sha1_store: &dyn Sha1Provider,
+    segment: &str,
 ) -> ledge_core::Result<Vec<u8>> {
+    use crate::fetch::present_ref;
     let mut out = Vec::new();
     // Service line + flush (required by git smart HTTP spec §3).
     out.extend_from_slice(&encode(b"# service=git-receive-pack\n"));
     out.extend_from_slice(&encode_flush());
 
-    let all_refs = refs.list("refs/").await?;
+    // List only the segment's namespace. segment=="" ⇒ "refs/" (Phase 1).
+    let all_refs = refs.list(&format!("refs/{segment}")).await?;
     if all_refs.is_empty() {
         // No refs yet — emit the null-id capabilities advertisement.
         out.extend_from_slice(&encode(
@@ -144,15 +147,13 @@ pub async fn handle_receive_pack_discovery(
                 ))
             })?;
             let sha1_hex = hex::encode(sha1);
+            // Present the client-facing (segment-stripped) ref name.
+            let presented = present_ref(ref_name.as_str(), segment);
             let line = if first {
                 first = false;
-                format!(
-                    "{} {}\0 report-status delete-refs\n",
-                    sha1_hex,
-                    ref_name.as_str()
-                )
+                format!("{} {}\0 report-status delete-refs\n", sha1_hex, presented)
             } else {
-                format!("{} {}\n", sha1_hex, ref_name.as_str())
+                format!("{} {}\n", sha1_hex, presented)
             };
             out.extend_from_slice(&encode(line.as_bytes()));
         }
@@ -789,6 +790,7 @@ mod tests {
         let response = handle_receive_pack_discovery(
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             sha1_provider.as_ref(),
+            "",
         )
         .await
         .unwrap();
@@ -805,6 +807,28 @@ mod tests {
             matches!(second, PktLine::Flush),
             "second pkt-line must be flush"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_discovery_workspace_segment_presents_stripped_names() {
+        let refs = MemRefStore::new();
+        let sha1_provider = MemObjectStore::new();
+        let id = ObjectId::from_bytes([0x11u8; 32]);
+        sha1_provider.sha1s.lock().unwrap().insert(*id.as_bytes(), make_sha1(0x11));
+        refs.insert("refs/workspaces/abc/heads/main", id);
+
+        let response = handle_receive_pack_discovery(
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            sha1_provider.as_ref(),
+            "workspaces/abc/",
+        )
+        .await
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&response);
+        assert!(s.contains("refs/heads/main"), "must present stripped name");
+        assert!(!s.contains("refs/workspaces/abc/"), "must not leak stored name");
+        assert!(s.contains("report-status delete-refs"), "must keep capabilities");
     }
 
     // ── Test 5: push writes objects and updates ref ───────────────────────
