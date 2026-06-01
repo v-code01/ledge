@@ -94,6 +94,11 @@ impl WorkspaceManager {
         Self { refs, leases, hlc }
     }
 
+    /// The storage prefix for a workspace's refs.
+    fn ws_prefix(id: &WorkspaceId) -> String {
+        format!("refs/workspaces/{}/", id.to_hex())
+    }
+
     /// Fork a workspace from `source` refs with lifetime `ttl`.
     ///
     /// For each source ref: read its durable entry; if present, create the
@@ -205,6 +210,49 @@ impl WorkspaceManager {
         }
 
         Ok(outcomes)
+    }
+
+    /// Release a workspace: delete every `refs/workspaces/<id>/*` ref, then
+    /// tombstone the lease. Idempotent — deleting an already-gone ref or
+    /// tombstoning an already-tombstoned lease is `Ok`. A `NotFound` from delete
+    /// (ref vanished between list and delete) or a `Conflict` (the target moved
+    /// under us) is swallowed: the workspace ref is gone either way.
+    ///
+    /// Complexity: O(k) deletes for k workspace refs + one lease tombstone.
+    pub async fn release(&self, id: WorkspaceId) -> Result<()> {
+        let prefix = Self::ws_prefix(&id);
+        for (name, entry) in self.refs.list(&prefix).await? {
+            match self.refs.delete(&name, entry.target).await {
+                Ok(()) => {}
+                // Idempotency: the ref already vanished (concurrent release / GC).
+                Err(LedgeError::NotFound(_)) => {}
+                // A stale CAS on delete means someone moved it; treat as gone.
+                Err(LedgeError::Conflict { .. }) => {}
+                Err(other) => return Err(other),
+            }
+        }
+        self.leases.tombstone(id).await?;
+        Ok(())
+    }
+
+    /// Resolve a workspace to a view, or `None` if its lease is gone/tombstoned.
+    /// Maps stored workspace ref names back to client-facing names (§3.2 inverse).
+    ///
+    /// Complexity: one lease get + O(k) for k workspace refs (list + map).
+    pub async fn get(&self, id: WorkspaceId) -> Result<Option<WorkspaceView>> {
+        let lease = match self.leases.get(id).await? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        let prefix = Self::ws_prefix(&id);
+        let refs = self
+            .refs
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .map(|(name, entry)| (client_ref(&id, name.as_str()), entry))
+            .collect();
+        Ok(Some(WorkspaceView { id, lease, refs }))
     }
 }
 
@@ -442,5 +490,32 @@ mod tests {
             oid(2)
         );
         let _ = (ws2, view2); // second workspace intentionally left for release tests
+    }
+
+    #[tokio::test]
+    async fn release_removes_refs_and_tombstones_lease() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        let tag = r("refs/tags/v1");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+        mgr.refs.update(&tag, oid(2), None).await.unwrap();
+        let view = mgr
+            .fork(&[main.clone(), tag.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // Pre-condition: workspace refs exist.
+        let prefix = format!("refs/workspaces/{}/", view.id.to_hex());
+        assert_eq!(mgr.refs.list(&prefix).await.unwrap().len(), 2);
+
+        mgr.release(view.id).await.unwrap();
+
+        // Workspace refs gone.
+        assert!(mgr.refs.list(&prefix).await.unwrap().is_empty());
+        // get() returns None after release.
+        assert!(mgr.get(view.id).await.unwrap().is_none());
+        // Durable source refs are UNTOUCHED.
+        assert_eq!(mgr.refs.get(&main).await.unwrap().unwrap().target, oid(1));
+        assert_eq!(mgr.refs.get(&tag).await.unwrap().unwrap().target, oid(2));
     }
 }
