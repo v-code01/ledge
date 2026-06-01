@@ -10,6 +10,7 @@ members = [
     "crates/ledge-bench",
     "crates/ledge-cow",
     "crates/ledge-rpc",
+    "crates/ledge-raft",
 ]
 
 [workspace.package]
@@ -53,6 +54,7 @@ futures           = "0.3"
 reflink-copy      = "0.1"
 capnp             = "0.21"
 capnpc            = "0.21"
+openraft          = "0.9"
 
 [profile.release]
 opt-level = 3

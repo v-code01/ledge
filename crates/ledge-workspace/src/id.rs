@@ -69,6 +69,11 @@ impl WorkspaceId {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    /// Construct directly from raw bytes (stable wire/replication form).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        WorkspaceId(bytes)
+    }
 }
 
 /// Decode two ASCII hex digits into one byte, or `None` if either is non-hex.
