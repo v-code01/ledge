@@ -7,6 +7,12 @@
 //! network partition to the rest of the cluster — which is what the
 //! leader-failure test relies on.
 
+// openraft's `RaftNetwork`/`RaftNetworkFactory` trait methods return
+// `Result<_, RPCError<..>>` by contract; `RPCError` is a large enum (>256 B) and
+// we cannot box it without violating the trait signature. The error path is
+// cold (only on RPC failure), so the large-Result size is irrelevant here.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

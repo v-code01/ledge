@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+# `testkit` is on by default so the crate's own integration tests (which live
+# in a separate compilation unit and therefore do not see the lib's `test` cfg)
+# can use TestCluster via `cargo test -p ledge-cluster`. Downstreams that do not
+# want the harness can opt out with `default-features = false`.
+default = ["testkit"]
 # Exposes the in-process test harness (TestCluster) to downstream crates.
 testkit = []
 

@@ -234,8 +234,9 @@ async fn snapshot_install_to_lagging_node() {
         .expect("add_learner");
 
     // The learner must converge to the full ref set via snapshot install.
+    // r39 was written with target byte (39 % 250) + 1 = 40 in the loop above.
     let probe = "refs/heads/r39";
-    let want = ObjectId::from_bytes([(39u64 % 250) as u8 + 1; 32]);
+    let want = ObjectId::from_bytes([40u8; 32]);
     let mut ok = false;
     for _ in 0..300 {
         if c.node(4).sm.applied_ref(probe).await.map(|e| e.target) == Some(want) {
