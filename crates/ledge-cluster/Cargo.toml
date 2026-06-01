@@ -15,6 +15,7 @@ testkit = []
 [dependencies]
 ledge-core = { path = "../ledge-core" }
 ledge-ref-store = { path = "../ledge-ref-store" }
+ledge-object-store = { path = "../ledge-object-store" }
 ledge-workspace = { path = "../ledge-workspace" }
 ledge-raft = { path = "../ledge-raft" }
 openraft = { workspace = true, features = ["serde", "storage-v2"] }
@@ -22,6 +23,8 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

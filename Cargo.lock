@@ -1517,8 +1517,10 @@ name = "ledge-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "futures",
  "ledge-core",
+ "ledge-object-store",
  "ledge-raft",
  "ledge-ref-store",
  "ledge-workspace",
