@@ -315,7 +315,12 @@ pub async fn handle_upload_pack(
     objects: Arc<dyn ObjectStore>,
     refs: Arc<dyn RefStore>,
     sha1_store: &dyn Sha1Provider,
+    segment: &str,
 ) -> ledge_core::Result<Vec<u8>> {
+    // Fetch is resolved by SHA-1 through `sha1_index`, never by ref name, so the
+    // workspace segment does not change object selection. The parameter exists
+    // for call-site uniformity with discovery/receive.
+    let _ = segment;
     // ── Parse `want` lines from the request body ──────────────────────────────
     let mut cursor: &[u8] = &body;
     let mut wanted_sha1s: Vec<[u8; 20]> = Vec::new();
@@ -703,10 +708,37 @@ mod tests {
             objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
         // NAK is pkt-line framed: "0008NAK\n" (8 bytes), then pack data.
+        assert!(pack.starts_with(b"0008NAK\n"));
+        assert!(pack[8..].starts_with(b"PACK"));
+    }
+
+    #[tokio::test]
+    async fn upload_pack_segment_is_want_resolved_not_ref_scoped() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x09);
+        let id = objects.seed(Bytes::from(b"ws fetch blob".to_vec()), sha1);
+        refs.insert("refs/workspaces/abc/heads/main", id);
+        let mut req = Vec::new();
+        req.extend_from_slice(&crate::pkt_line::encode(
+            format!("want {}\n", hex::encode(sha1)).as_bytes(),
+        ));
+        req.extend_from_slice(&crate::pkt_line::encode_flush());
+        req.extend_from_slice(&crate::pkt_line::encode(b"done\n"));
+        let pack = handle_upload_pack(
+            Bytes::from(req),
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            "workspaces/abc/",
+        )
+        .await
+        .unwrap();
         assert!(pack.starts_with(b"0008NAK\n"));
         assert!(pack[8..].starts_with(b"PACK"));
     }
@@ -735,6 +767,7 @@ mod tests {
             objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
