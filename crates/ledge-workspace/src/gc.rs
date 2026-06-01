@@ -46,10 +46,14 @@ pub struct GcStats {
 /// reclaimed on a later pass); under-keeping would be a correctness bug, so the
 /// liveness predicate is intentionally inclusive.
 fn now_ms() -> u64 {
+    // A pre-1970 clock yields `Err`; we map that to 0 rather than panicking so a
+    // skewed clock can never crash the unsupervised GC task. now_ms == 0 makes
+    // every lease appear live (conservative: GC never reclaims a live workspace's
+    // objects), which is the fail-safe direction.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Gc {
@@ -67,7 +71,10 @@ impl Gc {
 
     /// Run one mark-and-sweep pass (spec §6). Implements the four steps exactly:
     /// snapshot roots → freeze candidates → mark → sweep.
+    #[tracing::instrument(skip(self))]
     pub async fn run(&self) -> Result<GcStats> {
+        // Monotonic timer for the pass duration (Instant is clock-skew-immune).
+        let start = std::time::Instant::now();
         // ── 1. Snapshot roots ────────────────────────────────────────────────
         // Durable refs are unconditional roots.
         let mut roots: Vec<ObjectId> = Vec::new();
@@ -95,6 +102,8 @@ impl Gc {
         let scanned = candidates.len();
 
         // ── 3. Mark ──────────────────────────────────────────────────────────
+        // Capture the root count before `reachable_from` consumes the Vec.
+        let root_count = roots.len();
         let reachable: HashSet<ObjectId> = graph::reachable_from(&self.objects, roots).await?;
         let reachable_count = reachable.len();
 
@@ -118,12 +127,26 @@ impl Gc {
             reclaimed += 1;
         }
 
-        Ok(GcStats {
+        let stats = GcStats {
             scanned,
             reachable: reachable_count,
             reclaimed,
             bytes_freed,
-        })
+        };
+
+        // Structured pass summary (spec §9): roots, candidates, reachable,
+        // reclaimed, bytes freed, and wall duration.
+        tracing::info!(
+            roots = root_count,
+            candidates = stats.scanned,
+            reachable = stats.reachable,
+            reclaimed = stats.reclaimed,
+            bytes_freed = stats.bytes_freed,
+            duration_ms = start.elapsed().as_millis(),
+            "gc pass complete"
+        );
+
+        Ok(stats)
     }
 }
 

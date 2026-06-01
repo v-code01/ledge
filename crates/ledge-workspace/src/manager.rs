@@ -108,6 +108,7 @@ impl WorkspaceManager {
     ///
     /// Complexity: O(n) ref reads + O(n) ref creates for n source refs, plus one
     /// lease put. Side effects: n ref-store WAL appends + one lease WAL append.
+    #[tracing::instrument(skip(self, source), fields(ttl_secs = ttl.as_secs()))]
     pub async fn fork(&self, source: &[RefName], ttl: Duration) -> Result<WorkspaceView> {
         let id = WorkspaceId::generate(&self.hlc);
 
@@ -151,6 +152,7 @@ impl WorkspaceManager {
     /// Errors if the lease is unknown (Corruption naming the id).
     ///
     /// Complexity: one lease get + one lease put. Side effect: one lease WAL append.
+    #[tracing::instrument(skip(self), fields(id = %id, ttl_secs = ttl.as_secs()))]
     pub async fn renew(&self, id: WorkspaceId, ttl: Duration) -> Result<Lease> {
         let mut lease = self.leases.get(id).await?.ok_or_else(|| {
             LedgeError::Corruption(format!("renew: unknown workspace {}", id.to_hex()))
@@ -178,6 +180,7 @@ impl WorkspaceManager {
     /// Does NOT release the workspace.
     ///
     /// Complexity: O(m) for m mappings (2 reads + 1 write each, worst case).
+    #[tracing::instrument(skip(self, mappings), fields(id = %id, mappings = mappings.len()))]
     pub async fn commit(
         &self,
         id: WorkspaceId,
@@ -238,6 +241,7 @@ impl WorkspaceManager {
     /// under us) is swallowed: the workspace ref is gone either way.
     ///
     /// Complexity: O(k) deletes for k workspace refs + one lease tombstone.
+    #[tracing::instrument(skip(self), fields(id = %id))]
     pub async fn release(&self, id: WorkspaceId) -> Result<()> {
         let prefix = Self::ws_prefix(&id);
         for (name, entry) in self.refs.list(&prefix).await? {

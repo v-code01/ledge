@@ -154,4 +154,19 @@ mod tests {
         }
         assert_eq!(ids.len(), 1000);
     }
+
+    proptest::proptest! {
+        /// WorkspaceId hex round-trips for any generated id. `seed` only varies
+        /// the iteration count; each generate() yields a fresh HLC+counter id,
+        /// exercising many distinct bit patterns across the proptest run.
+        #[test]
+        fn prop_workspace_id_hex_roundtrip(seed in 0u64..100_000) {
+            let hlc = ledge_core::HLC::new();
+            let id = WorkspaceId::generate(&hlc);
+            let _ = seed; // seed varies the proptest iterations
+            let hex = id.to_hex();
+            let back = WorkspaceId::from_hex(&hex).unwrap();
+            proptest::prop_assert_eq!(id, back);
+        }
+    }
 }

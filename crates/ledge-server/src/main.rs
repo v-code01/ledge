@@ -60,6 +60,10 @@ async fn main() -> anyhow::Result<()> {
         hlc.clone(),
     )?;
 
+    // ── Lease WAL compaction: collapse the append log to a checkpoint when it
+    //    crosses 64 MiB (matching the ref store's default threshold). ─────────────
+    leases.spawn_compaction_task(64 * 1024 * 1024);
+
     // ── Expiry sweeper: every expiry_interval_secs, release each expired lease. ──
     {
         let workspaces = workspaces.clone();

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use ledge_core::{LedgeError, Result, HLC};
 use tokio::sync::Mutex;
@@ -236,6 +236,59 @@ impl LeaseStore {
     /// size-based compaction triggers (mirrors `Wal::path`).
     pub fn wal_path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Spawn a background tokio task that checks the WAL size every 60 seconds
+    /// and calls [`compact`](Self::compact) whenever it exceeds `threshold_bytes`.
+    ///
+    /// Mirrors the ref store's `RefStoreImpl::spawn_compaction_task`: holds a
+    /// [`Weak`] reference so the task exits automatically once the store is
+    /// dropped — no explicit cancellation handle required. In production the
+    /// server holds the `Arc` for its whole lifetime, so the task runs forever.
+    ///
+    /// The interval uses [`MissedTickBehavior::Skip`](tokio::time::MissedTickBehavior::Skip)
+    /// so a long compaction (or a stalled runtime) never piles up backlogged
+    /// ticks; the next tick simply fires on schedule.
+    ///
+    /// Complexity per tick: one `stat(2)` (O(1)); compaction is O(live leases)
+    /// and runs only above the threshold.
+    pub fn spawn_compaction_task(self: &Arc<Self>, threshold_bytes: u64) {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // Drop the strong ref before the next await so the store can be
+                // freed while this task sleeps; re-upgrade each tick.
+                let Some(store) = weak.upgrade() else {
+                    // Store has been dropped; exit the task.
+                    break;
+                };
+                // A failed stat (file vanished) is treated as size 0: nothing to
+                // compact, never a panic in the unsupervised task.
+                let size = std::fs::metadata(store.wal_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if size > threshold_bytes {
+                    match store.compact().await {
+                        Ok(()) => {
+                            let post = std::fs::metadata(store.wal_path())
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            tracing::info!(
+                                pre_bytes = size,
+                                post_bytes = post,
+                                "lease WAL compacted"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "lease WAL compaction failed");
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -474,5 +527,49 @@ mod tests {
             .map(|l| l.id)
             .collect();
         assert_eq!(reopened, live_set);
+    }
+
+    /// `compact()` must shrink an append-grown WAL while preserving every live
+    /// lease across a reopen. We grow the WAL with many puts (each appends a
+    /// frame), capture its size, compact to a single checkpoint, and assert the
+    /// on-disk file is strictly smaller AND all live leases survive.
+    #[tokio::test]
+    async fn compaction_truncates_wal() {
+        let dir = tempdir().unwrap();
+        let h = hlc();
+        let now = now_ms();
+        let path = dir.path().join("leases").join("wal");
+
+        let mut live_ids = std::collections::HashSet::new();
+        let pre_size;
+        {
+            let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+            // Grow the WAL: 200 distinct puts ⇒ 200 appended frames.
+            for _ in 0..200 {
+                let id = WorkspaceId::generate(&h);
+                store.put(lease(id, now + 60_000)).await.unwrap();
+                live_ids.insert(id);
+            }
+            pre_size = std::fs::metadata(&path).unwrap().len();
+            // Compact directly (the spawned task is just a timer wrapper around this).
+            store.compact().await.unwrap();
+        } // drop ⇒ flush + close before reopen.
+
+        let post_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            post_size < pre_size,
+            "compaction must shrink the WAL: post {post_size} !< pre {pre_size}"
+        );
+
+        // Every live lease survives the checkpoint round-trip.
+        let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+        let reopened: std::collections::HashSet<_> = store
+            .live(now)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(reopened, live_ids, "all live leases must survive compaction");
     }
 }
