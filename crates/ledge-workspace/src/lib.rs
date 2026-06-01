@@ -10,7 +10,7 @@ pub mod id;
 pub mod lease;
 pub mod manager;
 
+pub use gc::{Gc, GcStats};
 pub use id::WorkspaceId;
 pub use lease::{Lease, LeaseStore};
 pub use manager::{CommitOutcome, WorkspaceManager, WorkspaceView};
-// Task 5 adds: pub use gc::{Gc, GcStats};
