@@ -518,4 +518,21 @@ mod tests {
         assert_eq!(mgr.refs.get(&main).await.unwrap().unwrap().target, oid(1));
         assert_eq!(mgr.refs.get(&tag).await.unwrap().unwrap().target, oid(2));
     }
+
+    #[tokio::test]
+    async fn double_release_is_idempotent() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        mgr.refs.update(&main, oid(1), None).await.unwrap();
+        let view = mgr.fork(&[main], Duration::from_secs(60)).await.unwrap();
+
+        mgr.release(view.id).await.unwrap();
+        // Second release on an already-released workspace must still be Ok.
+        mgr.release(view.id).await.unwrap();
+        // Release on a never-existed workspace id is also Ok.
+        let phantom = WorkspaceId::generate(&mgr.hlc);
+        mgr.release(phantom).await.unwrap();
+
+        assert!(mgr.get(view.id).await.unwrap().is_none());
+    }
 }
