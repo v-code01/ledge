@@ -9,6 +9,7 @@ members = [
     "crates/ledge-server",
     "crates/ledge-bench",
     "crates/ledge-cow",
+    "crates/ledge-rpc",
 ]
 
 [workspace.package]
@@ -50,6 +51,8 @@ crc32fast         = "1"
 tempfile          = "3"
 futures           = "0.3"
 reflink-copy      = "0.1"
+capnp             = "0.21"
+capnpc            = "0.21"
 
 [profile.release]
 opt-level = 3

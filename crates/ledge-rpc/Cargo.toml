@@ -1,0 +1,28 @@
+[package]
+name        = "ledge-rpc"
+description = "Cap'n Proto wire schema + dispatch core for the Ledge /rpc endpoint"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+
+[lib]
+name = "ledge_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+ledge-core         = { path = "../ledge-core" }
+ledge-object-store = { path = "../ledge-object-store" }
+ledge-ref-store    = { path = "../ledge-ref-store" }
+ledge-workspace    = { path = "../ledge-workspace" }
+capnp.workspace    = true
+bytes.workspace    = true
+tokio.workspace    = true
+
+[build-dependencies]
+capnpc.workspace = true
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["full", "test-util"] }
+tempfile.workspace = true
