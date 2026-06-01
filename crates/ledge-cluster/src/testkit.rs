@@ -145,3 +145,253 @@ impl TestCluster {
         &self.node(id).raft
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-shard harness (Task 4): N shards × M nodes over one shared network
+// registry. Each (shard, node) is an independent Raft group; the registry keys
+// on (ShardId, NodeId) so shards are network-isolated from one another while
+// sharing the same in-process transport.
+// ---------------------------------------------------------------------------
+
+/// One replica of one shard: its Raft handle plus a [`ReadHandle`] onto its
+/// applied state and the shard-local HLC source used to stamp proposals.
+pub struct ShardReplica {
+    pub shard: ShardId,
+    pub node: NodeId,
+    pub raft: RaftHandle,
+    pub sm: ReadHandle,
+    pub hlc: Arc<ledge_core::HLC>,
+}
+
+/// An in-process cluster of `num_shards` shards, each replicated across the
+/// same `node_ids`. All shards share one [`Registry`] (network) but are keyed
+/// independently, so a write to shard A is invisible to shard B's log.
+pub struct MultiShardCluster {
+    pub num_shards: u32,
+    pub node_ids: Vec<NodeId>,
+    pub registry: Registry,
+    pub members: BTreeMap<NodeId, Node>,
+    /// All replicas of every shard hosted in this process, keyed by shard.
+    pub replicas: BTreeMap<ShardId, Vec<ShardReplica>>,
+}
+
+impl MultiShardCluster {
+    /// Build, initialize, and elect leaders for `num_shards` shards × `node_ids`
+    /// replicas. Returns only once every shard has a stable leader.
+    pub async fn start(num_shards: u32, node_ids: &[NodeId]) -> Self {
+        let registry = Registry::new();
+        let mut members = BTreeMap::new();
+        for &id in node_ids {
+            members.insert(id, Node::new("inproc"));
+        }
+
+        let mut replicas: BTreeMap<ShardId, Vec<ShardReplica>> = BTreeMap::new();
+        for s in 0..num_shards {
+            let shard = ShardId(s);
+            // One HLC per shard, shared by that shard's replicas in-process: the
+            // leader ticks it at propose time (the value travels in the op).
+            let hlc = Arc::new(ledge_core::HLC::new());
+            let mut shard_replicas = Vec::with_capacity(node_ids.len());
+            for &id in node_ids {
+                let log = LogStore::default();
+                let sm = StateMachineStore::new_temp().await;
+                let read = sm.read_handle();
+                let net = MemNetworkFactory::new(shard, registry.clone());
+                let raft = openraft::Raft::new(id, test_config(None), net, log, sm)
+                    .await
+                    .expect("Raft::new");
+                registry.register(shard, id, raft.clone());
+                shard_replicas.push(ShardReplica {
+                    shard,
+                    node: id,
+                    raft,
+                    sm: read,
+                    hlc: hlc.clone(),
+                });
+            }
+            replicas.insert(shard, shard_replicas);
+        }
+
+        let cluster = Self {
+            num_shards,
+            node_ids: node_ids.to_vec(),
+            registry,
+            members,
+            replicas,
+        };
+
+        // Initialize each shard on its first node, then await a leader.
+        for s in 0..num_shards {
+            let shard = ShardId(s);
+            let seed = cluster.node_ids[0];
+            let seed_raft = cluster
+                .replicas
+                .get(&shard)
+                .unwrap()
+                .iter()
+                .find(|r| r.node == seed)
+                .unwrap()
+                .raft
+                .clone();
+            seed_raft
+                .initialize(cluster.members.clone())
+                .await
+                .expect("initialize shard membership");
+        }
+        for s in 0..num_shards {
+            cluster.wait_for_leader(ShardId(s)).await;
+        }
+        cluster
+    }
+
+    /// Poll until `shard` has a node confirming `ServerState::Leader`.
+    pub async fn wait_for_leader(&self, shard: ShardId) -> NodeId {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reps = self.replicas.get(&shard).expect("shard exists");
+        loop {
+            for r in reps {
+                let m = r.raft.metrics().borrow().clone();
+                if let Some(l) = m.current_leader {
+                    if let Some(lr) = reps.iter().find(|x| x.node == l) {
+                        if lr.raft.metrics().borrow().state == ServerState::Leader {
+                            return l;
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("shard {shard:?}: no leader within 10s");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// All replicas of `shard`.
+    pub fn replicas_of(&self, shard: ShardId) -> &[ShardReplica] {
+        self.replicas.get(&shard).expect("shard exists")
+    }
+
+    /// Build the `ShardId → Vec<ShardHandle>` registry the cluster stores need:
+    /// every replica of every shard, so `leader_of` can address the leader
+    /// (in-process registry shape; see `ref_store` module docs for production).
+    pub fn shard_handles(&self) -> BTreeMap<ShardId, Vec<crate::ref_store::ShardHandle>> {
+        let mut out = BTreeMap::new();
+        for (&shard, reps) in &self.replicas {
+            let handles = reps
+                .iter()
+                .map(|r| crate::ref_store::ShardHandle {
+                    shard: r.shard,
+                    node_id: r.node,
+                    raft: r.raft.clone(),
+                    sm: r.sm.clone(),
+                    hlc: r.hlc.clone(),
+                })
+                .collect();
+            out.insert(shard, handles);
+        }
+        out
+    }
+
+    /// A [`ShardRouter`] over this cluster's shard count.
+    pub fn router(&self) -> crate::router::ShardRouter {
+        crate::router::ShardRouter::new(self.num_shards)
+    }
+
+    /// A `ClusterRefStore` built on `node`'s view of the cluster.
+    pub fn cluster_ref_store(&self, node: NodeId) -> crate::ref_store::ClusterRefStore {
+        crate::ref_store::ClusterRefStore::new(node, self.router(), self.shard_handles())
+    }
+
+    /// A `ClusterLeaseStore` built on `node`'s view of the cluster.
+    pub fn cluster_lease_store(&self, node: NodeId) -> crate::ref_store::ClusterLeaseStore {
+        crate::ref_store::ClusterLeaseStore::new(node, self.router(), self.shard_handles())
+    }
+
+    /// Does any replica of `shard` have an applied ref `name`? Polls briefly so
+    /// async follower application is observed deterministically (no fixed sleep
+    /// for correctness — bounded poll on a metrics-equivalent signal).
+    pub async fn shard_sm_has_ref(&self, shard: ShardId, name: &ledge_core::RefName) -> bool {
+        let reps = self.replicas_of(shard);
+        for _ in 0..200 {
+            for r in reps {
+                if r.sm.applied_ref(name.as_str()).await.is_some() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // One final check after the deadline.
+        for r in reps {
+            if r.sm.applied_ref(name.as_str()).await.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Two ref names the router places on DISTINCT shards (brute-force search).
+    /// Panics if `num_shards < 2`.
+    pub fn two_names_on_distinct_shards(&self) -> (ledge_core::RefName, ledge_core::RefName) {
+        assert!(self.num_shards >= 2, "need >= 2 shards");
+        let router = self.router();
+        let mut first: Option<(ledge_core::RefName, ShardId)> = None;
+        for i in 0..10_000u32 {
+            let name = ledge_core::RefName::new(&format!("refs/workspaces/t{i}/main")).unwrap();
+            let s = router.shard_for(name.as_str());
+            match &first {
+                None => first = Some((name, s)),
+                Some((f, fs)) if *fs != s => return (f.clone(), name),
+                _ => {}
+            }
+        }
+        panic!("could not find two names on distinct shards");
+    }
+
+    /// `count` ref names spread across BOTH shards (at least one per shard).
+    /// Panics if `num_shards != 2` or it cannot satisfy the spread.
+    pub fn names_spanning_both_shards(&self, count: usize) -> Vec<ledge_core::RefName> {
+        assert_eq!(self.num_shards, 2, "helper assumes exactly 2 shards");
+        let router = self.router();
+        let mut names = Vec::with_capacity(count);
+        let mut seen = [false; 2];
+        let mut i = 0u32;
+        while names.len() < count {
+            let name = ledge_core::RefName::new(&format!("refs/workspaces/t{i}/main")).unwrap();
+            let s = router.shard_for(name.as_str()).0 as usize;
+            seen[s] = true;
+            names.push(name);
+            i += 1;
+        }
+        // Ensure both shards represented; if not, extend until they are.
+        while !(seen[0] && seen[1]) {
+            let name = ledge_core::RefName::new(&format!("refs/workspaces/t{i}/main")).unwrap();
+            let s = router.shard_for(name.as_str()).0 as usize;
+            if !seen[s] {
+                seen[s] = true;
+                names.push(name);
+            }
+            i += 1;
+        }
+        names
+    }
+
+    /// Wait until every replica of `shard` has applied the same number of refs
+    /// as the leader's applied ref count, i.e. replication has caught up.
+    pub async fn await_applied(&self, shard: ShardId, name: &ledge_core::RefName) {
+        let reps = self.replicas_of(shard);
+        for _ in 0..300 {
+            let mut all = true;
+            for r in reps {
+                if r.sm.applied_ref(name.as_str()).await.is_none() {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("shard {shard:?}: ref {} not replicated to all replicas", name.as_str());
+    }
+}

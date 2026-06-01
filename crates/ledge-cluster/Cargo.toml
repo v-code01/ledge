@@ -21,6 +21,7 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
