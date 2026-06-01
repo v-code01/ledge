@@ -137,6 +137,49 @@ impl RefStoreImpl {
         self.wal.compact(leaves).await
     }
 
+    /// Replace the entire ref set with exact entries (target, hlc, version
+    /// preserved). Used by Raft snapshot install — versions must NOT be reset.
+    /// Rebuilds the ART atomically (`ArcSwap`) and writes a WAL `Checkpoint` of
+    /// the new state so the restored state is durable across reopen.
+    ///
+    /// Unlike `apply_op`/`update`, this does NOT recompute `version` or stamp a
+    /// fresh `hlc`: each provided `RefEntry` is inserted verbatim. This is the
+    /// determinism-preserving snapshot install path — a node that installs a
+    /// snapshot then serves a CAS update must agree byte-for-byte (including
+    /// `version`) with a node that replayed the log to the same point.
+    ///
+    /// # Atomicity
+    /// The fresh root is built off to the side and swapped in with a single
+    /// `ArcSwap::store`. The WAL checkpoint is written first so a crash between
+    /// the checkpoint write and the in-memory swap recovers to the new state on
+    /// the next `open()` (the checkpoint is the durable source of truth).
+    ///
+    /// # Errors
+    /// Propagates WAL encode or I/O errors from the checkpoint write.
+    pub async fn restore_from(&self, entries: Vec<(RefName, RefEntry)>) -> Result<()> {
+        // Build the durable checkpoint payload (name -> exact RefEntry).
+        let leaves: Vec<(String, RefEntry)> = entries
+            .iter()
+            .map(|(name, entry)| (name.as_str().to_string(), entry.clone()))
+            .collect();
+
+        // Write the checkpoint to the WAL first so the restored state is durable
+        // even if we crash before the in-memory swap below.
+        self.wal.compact(leaves).await?;
+
+        // Build a fresh ART containing exactly the provided (name -> RefEntry)
+        // pairs, inserting each RefEntry VERBATIM (no version recompute / hlc tick).
+        let mut root: Option<Arc<ArtNode>> = None;
+        for (name, entry) in entries {
+            debug_assert!(entry.version >= 1, "restored version invariant: version >= 1");
+            root = Some(art_insert(root, name.as_str().as_bytes(), entry, 0));
+        }
+
+        // Atomically publish the new root.
+        self.root.store(Arc::new(root));
+        Ok(())
+    }
+
     /// Spawn a background tokio task that periodically checks the WAL size
     /// and calls `compact_wal()` when it exceeds the configured threshold.
     ///
@@ -746,6 +789,58 @@ mod tests {
             .await;
         assert!(matches!(outcome, AppliedOutcome::Conflict(_)));
         assert!(store.get(&n).await.unwrap().is_some(), "ref survives a failed delete");
+    }
+
+    // ── restore_from: snapshot install preserves exact RefEntry ─────────────────
+
+    #[tokio::test]
+    async fn restore_from_preserves_exact_version_and_hlc() {
+        let store = make_store();
+        let n = name("refs/heads/restored");
+        // A source entry that has been updated several times: version=5, hlc=999.
+        let entry = RefEntry { target: oid(7), hlc: 999, version: 5 };
+        store
+            .restore_from(vec![(n.clone(), entry.clone())])
+            .await
+            .unwrap();
+
+        let got = store.get(&n).await.unwrap().expect("restored ref present");
+        assert_eq!(got.version, 5, "restore_from must NOT reset version to 1");
+        assert_eq!(got.hlc, 999, "restore_from must preserve the source hlc");
+        assert_eq!(got.target, oid(7), "restore_from must preserve the target");
+        assert_eq!(got, entry, "restored entry is byte-identical to the source");
+    }
+
+    #[tokio::test]
+    async fn restore_from_replaces_entire_set_and_is_durable() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let stale = name("refs/heads/stale");
+        let fresh = name("refs/heads/fresh");
+
+        {
+            let store = RefStoreImpl::open(data_dir.clone(), Arc::new(HLC::new())).unwrap();
+            // Pre-existing ref that must NOT survive the restore.
+            store.update(&stale, oid(1), None).await.unwrap();
+            // Restore wipes prior state and installs `fresh` at version=3.
+            store
+                .restore_from(vec![(
+                    fresh.clone(),
+                    RefEntry { target: oid(2), hlc: 555, version: 3 },
+                )])
+                .await
+                .unwrap();
+            assert!(store.get(&stale).await.unwrap().is_none(), "restore replaces the set");
+            assert_eq!(store.get(&fresh).await.unwrap().unwrap().version, 3);
+        }
+
+        // Reopen: the WAL checkpoint must reproduce the restored state exactly.
+        let store2 = RefStoreImpl::open(data_dir, Arc::new(HLC::new())).unwrap();
+        assert!(store2.get(&stale).await.unwrap().is_none(), "stale ref gone after reopen");
+        let got = store2.get(&fresh).await.unwrap().expect("fresh ref durable");
+        assert_eq!(got.version, 3, "version durable across reopen");
+        assert_eq!(got.hlc, 555);
+        assert_eq!(got.target, oid(2));
     }
 
     // ── 9. WAL replay durability ─────────────────────────────────────────────

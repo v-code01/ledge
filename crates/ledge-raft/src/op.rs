@@ -44,6 +44,10 @@ pub enum LedgeResp {
     Deleted,
     /// A lease op (put/tombstone) was applied.
     LeaseOk,
+    /// A Raft no-op entry (`Blank` leader heartbeat or `Membership` change) was
+    /// applied. Carries no application result; distinct from `LeaseOk` so the
+    /// wire result is not misattributed to a lease.
+    Noop,
 }
 
 impl LedgeOp {

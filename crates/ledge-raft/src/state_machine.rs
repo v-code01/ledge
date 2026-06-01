@@ -24,7 +24,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use ledge_core::{RefEntry, RefName, HLC};
-use ledge_ref_store::{AppliedOp, RefStoreImpl};
+use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::lease::{Lease, LeaseStore};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -133,6 +133,14 @@ impl StateMachineStore {
     }
 
     /// Rebuild the stores from a snapshot payload (fresh tempdir-backed stores).
+    ///
+    /// # Determinism
+    /// Refs are installed via `RefStoreImpl::restore_from`, which inserts each
+    /// `RefEntry` VERBATIM — preserving `target`, `hlc`, AND `version`. Replaying
+    /// via `apply_op(Update, expected: None)` would reset `version` to 1, so a
+    /// node that installed a snapshot then served a CAS update would diverge in
+    /// `version` from a node that replayed the log. `restore_from` closes that
+    /// gap: the snapshot install path is byte-identical to the log-replay path.
     async fn restore(&mut self, bytes: &[u8]) {
         let (dump, _): (StateDump, _) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard()).unwrap();
@@ -140,20 +148,14 @@ impl StateMachineStore {
         let hlc = Arc::new(HLC::new());
         let refs = Arc::new(RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone()).unwrap());
         let leases = Arc::new(LeaseStore::open(dir.path().to_path_buf(), hlc).unwrap());
-        // Replay refs with their stored (explicit) hlc via apply_op so the
-        // rebuilt RefEntry is byte-identical to the source (same hlc, version
-        // restarts at 1 which matches a fresh create).
-        for (name, entry) in dump.refs {
-            let n = RefName::new(&name).expect("snapshot ref name valid");
-            let _ = refs
-                .apply_op(&AppliedOp::Update {
-                    name: n,
-                    target: entry.target,
-                    expected: None,
-                    hlc: entry.hlc,
-                })
-                .await;
-        }
+        // Restore the FULL RefEntry set verbatim — version preserved.
+        let entries: Vec<(RefName, RefEntry)> = dump
+            .refs
+            .into_iter()
+            .map(|(name, entry)| (RefName::new(&name).expect("snapshot ref name valid"), entry))
+            .collect();
+        refs.restore_from(entries).await.expect("restore refs");
+        // Leases carry their own hlc + generation; `put` stores them verbatim.
         for lease in dump.leases {
             leases.put(lease).await.expect("restore lease");
         }
@@ -227,16 +229,16 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             self.last_applied_log = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Blank => {
-                    // Leader's no-op heartbeat entry; no state change, blank ack.
-                    responses.push(LedgeResp::LeaseOk);
+                    // Leader's no-op heartbeat entry; no state change, no-op ack.
+                    responses.push(LedgeResp::Noop);
                 }
                 EntryPayload::Normal(op) => {
                     responses.push(self.apply_one(&op).await);
                 }
                 EntryPayload::Membership(m) => {
                     self.last_membership = StoredMembership::new(Some(entry.log_id), m);
-                    // Membership entries carry no application result; blank ack.
-                    responses.push(LedgeResp::LeaseOk);
+                    // Membership entries carry no application result; no-op ack.
+                    responses.push(LedgeResp::Noop);
                 }
             }
         }
@@ -415,6 +417,72 @@ mod tests {
             dst.applied_state().await.unwrap().0,
             src.applied_state().await.unwrap().0,
         );
+    }
+
+    /// Regression guard: the snapshot install path must preserve `version`.
+    /// Drive a ref to version=3, snapshot, install into a fresh SM, and assert
+    /// the restored entry reproduces version AND hlc AND target exactly. A
+    /// node that installs this snapshot must agree byte-for-byte with one that
+    /// replayed the log — otherwise a subsequent CAS update diverges in version.
+    #[tokio::test]
+    async fn snapshot_install_preserves_full_ref_entry_including_version() {
+        let mut src = StateMachineStore::new_temp().await;
+        // Three successful CAS updates → version reaches 3.
+        let seq = vec![
+            LedgeOp::RefUpdate {
+                name: "refs/heads/v".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+            LedgeOp::RefUpdate {
+                name: "refs/heads/v".into(),
+                target_bytes: [2u8; 32],
+                expected_bytes: Some([1u8; 32]),
+                hlc: 20,
+            },
+            LedgeOp::RefUpdate {
+                name: "refs/heads/v".into(),
+                target_bytes: [3u8; 32],
+                expected_bytes: Some([2u8; 32]),
+                hlc: 30,
+            },
+        ];
+        let _ = src.apply(entries_for(seq)).await.unwrap();
+
+        let v = RefName::new("refs/heads/v").unwrap();
+        let src_entry = src.refs_get(&v).await.unwrap();
+        assert_eq!(src_entry.version, 3, "precondition: source reached version 3");
+
+        let mut builder = src.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let mut dst = StateMachineStore::new_temp().await;
+        dst.install_snapshot(&snap.meta, snap.snapshot).await.unwrap();
+
+        let dst_entry = dst.refs_get(&v).await.unwrap();
+        assert_eq!(dst_entry.version, 3, "snapshot install must preserve version (not reset to 1)");
+        assert_eq!(dst_entry.hlc, 30, "snapshot install preserves hlc");
+        assert_eq!(dst_entry.target, ledge_core::ObjectId::from_bytes([3u8; 32]));
+        assert_eq!(dst_entry, src_entry, "full RefEntry reproduced byte-for-byte");
+
+        // And a subsequent CAS update on the restored node lands at version 4 —
+        // exactly as a log-replay node would, proving no divergence.
+        let next = entry(
+            1,
+            4,
+            LedgeOp::RefUpdate {
+                name: "refs/heads/v".into(),
+                target_bytes: [4u8; 32],
+                expected_bytes: Some([3u8; 32]),
+                hlc: 40,
+            },
+        );
+        let resp = dst.apply([next]).await.unwrap();
+        match &resp[0] {
+            LedgeResp::RefUpdated(e) => assert_eq!(e.version, 4, "CAS after install continues version"),
+            other => panic!("expected RefUpdated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
