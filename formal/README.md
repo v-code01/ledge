@@ -1,12 +1,13 @@
 # Ledge — Model-Checked TLA+ Specifications
 
 A runnable, **model-checked** TLA+ formalization of the Ledge ref store's
-concurrency and the Phase 2a garbage-collector safety guard. These are not
-merely *published* specs — `make check` runs TLC and reports **zero invariant
+concurrency, the Phase 2a garbage-collector safety guard, and the Phase 3
+sharding layer (routing totality + apply determinism). These are not merely
+*published* specs — `make check` runs TLC and reports **zero invariant
 violations** on the configured finite instances, and each headline invariant
 has been validated against a deliberately-broken model (a "negative control")
-to prove it is not vacuously true — three are documented below
-(`NoLostUpdate`, `SnapshotIsolation`, `GCSafety`).
+to prove it is not vacuously true — four are documented below
+(`NoLostUpdate`, `SnapshotIsolation`, `GCSafety`, `RoutingTotality`).
 
 ```
 formal/
@@ -14,15 +15,19 @@ formal/
 ├── RefStore.cfg          # TLC config: constants, INVARIANTs, state constraint
 ├── GcReachability.tla    # mark-and-sweep candidate-set guard + GC safety
 ├── GcReachability.cfg
-├── Makefile              # `make check` runs TLC on both modules
+├── Sharding.tla          # Phase 3 routing totality + apply determinism
+├── Sharding.cfg          # TLC config (clean instance)
+├── Sharding_neg.cfg      # negative-control config (BadRouting = TRUE; must fail)
+├── Makefile              # `make check` runs TLC on all modules; `make neg` runs the negative control
 └── README.md             # this file
 ```
 
 ## How to run
 
 ```sh
-make check        # default target: TLC on both modules, fail on any violation
-make sany         # syntax-check both modules
+make check        # default target: TLC on all modules, fail on any violation
+make sany         # syntax-check all modules
+make neg          # run the Sharding negative control; PASS iff TLC reports a violation
 make clean        # remove TLC scratch state / trace files
 ```
 
@@ -201,6 +206,82 @@ The depth of the complete state graph search is 22.
 
 ---
 
+## Module `Sharding.tla`
+
+Models the **Phase 3 Ledge-specific** additions around the Raft consensus
+core. **Raft's own safety is inherited, not re-derived here.** Election
+safety, log matching, leader completeness, and state-machine safety come from
+openraft, whose protocol is the Ongaro/Diego Raft TLA+ lineage (the canonical
+`raft.tla`). This module deliberately does **not** re-model consensus — it
+verifies only the two properties that sit *above* (routing) and *below*
+(deterministic apply) the consensus core, assuming the committed-log
+abstraction Raft provides (a single agreed total order of entries per shard).
+
+**Instance** (`Sharding.cfg`): `Refs = {r1, r2, r3}`, `NumShards = 2`,
+`Objects = {o1, o2}`, `NONE` (a model value), `BadRouting = FALSE`,
+`Hash <- HashDef` (`r1→4, r2→7, r3→9`, so `shard_for` spreads `r1→0, r2→1,
+r3→1`), and `OpLog <- OpLogDef` (a 4-op committed shard log: create → update →
+stale-conflict → delete). The operational determinism model has a tiny state
+graph (two `applied` counters in `0..4` plus the derived per-replica state);
+the exhaustive check is sub-second.
+
+### What is modeled
+
+- **Routing (static).** `shard_for(r) == Hash[r] % NumShards` — the
+  `ShardRouter::shard_for` at protocol altitude (the concrete hash is BLAKE3;
+  here `Hash` is an abstract total `CONSTANT` function `Refs → Nat`, the only
+  property routing safety depends on). `ROUTES(r)` is the *set* of shards a
+  ref maps to; for a correct total function it is always a singleton.
+- **Deterministic apply.** A shard state machine is a ref-map
+  `Refs → (entry ∪ {NONE})`; `Apply(state, op) == ⟨state', resp⟩` is a **pure
+  function** of `(state, op)` — the explicit-hlc apply path
+  (`RefStoreImpl::apply_op`). Ops carry their `hlc` explicitly (leader-stamped
+  before replication, per the §4 data flow), so apply never reads a clock or
+  any replica-local nondeterministic source. TLA+ functions are deterministic
+  by construction, so making `Apply` a function *is* the determinism
+  guarantee; the operational invariant proves two replicas converge under it.
+- **Operational confluence.** Two replicas (`sm1`/`resps1`, `sm2`/`resps2`)
+  consume the **same** committed log `OpLog` in index order; `applied1` /
+  `applied2` track each replica's progress. A nondeterministic scheduler
+  (`Step1` / `Step2`) advances either replica by one entry at a time, so TLC
+  explores **every interleaving**. Each replica always applies
+  `OpLog[applied+1]` next — the same ordered prefix, possibly at different
+  speeds.
+
+### Invariants
+
+| Invariant | One-line meaning |
+|---|---|
+| `TypeOK` | Every variable is well-typed: both replica states are total ref-maps with NONE-or-`[target,hlc,version]` entries (checked structurally, since `Entry`'s `hlc: Nat` is infinite and not enumerable); `applied` counters within log bounds; responses drawn from `{Updated, Deleted, Conflict}`. |
+| `RoutingTotality` | `shard_for` is a total function into the shard index space, and **each ref maps to exactly one shard** (`Cardinality(ROUTES(r)) = 1`). Falsifiable; see negative control. |
+| `Partition` | The per-shard owned sets **partition** the ref-name space: their union is all of `Refs` (none orphaned) and they are pairwise disjoint (none double-owned). |
+| `DeterminismInv` | **Apply determinism (operational).** Whenever the two replicas have applied the same committed-prefix length (`applied1 = applied2`), their state machines **and** response sequences are identical — confluence over every scheduler interleaving TLC explores. This is the property §4 ("followers apply the same entry → identical state") depends on. |
+| `PrefixFunctional` | Each replica's `(state, resps)` equals folding `Apply` over `OpLog[1..applied]` from `InitState` — the applied state is a pure **function of the first `applied` entries only**, pinning each replica to the canonical fold so determinism is structural, not a scheduling coincidence. |
+
+> **On `RoutingTotality` / `Partition` being constant-level.** Both are
+> functions of the `CONSTANT`s only (no spec variables), so TLC prints an
+> informational warning ("constant-level formula … evaluates to TRUE") and
+> checks them once at initialization. They are kept as `INVARIANT`s (rather
+> than `ASSUME`s) so the negative control fires as a normal invariant
+> violation and `make check` exercises them on every run. The warning is
+> benign; `make check` exits `0`.
+
+### TLC output (clean run, `make check`)
+
+```
+Model checking completed. No error has been found.
+42 states generated, 25 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 9.
+```
+
+- States generated: **42**
+- Distinct states: **25**
+- Search depth: **9**
+- Invariant violations: **0**
+- Wall time: **sub-second**
+
+---
+
 ## Negative controls (proving the invariants have teeth)
 
 TLA+ has no unit tests — the invariants *are* the tests, and TLC is the runner.
@@ -209,10 +290,14 @@ expected counterexample, proving the invariant actually constrains the model
 (is not vacuously true). This is the formal-methods equivalent of "watch the
 test fail first."
 
-Three negative controls are documented below, one per headline invariant:
-`NoLostUpdate` (RefStore), `SnapshotIsolation` (RefStore), and `GCSafety`
-(GcReachability). Each broken variant is built as a throwaway copy under `/tmp`
-and is **not** committed; the modules in this directory are the clean ones.
+Four negative controls are documented below, one per headline invariant:
+`NoLostUpdate` (RefStore), `SnapshotIsolation` (RefStore), `GCSafety`
+(GcReachability), and `RoutingTotality` (Sharding). The RefStore/GC ones are
+built as throwaway copies under `/tmp` and are **not** committed; the Sharding
+one ships as a committed config (`Sharding_neg.cfg`, `BadRouting = TRUE`) and a
+`make neg` target, because a `CONSTANT` toggle makes it a clean, repeatable,
+zero-edit control. The `.tla` modules in this directory are all the clean
+ones.
 
 ### RefStore — headline invariant `NoLostUpdate`
 
@@ -332,10 +417,63 @@ State 6: <GcMark>     /\ reachable  = {o1}      \* BROKEN: should be {o1, o2}
 
 Restoring `reachable' = ReachableClosure(frozenRoots)` returns the clean module.
 
+### Sharding — headline invariant `RoutingTotality`
+
+Unlike the controls above, this one ships as a committed `CONSTANT` toggle so
+it is a single repeatable command — no source edit. `Sharding.tla` exposes a
+`BadRouting` boolean: when `TRUE`, the routing relation double-assigns the
+first ref (by hash) to **two** shards instead of one:
+
+```tla
+ROUTES(r) ==
+    IF BadRouting /\ r = FirstRef /\ NumShards >= 2
+    THEN { shard_for(r), OtherShard(r) }   \* BROKEN: two shards own r
+    ELSE { shard_for(r) }                  \* correct: exactly one shard
+```
+
+This is exactly the partition bug routing must not have: a ref owned by two
+shards (`Cardinality(ROUTES(r)) = 2`, and the ref lands in two shards' owned
+sets). `Sharding_neg.cfg` sets `BadRouting = TRUE`; everything else matches
+the clean instance.
+
+**Run it:**
+
+```sh
+make neg
+# or directly:
+java -cp ~/.tla/tla2tools.jar tlc2.TLC -config Sharding_neg.cfg Sharding.tla
+```
+
+**Counterexample TLC produces** (TLC exits non-zero; `make neg` PASSES on that
+non-zero exit):
+
+```
+Error: The invariant of RoutingTotality is equal to FALSE
+```
+
+`RoutingTotality` is constant-level, so TLC evaluates it at initialization and
+reports it `equal to FALSE` (no state trace needed — the violation is in the
+constants, not a reachable state): `r1` (the first ref by hash) now routes to
+both shard `0` and shard `1`, so `Cardinality(ROUTES("r1")) = 2 ≠ 1`. With
+`BadRouting = FALSE` (the default `Sharding.cfg`) every ref's routing image is
+a singleton and the invariant holds. The `make neg` target asserts the
+non-zero exit, so it is part of the suite's definition of "green."
+
+> **`ApplyDeterminism` was also validated against a broken apply.** A throwaway
+> `/tmp` copy gave replica 2 a perturbed apply (`version + 99` on update). At
+> `applied1 = applied2 = 1` the two replicas diverged (`version 1` vs `version
+> 99`), firing **both** `DeterminismInv` and `PrefixFunctional`. This confirms
+> the determinism invariants are non-vacuous — they genuinely depend on apply
+> being a pure function of `(state, op)`. The probe was removed after
+> confirmation; the committed module is the clean one.
+
 ---
 
 ## Out of scope
 
 WAL crash-recovery modeling, the Git wire protocol, object content/hashing,
-liveness/termination (safety only), and the ART node structure. Phase 3 will
-extend `RefStore.tla` with the Raft replication layer.
+liveness/termination (safety only), and the ART node structure. Raft consensus
+itself (election safety, log matching, leader completeness, state-machine
+safety) is **not** re-derived — it is inherited from openraft's Ongaro/Diego
+TLA+ lineage; `Sharding.tla` models only the Ledge-specific routing-totality
+and apply-determinism properties layered above and below that consensus core.
