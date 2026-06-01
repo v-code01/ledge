@@ -27,6 +27,8 @@ pub const SNAPSHOT_BYTES_TOTAL: &str = "ledge_snapshot_bytes_total";
 pub const SNAPSHOT_REFLINKED_TOTAL: &str = "ledge_snapshot_reflinked_total";
 pub const SNAPSHOT_COPIED_TOTAL: &str = "ledge_snapshot_copied_total";
 pub const SNAPSHOT_DURATION: &str = "ledge_snapshot_duration_seconds";
+pub const RPC_REQUESTS_TOTAL: &str = "ledge_rpc_requests_total";
+pub const RPC_REQUEST_DURATION: &str = "ledge_rpc_request_duration_seconds";
 
 pub fn install_recorder() -> ledge_core::Result<()> {
     let handle = PrometheusBuilder::new()
@@ -75,6 +77,14 @@ pub fn record_snapshot(stats: &ledge_cow::CloneStats, d: std::time::Duration) {
     metrics::histogram!(SNAPSHOT_DURATION).record(d.as_secs_f64());
 }
 
+/// Record one `POST /rpc` call: bump the per-method counter and the per-method
+/// duration histogram. The label is the decoded request union tag (e.g.
+/// "writeObject"), or "unknown" for an undecodable / malformed body.
+pub fn record_rpc_request(method: &'static str, d: std::time::Duration) {
+    metrics::counter!(RPC_REQUESTS_TOTAL, "method" => method).increment(1);
+    metrics::histogram!(RPC_REQUEST_DURATION, "method" => method).record(d.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +117,18 @@ mod tests {
     fn snapshot_metric_constants_correct() {
         assert_eq!(SNAPSHOTS_TOTAL, "ledge_snapshots_total");
         assert_eq!(SNAPSHOT_DURATION, "ledge_snapshot_duration_seconds");
+    }
+
+    #[test]
+    fn rpc_metric_constants_correct() {
+        assert_eq!(RPC_REQUESTS_TOTAL, "ledge_rpc_requests_total");
+        assert_eq!(RPC_REQUEST_DURATION, "ledge_rpc_request_duration_seconds");
+    }
+
+    #[test]
+    fn rpc_record_helper_no_panic_without_recorder() {
+        record_rpc_request("writeObject", std::time::Duration::from_millis(1));
+        record_rpc_request("unknown", std::time::Duration::from_micros(50));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod admin_routes;
 pub mod config;
 pub mod metrics;
 pub mod routes;
+pub mod rpc_routes;
 pub mod workspace_routes;
 
 pub use routes::AppState;
@@ -54,6 +55,8 @@ pub fn build_app(state: AppState) -> Router {
             axum::routing::post(workspace_routes::commit_workspace),
         )
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
+        // ── Binary control plane (Cap'n Proto, spec §2) ────────────────────
+        .route("/rpc", axum::routing::post(rpc_routes::rpc))
         .route(
             "/admin/snapshot",
             axum::routing::post(admin_routes::admin_snapshot),

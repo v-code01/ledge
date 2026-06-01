@@ -22,6 +22,7 @@ ledge-ref-store    = { path = "../ledge-ref-store" }
 ledge-git          = { path = "../ledge-git" }
 ledge-workspace    = { path = "../ledge-workspace" }
 ledge-cow          = { path = "../ledge-cow" }
+ledge-rpc          = { path = "../ledge-rpc" }
 axum.workspace              = true
 tower.workspace             = true
 tower-http.workspace        = true
@@ -42,3 +43,4 @@ anyhow.workspace            = true
 tokio    = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
 reqwest  = { version = "0.12", features = ["json"] }
+capnp.workspace = true
