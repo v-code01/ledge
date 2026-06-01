@@ -29,7 +29,6 @@ async fn git(args: &[&str], cwd: &Path) -> std::process::Output {
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TRACE_PACKET", "1")
             .output(),
     )
     .await
