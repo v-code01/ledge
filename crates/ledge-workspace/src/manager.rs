@@ -93,6 +93,53 @@ impl WorkspaceManager {
     pub fn new(refs: Arc<RefStoreImpl>, leases: Arc<LeaseStore>, hlc: Arc<HLC>) -> Self {
         Self { refs, leases, hlc }
     }
+
+    /// Fork a workspace from `source` refs with lifetime `ttl`.
+    ///
+    /// For each source ref: read its durable entry; if present, create the
+    /// re-rooted workspace ref (`expected = None` => create-if-absent) sharing
+    /// the same target `ObjectId` (objects are never copied — content
+    /// addressing). A missing source ref is an error (Corruption naming it).
+    ///
+    /// Complexity: O(n) ref reads + O(n) ref creates for n source refs, plus one
+    /// lease put. Side effects: n ref-store WAL appends + one lease WAL append.
+    pub async fn fork(&self, source: &[RefName], ttl: Duration) -> Result<WorkspaceView> {
+        let id = WorkspaceId::generate(&self.hlc);
+
+        let mut view_refs: Vec<(String, RefEntry)> = Vec::with_capacity(source.len());
+        let mut source_names: Vec<String> = Vec::with_capacity(source.len());
+
+        for src in source {
+            let entry = self.refs.get(src).await?.ok_or_else(|| {
+                LedgeError::Corruption(format!("fork: source ref does not exist: {}", src.as_str()))
+            })?;
+            let ws = workspace_ref(&id, src)?;
+            // create-if-absent: a brand-new workspace namespace must be empty.
+            self.refs.update(&ws, entry.target, None).await?;
+            view_refs.push((src.as_str().to_string(), entry));
+            source_names.push(src.as_str().to_string());
+        }
+
+        let created = now_ms();
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let expires = created.saturating_add(ttl_ms);
+
+        let lease = Lease {
+            id,
+            source_refs: source_names,
+            created_at_ms: created,
+            expires_at_ms: expires,
+            hlc: self.hlc.tick(),
+            generation: 1,
+        };
+        self.leases.put(lease.clone()).await?;
+
+        Ok(WorkspaceView {
+            id,
+            lease,
+            refs: view_refs,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +172,35 @@ mod tests {
     /// Convenience: a RefName from a &str, panicking on invalid (test-only).
     fn r(s: &str) -> RefName {
         RefName::new(s).expect("valid ref name")
+    }
+
+    #[tokio::test]
+    async fn fork_copies_source_refs_with_same_targets() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        let target = oid(1);
+        // Seed a durable ref (create-if-absent uses expected = None).
+        mgr.refs.update(&main, target, None).await.unwrap();
+
+        let view = mgr
+            .fork(&[main.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // View presents the CLIENT-facing source name with the SAME target.
+        assert_eq!(view.refs.len(), 1);
+        assert_eq!(view.refs[0].0, "refs/heads/main");
+        assert_eq!(view.refs[0].1.target, target);
+
+        // The stored workspace ref exists and shares the target ObjectId.
+        let ws = workspace_ref(&view.id, &main).unwrap();
+        let stored = mgr.refs.get(&ws).await.unwrap().expect("ws ref present");
+        assert_eq!(stored.target, target);
+
+        // The lease is recorded and live.
+        let lease = mgr.leases.get(view.id).await.unwrap().expect("lease present");
+        assert_eq!(lease.generation, 1);
+        assert_eq!(lease.source_refs, vec!["refs/heads/main".to_string()]);
+        assert!(lease.expires_at_ms > lease.created_at_ms);
     }
 }
