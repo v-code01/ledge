@@ -40,6 +40,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use ledge_core::{LedgeError, ObjectId};
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -324,6 +326,161 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
     }
 }
 
+// ── Object replication transport: HttpObjectPeer ─────────────────────────────
+
+/// HTTP transport for the [`crate::object_store::ObjectPeer`] trait.
+///
+/// This is the production counterpart to [`crate::object_store::LocalObjectPeer`]
+/// (which wraps a sibling in-process `DiskObjectStore`). Each method is a single
+/// HTTP round-trip to the peer node's object endpoints, which are served by
+/// `ledge-server`'s `object_routes`:
+///
+/// - `put` / `put_git` → `POST {base}/objects/{shard}/replicate` with the **raw
+///   object content** as the octet-stream body. The git type is carried in the
+///   `?type=<n>` query (`put` uses the blob default, type 3). The receiver writes
+///   the bytes to its local `DiskObjectStore` via `write`/`write_git_object`,
+///   which re-derives the BLAKE3 content address; the 200 body is the resulting
+///   ObjectId hex. Because the store is content-addressed, the put is **idempotent**
+///   and the response id is verified to equal the expected id (a mismatch is a
+///   [`LedgeError::Corruption`], catching a tampering/buggy peer).
+/// - `get` → `GET {base}/objects/{shard}/{id_hex}` returning the raw content bytes
+///   (`200`) or `None` (`404`). The caller (`ReplicatedObjectStore::read`)
+///   re-verifies the content address on store, so a corrupt fetch is rejected
+///   there too.
+/// - `has` → `GET` with the same id; `200` ⇒ present, `404` ⇒ absent.
+///
+/// The `reqwest::Client` is pooled (keep-alive) and cheap to clone, mirroring
+/// [`HttpRaftNetwork`].
+pub struct HttpObjectPeer {
+    /// Base URL the peer serves `/objects/*` on (e.g. `http://127.0.0.1:8080`).
+    base_url: String,
+    /// Which shard's object replica this peer holds.
+    shard: ShardId,
+    /// Pooled HTTP client (keep-alive), shared across calls.
+    client: reqwest::Client,
+}
+
+impl HttpObjectPeer {
+    /// Build a peer client for `shard` against `base_url` over a fresh pooled
+    /// client.
+    pub fn new(base_url: impl Into<String>, shard: ShardId) -> Self {
+        Self {
+            base_url: base_url.into(),
+            shard,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Build a peer client reusing an existing pooled `reqwest::Client`.
+    pub fn with_client(base_url: impl Into<String>, shard: ShardId, client: reqwest::Client) -> Self {
+        Self {
+            base_url: base_url.into(),
+            shard,
+            client,
+        }
+    }
+
+    /// `{base}/objects/{shard}/replicate` — the typed-write replicate endpoint.
+    fn replicate_url(&self) -> String {
+        format!("{}/objects/{}/replicate", self.base_url, self.shard.0)
+    }
+
+    /// `{base}/objects/{shard}/{id_hex}` — the by-id fetch/probe endpoint.
+    fn object_url(&self, id: &ObjectId) -> String {
+        format!("{}/objects/{}/{}", self.base_url, self.shard.0, id.to_hex())
+    }
+
+    /// Common put body: POST raw `content` with `?type=git_type`, expect the
+    /// 200 body to be the ObjectId hex, and verify it equals `id`.
+    async fn put_typed(&self, id: &ObjectId, git_type: u8, content: &[u8]) -> ledge_core::Result<()> {
+        let url = format!("{}?type={}", self.replicate_url(), git_type);
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/octet-stream")
+            .body(content.to_vec())
+            .send()
+            .await
+            .map_err(|e| LedgeError::Unavailable(format!("replicate {} to peer failed: {e}", id.to_hex())))?;
+        if !resp.status().is_success() {
+            return Err(LedgeError::Unavailable(format!(
+                "replicate {} to peer returned {}",
+                id.to_hex(),
+                resp.status()
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| LedgeError::Unavailable(format!("read replicate response: {e}")))?;
+        let got = ObjectId::from_hex(body.trim())?;
+        if &got != id {
+            // Content addressing makes this verifiable: the peer must have
+            // re-derived the identical id, or it stored bytes under a different
+            // address (tampered/buggy peer).
+            return Err(LedgeError::Corruption(format!(
+                "peer replicate for {} produced address {}",
+                id.to_hex(),
+                got.to_hex()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::object_store::ObjectPeer for HttpObjectPeer {
+    async fn put(&self, id: &ObjectId, content: &[u8]) -> ledge_core::Result<()> {
+        // Plain `put` stores as a git blob (type 3), matching DiskObjectStore::write.
+        self.put_typed(id, 3, content).await
+    }
+
+    async fn put_git(&self, id: &ObjectId, git_type: u8, content: &[u8]) -> ledge_core::Result<()> {
+        self.put_typed(id, git_type, content).await
+    }
+
+    async fn get(&self, id: &ObjectId) -> ledge_core::Result<Option<Bytes>> {
+        let resp = self
+            .client
+            .get(self.object_url(id))
+            .send()
+            .await
+            .map_err(|e| LedgeError::Unavailable(format!("fetch {} from peer failed: {e}", id.to_hex())))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(LedgeError::Unavailable(format!(
+                "fetch {} from peer returned {}",
+                id.to_hex(),
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LedgeError::Unavailable(format!("read fetch response: {e}")))?;
+        Ok(Some(bytes))
+    }
+
+    async fn has(&self, id: &ObjectId) -> ledge_core::Result<bool> {
+        let resp = self
+            .client
+            .get(self.object_url(id))
+            .send()
+            .await
+            .map_err(|e| LedgeError::Unavailable(format!("probe {} on peer failed: {e}", id.to_hex())))?;
+        match resp.status() {
+            s if s.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            other => Err(LedgeError::Unavailable(format!(
+                "probe {} on peer returned {other}",
+                id.to_hex()
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Transport tests. The full consensus-correctness proof lives in the
@@ -528,5 +685,203 @@ mod tests {
 
         raft.shutdown().await.ok();
         server.abort();
+    }
+
+    // ── Object replication transport tests ───────────────────────────────────
+
+    use crate::object_store::{ObjectPeer, ReplicatedObjectStore};
+    use bytes::Bytes;
+    use ledge_core::{LedgeError, ObjectId, ObjectStore};
+    use ledge_object_store::DiskObjectStore;
+
+    /// Spin a real Axum server over a tempdir-backed `DiskObjectStore` exposing
+    /// the object replicate/fetch endpoints, returning `(base_url, store, join)`.
+    ///
+    /// The route shape MUST match `ledge-server`'s `object_routes`:
+    /// `POST /objects/{shard}/replicate?type=<n>` (raw body → ObjectId hex) and
+    /// `GET /objects/{shard}/{id_hex}` (raw content or 404). This in-crate copy
+    /// keeps the transport test self-contained (no dep on `ledge-server`).
+    async fn serve_object_store() -> (String, Arc<DiskObjectStore>, tokio::task::JoinHandle<()>) {
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the tempdir so the served store outlives the test body (the dir is
+        // reclaimed at process exit; acceptable for a transient test fixture).
+        let path = dir.keep();
+        let store = Arc::new(DiskObjectStore::new(path).unwrap());
+
+        #[derive(serde::Deserialize)]
+        struct TypeQuery {
+            #[serde(default)]
+            r#type: Option<u8>,
+        }
+
+        async fn replicate(
+            State(store): State<Arc<DiskObjectStore>>,
+            Path(_shard): Path<u32>,
+            Query(q): Query<TypeQuery>,
+            body: axum::body::Bytes,
+        ) -> Result<String, (StatusCode, String)> {
+            let git_type = q.r#type.unwrap_or(3);
+            let id = store
+                .write_git_object(git_type, body)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            Ok(id.to_hex())
+        }
+
+        async fn fetch(
+            State(store): State<Arc<DiskObjectStore>>,
+            Path((_shard, id_hex)): Path<(u32, String)>,
+        ) -> Result<Vec<u8>, StatusCode> {
+            let id = ObjectId::from_hex(&id_hex).map_err(|_| StatusCode::BAD_REQUEST)?;
+            match store.read(id).await {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(LedgeError::NotFound(_)) => Err(StatusCode::NOT_FOUND),
+                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+
+        let app = Router::new()
+            .route("/objects/{shard}/replicate", post(replicate))
+            .route("/objects/{shard}/{id}", get(fetch))
+            .with_state(store.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), store, join)
+    }
+
+    #[tokio::test]
+    async fn http_object_peer_roundtrip() {
+        let (base, store, server) = serve_object_store().await;
+        let peer = HttpObjectPeer::new(base, ShardId(0));
+
+        // put → returns the content address; GET fetches identical bytes.
+        let content = Bytes::from_static(b"replicate me over HTTP");
+        let id = ObjectId::from(blake3::hash(&content));
+        peer.put(&id, &content).await.expect("put over HTTP");
+        assert!(store.exists(id).await.unwrap(), "peer stored the object");
+        assert!(peer.has(&id).await.unwrap(), "has() sees the object");
+
+        let got = peer.get(&id).await.unwrap().expect("get returns Some");
+        assert_eq!(&got[..], &content[..], "fetched bytes identical");
+
+        // A missing id round-trips as None / false (404).
+        let absent = ObjectId::from(blake3::hash(b"never written"));
+        assert!(peer.get(&absent).await.unwrap().is_none());
+        assert!(!peer.has(&absent).await.unwrap());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_object_peer_put_git_preserves_type() {
+        let (base, store, server) = serve_object_store().await;
+        let peer = HttpObjectPeer::new(base, ShardId(0));
+
+        // A tree object (type 2): the receiver must reproduce the type byte so
+        // its content address + git header match.
+        let content = Bytes::from_static(b"100644 file\0\x01\x02\x03");
+        let id = ObjectId::from(blake3::hash(&content));
+        peer.put_git(&id, 2, &content).await.expect("put_git over HTTP");
+        assert_eq!(store.git_type_of(id).await.unwrap(), 2, "type byte preserved");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_object_peer_rejects_mismatched_address() {
+        // The receiver re-derives the id from the bytes; the client verifies the
+        // returned id equals the expected id. Claim an id that does NOT match the
+        // content → the put must be rejected as Corruption.
+        let (base, _store, server) = serve_object_store().await;
+        let peer = HttpObjectPeer::new(base, ShardId(0));
+
+        let content = Bytes::from_static(b"honest bytes");
+        let wrong_id = ObjectId::from(blake3::hash(b"a different object"));
+        let err = peer
+            .put(&wrong_id, &content)
+            .await
+            .expect_err("mismatched content address must be rejected");
+        assert!(
+            matches!(err, LedgeError::Corruption(_)),
+            "expected Corruption, got {err:?}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replicated_store_over_http_writes_to_quorum() {
+        // 3-replica shard: 1 local + 2 HTTP peers. quorum = 2. A write must land
+        // on the local store AND at least one peer; best-effort drains the rest,
+        // so both peers should converge. We assert both end up with the object.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(DiskObjectStore::new(local_dir.path().to_path_buf()).unwrap());
+
+        let (base_a, store_a, server_a) = serve_object_store().await;
+        let (base_b, store_b, server_b) = serve_object_store().await;
+        let peer_a: Arc<dyn ObjectPeer> = Arc::new(HttpObjectPeer::new(base_a, ShardId(0)));
+        let peer_b: Arc<dyn ObjectPeer> = Arc::new(HttpObjectPeer::new(base_b, ShardId(0)));
+
+        let store = ReplicatedObjectStore::new(local.clone(), vec![peer_a, peer_b]);
+        assert_eq!(store.quorum(), 2, "n=3 ⇒ quorum 2");
+
+        let content = Bytes::from_static(b"quorum-durable object");
+        let id = store.write(content.clone()).await.expect("quorum write");
+        assert!(local.exists(id).await.unwrap(), "local has it");
+
+        // The post-quorum drain runs in the background; poll until both converge.
+        for _ in 0..100 {
+            if store_a.exists(id).await.unwrap() && store_b.exists(id).await.unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(store_a.exists(id).await.unwrap(), "peer A converged");
+        assert!(store_b.exists(id).await.unwrap(), "peer B converged");
+
+        server_a.abort();
+        server_b.abort();
+    }
+
+    #[tokio::test]
+    async fn replicated_store_over_http_quorum_with_one_peer_down() {
+        // 3-replica shard, but one peer points at a dead address (connection
+        // refused). quorum = 2 = local + the one live peer, so the write still
+        // succeeds; anti-entropy repairs the dead replica later.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(DiskObjectStore::new(local_dir.path().to_path_buf()).unwrap());
+
+        let (base_live, store_live, server_live) = serve_object_store().await;
+        let peer_live: Arc<dyn ObjectPeer> = Arc::new(HttpObjectPeer::new(base_live, ShardId(0)));
+        // Reserved-port / closed socket: connection refused → put errors, but
+        // quorum is still reached by local + the live peer.
+        let peer_dead: Arc<dyn ObjectPeer> =
+            Arc::new(HttpObjectPeer::new("http://127.0.0.1:1", ShardId(0)));
+
+        let store = ReplicatedObjectStore::new(local.clone(), vec![peer_live, peer_dead]);
+        assert_eq!(store.quorum(), 2);
+
+        let content = Bytes::from_static(b"survives one down peer");
+        let id = store.write(content).await.expect("quorum still reached with one peer down");
+        assert!(local.exists(id).await.unwrap());
+
+        for _ in 0..100 {
+            if store_live.exists(id).await.unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(store_live.exists(id).await.unwrap(), "live peer got it");
+
+        server_live.abort();
     }
 }

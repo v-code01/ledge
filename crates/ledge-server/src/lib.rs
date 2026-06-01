@@ -2,6 +2,7 @@ pub mod admin_routes;
 pub mod cluster_routes;
 pub mod config;
 pub mod metrics;
+pub mod object_routes;
 pub mod routes;
 pub mod rpc_routes;
 pub mod workspace_routes;
@@ -19,7 +20,7 @@ use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, LeaseStore, WorkspaceManager};
 
 use std::collections::{BTreeMap, HashMap};
-use ledge_cluster::net_http::HttpRaftNetworkFactory;
+use ledge_cluster::net_http::{HttpObjectPeer, HttpRaftNetworkFactory};
 use ledge_cluster::ref_store::ShardHandle;
 use ledge_cluster::{ClusterRefStore, ReplicatedObjectStore, ShardId, ShardRouter};
 use ledge_raft::{StateMachineStore, TypeConfig, WalLogStore};
@@ -144,10 +145,31 @@ pub async fn build_cluster_stack(
     }
 
     let cluster_refs = Arc::new(ClusterRefStore::new(node_id, router, shard_handles));
-    // No object peers in Phase 3 bootstrap: replication of objects across nodes
-    // uses the same HTTP transport as the ref Raft and is a follow-up; the local
-    // store is the single replica for now (content-addressed, so safe).
-    let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), Vec::new()));
+    // Within-shard content-addressed quorum replication (spec §2.5): every OTHER
+    // node in the cluster is a replica of this shard's objects, reached over the
+    // same HTTP base URL it serves `/raft/*` on (the `/objects/*` routes are
+    // mounted on the same router). One `HttpObjectPeer` per peer (excluding
+    // self). A `write` returns once a quorum (`n/2+1` of local + peers) is
+    // durable; missing replicas self-repair via anti-entropy on read.
+    //
+    // Phase 3 replica-set model: one replica set per shard spanning all nodes.
+    // `ShardId(0)` is used as the peer's shard segment — it is accepted for
+    // routing symmetry and the node-local store holds whatever shards it hosts;
+    // the content address is shard-independent, so the segment does not affect
+    // correctness here.
+    let object_client = reqwest::Client::new();
+    let object_peers: Vec<Arc<dyn ledge_cluster::ObjectPeer>> = peers
+        .iter()
+        .filter(|(id, _)| **id != node_id)
+        .map(|(_, addr)| {
+            Arc::new(HttpObjectPeer::with_client(
+                addr.clone(),
+                ShardId(0),
+                object_client.clone(),
+            )) as Arc<dyn ledge_cluster::ObjectPeer>
+        })
+        .collect();
+    let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), object_peers));
 
     Ok(ClusterStack {
         refs: cluster_refs as Arc<dyn RefStore>,
@@ -199,6 +221,18 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/cluster/status",
             axum::routing::get(cluster_routes::cluster_status),
+        )
+        // ── Object replication (spec §2.5) — content-addressed peer endpoints.
+        // Active in both modes: in single-node they harmlessly serve the local
+        // node's objects; in cluster mode they are the HttpObjectPeer transport
+        // for within-shard quorum replication + anti-entropy fetch. ───────────
+        .route(
+            "/objects/{shard}/replicate",
+            axum::routing::post(object_routes::replicate_object),
+        )
+        .route(
+            "/objects/{shard}/{id}",
+            axum::routing::get(object_routes::get_object),
         )
         // ── Workspace-scoped git (segment = workspaces/{id}/) ──────────────
         .route("/ws/{id}/info/refs", axum::routing::get(routes::ws_info_refs))
