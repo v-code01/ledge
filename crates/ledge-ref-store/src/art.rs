@@ -646,13 +646,11 @@ pub fn art_delete(node: Arc<ArtNode>, key: &[u8], depth: usize) -> Option<Arc<Ar
                 return Some(node); // Key not in this subtree.
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return Some(node);
-            }
-            let byte = key[after];
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             let pos = (0..n.count as usize).find(|&i| n.keys[i] == byte)?;
             let child = n.children[pos].as_ref()?;
-            let new_child = art_delete(Arc::clone(child), key, after + 1);
+            let new_child = art_delete(Arc::clone(child), key, next_depth);
             let mut new_n = n.clone();
             if let Some(nc) = new_child {
                 new_n.children[pos] = Some(nc);
@@ -681,13 +679,11 @@ pub fn art_delete(node: Arc<ArtNode>, key: &[u8], depth: usize) -> Option<Arc<Ar
                 return Some(node);
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return Some(node);
-            }
-            let byte = key[after];
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             let pos = (0..n.count as usize).find(|&i| n.keys[i] == byte)?;
             let child = n.children[pos].as_ref()?;
-            let new_child = art_delete(Arc::clone(child), key, after + 1);
+            let new_child = art_delete(Arc::clone(child), key, next_depth);
             let mut new_n = n.clone();
             if let Some(nc) = new_child {
                 new_n.children[pos] = Some(nc);
@@ -715,16 +711,14 @@ pub fn art_delete(node: Arc<ArtNode>, key: &[u8], depth: usize) -> Option<Arc<Ar
                 return Some(node);
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return Some(node);
-            }
-            let byte = key[after];
+            let byte = if after >= key.len() { 0x00 } else { key[after] };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             let idx = n.key_index[byte as usize];
             if idx == 0xFF {
                 return Some(node);
             }
             let child = n.children[idx as usize].as_ref()?;
-            let new_child = art_delete(Arc::clone(child), key, after + 1);
+            let new_child = art_delete(Arc::clone(child), key, next_depth);
             // n is &Box<Node48>; clone the inner Node48 directly.
             let mut new_n: Node48 = (**n).clone();
             if let Some(nc) = new_child {
@@ -748,12 +742,10 @@ pub fn art_delete(node: Arc<ArtNode>, key: &[u8], depth: usize) -> Option<Arc<Ar
                 return Some(node);
             }
             let after = depth + pfx.len();
-            if after >= key.len() {
-                return Some(node);
-            }
-            let byte = key[after] as usize;
+            let byte = if after >= key.len() { 0x00usize } else { key[after] as usize };
+            let next_depth = if after >= key.len() { after } else { after + 1 };
             let child = n.children[byte].as_ref()?;
-            let new_child = art_delete(Arc::clone(child), key, after + 1);
+            let new_child = art_delete(Arc::clone(child), key, next_depth);
             let mut new_n = n.clone();
             if let Some(nc) = new_child {
                 new_n.children[byte] = Some(nc);
@@ -991,5 +983,18 @@ mod tests {
             root = Some(art_insert(root, k, make_entry(i as u8, i as u64 + 1), 0));
         }
         assert_eq!(art_prefix_iter(&root.unwrap(), b"", 0).len(), 2);
+    }
+
+    #[test]
+    fn delete_prefix_key() {
+        // "refs/a" is a strict prefix of "refs/ab"
+        let mut root = None;
+        root = Some(art_insert(root, b"refs/a", make_entry(1, 1), 0));
+        root = Some(art_insert(root, b"refs/ab", make_entry(2, 2), 0));
+        // Delete the shorter key
+        let root = art_delete(root.unwrap(), b"refs/a", 0);
+        let root = root.expect("tree not empty");
+        assert!(art_lookup(&root, b"refs/a", 0).is_none(), "refs/a should be deleted");
+        assert!(art_lookup(&root, b"refs/ab", 0).is_some(), "refs/ab should still exist");
     }
 }
