@@ -8,6 +8,7 @@ pub struct LedgeConfig {
     pub ref_store: RefStoreConfig,
     pub metrics: MetricsConfig,
     pub workspace: WorkspaceConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -39,6 +40,35 @@ pub struct WorkspaceConfig {
     pub default_ttl_secs: u64,
 }
 
+/// Cluster (sharded Raft) configuration. Disabled by default: a default-loaded
+/// config is single-node and byte-identical to Phase 1/2 (the `/raft` and
+/// `/cluster` handlers see no shards and report not-clustered).
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct ClusterConfig {
+    /// When false (default), the server runs single-node; no Raft groups are
+    /// built and the cluster endpoints are inert (503).
+    pub enabled: bool,
+    /// This node's Raft node id (must be unique across the cluster).
+    pub node_id: u64,
+    /// Number of shards (independent Raft groups) this cluster partitions into.
+    pub num_shards: u32,
+    /// Peer node table for the Raft HTTP network. Empty by default; populated
+    /// from `[[cluster.peers]]` TOML blocks. `#[serde(default)]` so a config with
+    /// no peers block deserializes to an empty Vec without a `config`-crate
+    /// empty-Vec default footgun.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+    /// Local bind address this node serves its `/raft/*` endpoints on.
+    pub raft_bind: String,
+}
+
+/// One cluster peer: a Raft node id and the base URL it serves `/raft/*` on.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct PeerConfig {
+    pub id: u64,
+    pub addr: String,
+}
+
 impl LedgeConfig {
     pub fn load(config_path: Option<&PathBuf>) -> ledge_core::Result<Self> {
         use config::{Config, Environment, File};
@@ -51,7 +81,11 @@ impl LedgeConfig {
             .set_default("metrics.addr",                       "0.0.0.0:9090").map_err(map_cfg)?
             .set_default("workspace.expiry_interval_secs",     30i64).map_err(map_cfg)?
             .set_default("workspace.gc_interval_secs",         300i64).map_err(map_cfg)?
-            .set_default("workspace.default_ttl_secs",         3600i64).map_err(map_cfg)?;
+            .set_default("workspace.default_ttl_secs",         3600i64).map_err(map_cfg)?
+            .set_default("cluster.enabled",                    false).map_err(map_cfg)?
+            .set_default("cluster.node_id",                    1i64).map_err(map_cfg)?
+            .set_default("cluster.num_shards",                 1i64).map_err(map_cfg)?
+            .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -109,6 +143,37 @@ mod tests {
         assert_eq!(cfg.server.addr, "127.0.0.1:4000");
         assert_eq!(cfg.ref_store.wal_compact_threshold_mb, 128);
         assert!(!cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn cluster_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert!(!cfg.cluster.enabled, "cluster disabled by default");
+        assert_eq!(cfg.cluster.node_id, 1);
+        assert_eq!(cfg.cluster.num_shards, 1);
+        assert!(cfg.cluster.peers.is_empty(), "peers empty by default");
+        assert_eq!(cfg.cluster.raft_bind, "0.0.0.0:4001");
+    }
+
+    #[test]
+    fn cluster_config_toml_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[cluster]\nenabled=true\nnode_id=2\nnum_shards=4\nraft_bind=\"127.0.0.1:5001\"\n[[cluster.peers]]\nid=1\naddr=\"http://h1:4001\"\n[[cluster.peers]]\nid=3\naddr=\"http://h3:4001\""
+        )
+        .unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.node_id, 2);
+        assert_eq!(cfg.cluster.num_shards, 4);
+        assert_eq!(cfg.cluster.raft_bind, "127.0.0.1:5001");
+        assert_eq!(cfg.cluster.peers.len(), 2);
+        assert_eq!(cfg.cluster.peers[0].id, 1);
+        assert_eq!(cfg.cluster.peers[0].addr, "http://h1:4001");
+        assert_eq!(cfg.cluster.peers[1].id, 3);
     }
 
     #[test]
