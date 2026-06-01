@@ -182,7 +182,9 @@ pub async fn handle_receive_pack(
     body: Bytes,
     refs: Arc<dyn RefStore>,
     sha1_store: &dyn Sha1Provider,
+    segment: &str,
 ) -> ledge_core::Result<Vec<u8>> {
+    use crate::fetch::store_ref;
     // ── Step 1: parse ref commands until flush ─────────────────────────────
     let mut cursor: &[u8] = &body;
     let mut commands: Vec<RefCommand> = Vec::new();
@@ -263,7 +265,11 @@ pub async fn handle_receive_pack(
     let mut ref_results: Vec<(String, Result<(), String>)> = Vec::new();
 
     for cmd in &commands {
-        let ref_name = match RefName::new(&cmd.ref_name) {
+        // Translate the client ref to its stored (segment-prefixed) name. The
+        // status line still reports the CLIENT name (`cmd.ref_name`) so git's
+        // report-status matches exactly what the client pushed.
+        let stored_name = store_ref(&cmd.ref_name, segment);
+        let ref_name = match RefName::new(&stored_name) {
             Ok(n) => n,
             Err(e) => {
                 ref_results.push((cmd.ref_name.clone(), Err(format!("invalid ref name: {}", e))));
@@ -862,6 +868,7 @@ mod tests {
             Bytes::from(body),
             refs.clone() as Arc<dyn RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
@@ -882,6 +889,46 @@ mod tests {
         let ref_name = RefName::new("refs/heads/main").unwrap();
         let entry = refs.get(&ref_name).await.unwrap();
         assert!(entry.is_some(), "refs/heads/main must exist after push");
+    }
+
+    #[tokio::test]
+    async fn receive_pack_segment_stores_under_workspace_prefix() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+
+        let blob_content = Bytes::from_static(b"workspace push blob");
+        let git_header = format!("blob {}\0", blob_content.len());
+        let mut sha1_input = git_header.into_bytes();
+        sha1_input.extend_from_slice(&blob_content);
+        use sha1::{Digest, Sha1};
+        let blob_sha1: [u8; 20] = Sha1::digest(&sha1_input).into();
+        let pack = crate::fetch::encode_pack(&[(3u8, blob_content.clone())]);
+
+        let null = null_sha1();
+        let mut body: Vec<u8> = Vec::new();
+        // Client pushes the normal name refs/heads/main.
+        body.extend_from_slice(&pkt_ref_cmd(&null, &blob_sha1, "refs/heads/main", Some(" caps")));
+        body.extend_from_slice(&encode_flush());
+        body.extend_from_slice(&pack);
+
+        let response = handle_receive_pack(
+            Bytes::from(body),
+            refs.clone() as Arc<dyn RefStore>,
+            objects.as_ref(),
+            "workspaces/abc/",
+        )
+        .await
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&response);
+        assert!(s.contains("unpack ok"), "{s}");
+        // report-status echoes the CLIENT name.
+        assert!(s.contains("ok refs/heads/main"), "{s}");
+        // ...but the ref is stored under the workspace prefix.
+        let stored = RefName::new("refs/workspaces/abc/heads/main").unwrap();
+        assert!(refs.get(&stored).await.unwrap().is_some(), "must store under ws prefix");
+        let client = RefName::new("refs/heads/main").unwrap();
+        assert!(refs.get(&client).await.unwrap().is_none(), "must NOT store under client name");
     }
 
     // ── Test 6: create-conflict reports ng ───────────────────────────────
@@ -921,6 +968,7 @@ mod tests {
             Bytes::from(body),
             refs.clone() as Arc<dyn RefStore>,
             objects.as_ref(),
+            "",
         )
         .await
         .unwrap();
