@@ -1,0 +1,10 @@
+{
+  "//": "Ledge is a Rust project. The SDKs under sdk/ each have their own language toolchain and test suite (sdk/python has its own pyrightconfig.json + .venv + pytest; sdk/ts has tsc + vitest). Exclude sdk/ from any repo-root Pyright run, which cannot resolve the per-SDK virtualenvs / generated bindings and would report false positives on pycapnp's dynamically-loaded schema attributes. The Python SDK is type-checked correctly from within sdk/python/ where its venv is configured.",
+  "exclude": [
+    "sdk",
+    "**/node_modules",
+    "**/.venv",
+    "**/target",
+    "**/__pycache__"
+  ]
+}
