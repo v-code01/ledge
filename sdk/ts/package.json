@@ -1,0 +1,24 @@
+{
+  "name": "@ledge/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "TypeScript reference SDK for the Ledge control plane over Cap'n Proto POST /rpc.",
+  "exports": {
+    ".": "./src/client.ts"
+  },
+  "scripts": {
+    "gen": "capnp-es -ots ../schema/ledge.capnp && mkdir -p src/generated && mv ../schema/ledge.ts src/generated/ledge.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "capnp-es": "^0.0.14"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.7"
+  }
+}
