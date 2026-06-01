@@ -203,4 +203,18 @@ mod tests {
         assert_eq!(lease.source_refs, vec!["refs/heads/main".to_string()]);
         assert!(lease.expires_at_ms > lease.created_at_ms);
     }
+
+    #[tokio::test]
+    async fn fork_missing_source_ref_errors() {
+        let (mgr, _dir) = setup();
+        let absent = r("refs/heads/nope");
+        let err = mgr
+            .fork(&[absent], Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        match err {
+            LedgeError::Corruption(msg) => assert!(msg.contains("refs/heads/nope")),
+            other => panic!("expected Corruption naming the ref, got {other:?}"),
+        }
+    }
 }
