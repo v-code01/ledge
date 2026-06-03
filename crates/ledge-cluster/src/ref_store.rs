@@ -40,7 +40,9 @@ use ledge_raft::{LedgeOp, LedgeResp, ReadHandle, TypeConfig};
 use ledge_workspace::{id::WorkspaceId, lease::Lease};
 use openraft::Raft;
 
+use crate::forward::{ClusterOp, LocalApplier, RefOpForwarder, RefOpResponse};
 use crate::router::{ShardId, ShardRouter, ShardSpan};
+use crate::shard_map::ShardMap;
 
 /// Raft handle type for one shard replica.
 type RaftHandle = Raft<TypeConfig>;
@@ -90,6 +92,20 @@ const LEADER_POLL_ATTEMPTS: usize = 50;
 /// non-retryable integrity failure.
 fn infra(msg: impl Into<String>) -> LedgeError {
     LedgeError::Unavailable(msg.into())
+}
+
+/// Forwarder used when a store is built without placement (Phase-3 in-process
+/// harness / single-node). It is never invoked because every shard is locally
+/// hosted; if it ever is, that is a configuration bug → `Unavailable`.
+struct RejectAllForwarder;
+
+#[async_trait]
+impl RefOpForwarder for RejectAllForwarder {
+    async fn forward(&self, shard: ShardId, _op: ClusterOp) -> Result<RefOpResponse> {
+        Err(infra(format!(
+            "shard {shard:?} not locally hosted and no forwarder configured"
+        )))
+    }
 }
 
 /// Resolve the current leader handle of `shard` from a replica set, polling the
@@ -175,12 +191,25 @@ impl std::fmt::Display for ClientWriteErr {
 pub struct ClusterRefStore {
     node_id: u64,
     router: ShardRouter,
+    /// LOCALLY-HOSTED shards only (an absent shard ⇒ not hosted ⇒ forward).
     shards: BTreeMap<ShardId, Vec<ShardHandle>>,
     mode: ConsistencyMode,
+    /// The placement map (for "do I host this shard?" + forward-target choice).
+    /// `Default` (empty) in single-node / Phase-3 in-process mode, where every
+    /// shard is present in `shards` so the forward branch is never taken.
+    map: ShardMap,
+    /// Forwarder for non-locally-hosted shards. Defaults to a reject-all stub so
+    /// a store built without placement (Phase-3 harness) behaves exactly as
+    /// before for its locally-present shards.
+    forwarder: Arc<dyn RefOpForwarder>,
 }
 
 impl ClusterRefStore {
-    /// Construct over a node's view of the cluster. Defaults to linearizable reads.
+    /// Construct over a node's view of the cluster. Defaults to linearizable
+    /// reads, an empty placement map, and a reject-all forwarder — i.e. the
+    /// Phase-3 behavior where `shards` holds every shard and no op is ever
+    /// forwarded. Use [`with_placement`](Self::with_placement) to enable the
+    /// remote path.
     pub fn new(
         node_id: u64,
         router: ShardRouter,
@@ -191,13 +220,54 @@ impl ClusterRefStore {
             router,
             shards,
             mode: ConsistencyMode::Linearizable,
+            map: ShardMap::default(),
+            forwarder: Arc::new(RejectAllForwarder),
         }
+    }
+
+    /// Construct with placement: a LOCAL-ONLY handle map (absent shards are
+    /// forwarded), the cluster's `ShardMap`, and a `forwarder` for remote shards.
+    /// This is the production / multi-host constructor (`build_cluster_stack`)
+    /// and the in-memory forwarding test's constructor.
+    pub fn with_placement(
+        node_id: u64,
+        router: ShardRouter,
+        shards: BTreeMap<ShardId, Vec<ShardHandle>>,
+        map: ShardMap,
+        forwarder: Arc<dyn RefOpForwarder>,
+    ) -> Self {
+        Self {
+            node_id,
+            router,
+            shards,
+            mode: ConsistencyMode::Linearizable,
+            map,
+            forwarder,
+        }
+    }
+
+    /// Attach a placement map + forwarder, enabling the remote-shard path for
+    /// shards absent from the local handle map (builder-style).
+    pub fn with_forwarder(mut self, forwarder: Arc<dyn RefOpForwarder>, map: ShardMap) -> Self {
+        self.forwarder = forwarder;
+        self.map = map;
+        self
     }
 
     /// Override the read consistency mode (builder-style).
     pub fn with_mode(mut self, mode: ConsistencyMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Whether THIS node hosts `shard` (it has a local handle for it).
+    fn hosts_locally(&self, shard: ShardId) -> bool {
+        self.shards.contains_key(&shard)
+    }
+
+    /// The placement map this store was built with (introspection / status).
+    pub fn map(&self) -> &ShardMap {
+        &self.map
     }
 
     /// The router this store partitions through (for tests / introspection).
@@ -281,6 +351,16 @@ impl ClusterRefStore {
 impl RefStore for ClusterRefStore {
     async fn get(&self, name: &RefName) -> Result<Option<RefEntry>> {
         let shard = self.router.shard_for(name.as_str());
+        if !self.hosts_locally(shard) {
+            return match self
+                .forwarder
+                .forward(shard, ClusterOp::Get { name: name.as_str().to_string() })
+                .await?
+            {
+                RefOpResponse::Entry(e) => Ok(e),
+                other => Err(infra(format!("unexpected forward resp for get: {other:?}"))),
+            };
+        }
         match self.mode {
             ConsistencyMode::Linearizable => {
                 let leader = self.leader_of(shard).await?;
@@ -305,8 +385,28 @@ impl RefStore for ClusterRefStore {
         expected: Option<ObjectId>,
     ) -> Result<RefEntry> {
         let shard = self.router.shard_for(name.as_str());
-        // HLC is ticked on the LEADER at propose time (spec §2.3): the proposing
-        // node is the timestamp source, and the value travels in the op.
+        if !self.hosts_locally(shard) {
+            // Remote shard: ship target+expected; the HOST assigns the HLC.
+            let resp = self
+                .forwarder
+                .forward(
+                    shard,
+                    ClusterOp::Update {
+                        name: name.as_str().to_string(),
+                        target_bytes: *new.as_bytes(),
+                        expected_bytes: expected.map(|e| *e.as_bytes()),
+                    },
+                )
+                .await?;
+            return match resp {
+                RefOpResponse::Updated(e) => Ok(e),
+                RefOpResponse::Conflict(c) => Err(LedgeError::Conflict { current: c }),
+                RefOpResponse::NotFound => Err(LedgeError::NotFound(new)),
+                other => Err(infra(format!("unexpected forward resp for update: {other:?}"))),
+            };
+        }
+        // Local shard: existing Phase-3 fast path (HLC ticked on the leader at
+        // propose time — spec §2.3 — the value travels in the op).
         let leader = self.leader_of(shard).await?;
         let hlc = leader.hlc.tick();
         let op = LedgeOp::RefUpdate {
@@ -321,6 +421,24 @@ impl RefStore for ClusterRefStore {
 
     async fn delete(&self, name: &RefName, expected: ObjectId) -> Result<()> {
         let shard = self.router.shard_for(name.as_str());
+        if !self.hosts_locally(shard) {
+            let resp = self
+                .forwarder
+                .forward(
+                    shard,
+                    ClusterOp::Delete {
+                        name: name.as_str().to_string(),
+                        expected_bytes: *expected.as_bytes(),
+                    },
+                )
+                .await?;
+            return match resp {
+                RefOpResponse::Deleted => Ok(()),
+                RefOpResponse::Conflict(c) => Err(LedgeError::Conflict { current: c }),
+                RefOpResponse::NotFound => Err(LedgeError::NotFound(expected)),
+                other => Err(infra(format!("unexpected forward resp for delete: {other:?}"))),
+            };
+        }
         let leader = self.leader_of(shard).await?;
         let hlc = leader.hlc.tick();
         let op = LedgeOp::RefDelete {
@@ -337,6 +455,10 @@ impl RefStore for ClusterRefStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<(RefName, RefEntry)>> {
+        // TODO(p4a §4.3): fan out List to remote (non-locally-hosted) shards via
+        // the forwarder + merge. For now `list`/`snapshot` read LOCAL shards only;
+        // the in-memory forwarding test does not exercise cross-shard list, and
+        // the forward-and-merge `list` ships with the `/cluster/ref-op` endpoint.
         let shards: Vec<ShardId> = match self.router.shards_for_prefix(prefix) {
             ShardSpan::One(s) => vec![s],
             ShardSpan::All => self.shards.keys().copied().collect(),
@@ -376,6 +498,98 @@ impl RefStore for ClusterRefStore {
             let _ = shard;
         }
         Arc::new(MapRefSnapshot { refs })
+    }
+}
+
+impl ClusterRefStore {
+    /// Apply an ALREADY shard-targeted op via the LOCAL shard handle (no
+    /// re-routing): the entry point for the in-memory forwarder and the
+    /// `/cluster/ref-op` HTTP handler. Errors if this node does not host
+    /// `shard` (the caller misdirected the op — spec §4.4).
+    pub async fn apply_local_op(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse> {
+        if !self.hosts_locally(shard) {
+            return Err(infra(format!(
+                "misdirected: shard {shard:?} not hosted here"
+            )));
+        }
+        match op {
+            ClusterOp::Update {
+                name,
+                target_bytes,
+                expected_bytes,
+            } => {
+                // Leader-assigned HLC on the HOST (not pre-assigned on the
+                // forwarding node — matches the local-path semantics).
+                let leader = self.leader_of(shard).await?;
+                let hlc = leader.hlc.tick();
+                let lop = LedgeOp::RefUpdate {
+                    name,
+                    target_bytes,
+                    expected_bytes,
+                    hlc,
+                };
+                match self.client_write_routed(shard, lop).await? {
+                    LedgeResp::RefUpdated(e) => Ok(RefOpResponse::Updated(e)),
+                    LedgeResp::Conflict(c) => Ok(RefOpResponse::Conflict(c)),
+                    LedgeResp::NotFound => Ok(RefOpResponse::NotFound),
+                    other => Err(infra(format!("unexpected resp for update: {other:?}"))),
+                }
+            }
+            ClusterOp::Delete {
+                name,
+                expected_bytes,
+            } => {
+                let leader = self.leader_of(shard).await?;
+                let hlc = leader.hlc.tick();
+                let lop = LedgeOp::RefDelete {
+                    name,
+                    expected_bytes,
+                    hlc,
+                };
+                match self.client_write_routed(shard, lop).await? {
+                    LedgeResp::Deleted => Ok(RefOpResponse::Deleted),
+                    LedgeResp::Conflict(c) => Ok(RefOpResponse::Conflict(c)),
+                    LedgeResp::NotFound => Ok(RefOpResponse::NotFound),
+                    other => Err(infra(format!("unexpected resp for delete: {other:?}"))),
+                }
+            }
+            ClusterOp::Get { name } => {
+                // Linearizable single-ref read on the host (mirror RefStore::get).
+                let entry = match self.mode {
+                    ConsistencyMode::Linearizable => {
+                        let leader = self.leader_of(shard).await?;
+                        leader
+                            .raft
+                            .ensure_linearizable()
+                            .await
+                            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                        leader.sm.applied_ref(&name).await
+                    }
+                    ConsistencyMode::Stale => self.local_handle(shard)?.sm.applied_ref(&name).await,
+                };
+                Ok(RefOpResponse::Entry(entry))
+            }
+            ClusterOp::List { prefix } => {
+                let refs = self.read_refs(shard, &prefix).await?;
+                Ok(RefOpResponse::Refs(
+                    refs.into_iter()
+                        .map(|(n, e)| (n.as_str().to_string(), e))
+                        .collect(),
+                ))
+            }
+        }
+    }
+}
+
+/// `Arc`-wrapped [`LocalApplier`] so a store can be handed to the in-memory
+/// forwarder registry / the HTTP handler as `Arc<dyn LocalApplier>`. The wrapped
+/// store applies ops directly to its local shard handles (it never forwards).
+pub struct StoreApplier(pub Arc<ClusterRefStore>);
+
+#[async_trait]
+impl LocalApplier for StoreApplier {
+    async fn apply_local(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse> {
+        self.0.apply_local_op(shard, op).await
     }
 }
 

@@ -302,6 +302,32 @@ impl MultiShardCluster {
         crate::ref_store::ClusterRefStore::new(node, self.router(), self.shard_handles())
     }
 
+    /// A `ClusterRefStore` for `node` whose LOCAL handle map contains ONLY the
+    /// shards `map` says `node` hosts (the rest are forwarded via `forwarder`).
+    /// For the in-memory forwarding test (spec §7): build the underlying Raft
+    /// groups for all shards on all nodes, but expose each node as hosting only
+    /// its mapped subset. Returned as `Arc` so it can also be registered as a
+    /// `LocalApplier` in the forwarder registry.
+    pub fn cluster_ref_store_hosting(
+        &self,
+        node: NodeId,
+        map: &crate::shard_map::ShardMap,
+        forwarder: std::sync::Arc<dyn crate::forward::RefOpForwarder>,
+    ) -> std::sync::Arc<crate::ref_store::ClusterRefStore> {
+        let hosted: BTreeMap<_, _> = self
+            .shard_handles()
+            .into_iter()
+            .filter(|(shard, _)| map.hosts(*shard, node))
+            .collect();
+        std::sync::Arc::new(crate::ref_store::ClusterRefStore::with_placement(
+            node,
+            self.router(),
+            hosted,
+            map.clone(),
+            forwarder,
+        ))
+    }
+
     /// A `ClusterLeaseStore` built on `node`'s view of the cluster.
     pub fn cluster_lease_store(&self, node: NodeId) -> crate::ref_store::ClusterLeaseStore {
         crate::ref_store::ClusterLeaseStore::new(node, self.router(), self.shard_handles())
