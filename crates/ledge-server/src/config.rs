@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use ledge_core::LedgeError;
+use ledge_cluster::{Replica, ShardId, ShardMap, ShardMapError};
 
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct LedgeConfig {
@@ -58,6 +59,13 @@ pub struct ClusterConfig {
     /// empty-Vec default footgun.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// The static shard map (spec §5): each shard's replica set, identical on
+    /// every node. `#[serde(default)]` so single-node configs omit it. When
+    /// non-empty this SUPERSEDES the flat `num_shards`/`peers` fields, which are
+    /// retained only for Phase 3 back-compat; `num_shards` is then derived from
+    /// the map (`shard_map().num_shards()`).
+    #[serde(default)]
+    pub shards: Vec<ShardSpec>,
     /// Local bind address this node serves its `/raft/*` endpoints on.
     pub raft_bind: String,
 }
@@ -67,6 +75,45 @@ pub struct ClusterConfig {
 pub struct PeerConfig {
     pub id: u64,
     pub addr: String,
+}
+
+/// One shard's declared replica set in the static shard map (spec §5).
+/// `#[serde(default)]` on `ClusterConfig.shards` lets a single-node config omit
+/// this entirely.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct ShardSpec {
+    /// Shard id (`0..num_shards`); used as the `ShardId` key.
+    pub id: u32,
+    /// Ordered replica members of this shard (order is preserved into the map,
+    /// so the first member is the deterministic no-preference forward target).
+    pub members: Vec<ReplicaSpec>,
+}
+
+/// One replica entry inside a `[[cluster.shards]]` block (spec §5).
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct ReplicaSpec {
+    /// Raft node id of the replica.
+    pub id: u64,
+    /// Base URL the replica serves `/raft/*` + `/cluster/*` on.
+    pub addr: String,
+}
+
+impl ClusterConfig {
+    /// Build the validated [`ShardMap`] from the declared `[[cluster.shards]]`.
+    /// An empty `shards` (single-node / no-cluster) yields an empty, valid map
+    /// (`num_shards() == 0`). Validation errors (empty shard, duplicate node)
+    /// surface as `ShardMapError`.
+    pub fn shard_map(&self) -> Result<ShardMap, ShardMapError> {
+        ShardMap::from_entries(self.shards.iter().map(|s| {
+            (
+                ShardId(s.id),
+                s.members
+                    .iter()
+                    .map(|m| Replica { node_id: m.id, addr: m.addr.clone() })
+                    .collect::<Vec<_>>(),
+            )
+        }))
+    }
 }
 
 impl LedgeConfig {
@@ -174,6 +221,61 @@ mod tests {
         assert_eq!(cfg.cluster.peers[0].id, 1);
         assert_eq!(cfg.cluster.peers[0].addr, "http://h1:4001");
         assert_eq!(cfg.cluster.peers[1].id, 3);
+    }
+
+    #[test]
+    fn cluster_shards_parse_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[cluster]\nenabled=true\nnode_id=3\nraft_bind=\"0.0.0.0:8403\"\n\
+             [[cluster.shards]]\nid=0\nmembers=[{{id=1,addr=\"http://n1:8401\"}},{{id=2,addr=\"http://n2:8402\"}},{{id=3,addr=\"http://n3:8403\"}}]\n\
+             [[cluster.shards]]\nid=1\nmembers=[{{id=3,addr=\"http://n3:8403\"}},{{id=4,addr=\"http://n4:8404\"}},{{id=5,addr=\"http://n5:8405\"}}]"
+        )
+        .unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.node_id, 3);
+        assert_eq!(cfg.cluster.shards.len(), 2);
+        assert_eq!(cfg.cluster.shards[0].id, 0);
+        assert_eq!(cfg.cluster.shards[0].members.len(), 3);
+        assert_eq!(cfg.cluster.shards[1].members[2].id, 5);
+        assert_eq!(cfg.cluster.shards[1].members[2].addr, "http://n5:8405");
+    }
+
+    #[test]
+    fn cluster_shards_convert_to_shard_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[cluster]\nenabled=true\nnode_id=3\nraft_bind=\"0.0.0.0:8403\"\n\
+             [[cluster.shards]]\nid=0\nmembers=[{{id=1,addr=\"http://n1:8401\"}},{{id=2,addr=\"http://n2:8402\"}},{{id=3,addr=\"http://n3:8403\"}}]\n\
+             [[cluster.shards]]\nid=1\nmembers=[{{id=3,addr=\"http://n3:8403\"}},{{id=4,addr=\"http://n4:8404\"}},{{id=5,addr=\"http://n5:8405\"}}]"
+        )
+        .unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        let map = cfg.cluster.shard_map().expect("valid shard map");
+        assert_eq!(map.num_shards(), 2);
+        // Placement matches spec §3.2: node 3 hosts both, node 1 only shard 0.
+        assert_eq!(
+            map.shards_hosted_by(3),
+            vec![ledge_cluster::ShardId(0), ledge_cluster::ShardId(1)]
+        );
+        assert_eq!(map.shards_hosted_by(1), vec![ledge_cluster::ShardId(0)]);
+        assert_eq!(map.replica_addr(ledge_cluster::ShardId(1), 4), Some("http://n4:8404"));
+    }
+
+    #[test]
+    fn empty_shards_still_parse_single_node() {
+        // No [[cluster.shards]] blocks (single-node / no-cluster) must parse to
+        // an empty Vec, and shard_map() yields an empty map (num_shards == 0).
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert!(cfg.cluster.shards.is_empty());
+        let map = cfg.cluster.shard_map().expect("empty map is valid");
+        assert_eq!(map.num_shards(), 0);
     }
 
     #[test]
