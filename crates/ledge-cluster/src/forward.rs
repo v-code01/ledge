@@ -19,6 +19,12 @@ use ledge_core::{RefEntry, Result};
 
 use crate::router::ShardId;
 
+/// Counter metric name (Prometheus): a shard-targeted ref op was FORWARDED over
+/// HTTP to a hosting member by [`HttpForwarder::forward`], labeled `shard`. The
+/// server crate re-declares the identical name in its `metrics` module so both
+/// crates agree on the series; it is incremented here at the true forward site.
+pub const REF_OP_FORWARDED_TOTAL: &str = "ledge_ref_op_forwarded_total";
+
 /// A shard-targeted ref op for forwarding. Object ids are raw 32-byte arrays for
 /// a serde-trivial, stable wire form (mirrors `LedgeOp`). No HLC field: the
 /// hosting node's leader assigns it.
@@ -168,6 +174,9 @@ impl RefOpForwarder for HttpForwarder {
         let target = self.map.pick_forward_target(shard, None).ok_or_else(|| {
             ledge_core::LedgeError::Unavailable(format!("no host for shard {shard:?}"))
         })?;
+        // Count the forward at the true forward site (one per outbound POST
+        // attempt, before transport). Labeled by shard for per-shard fan-out.
+        metrics::counter!(REF_OP_FORWARDED_TOTAL, "shard" => shard.0.to_string()).increment(1);
         let url = format!("{}/cluster/ref-op", target.addr.trim_end_matches('/'));
         // Wire body: bincode `(ShardId, ClusterOp)` (spec §4.4). bincode 2.x
         // serde API with the crate-standard config (matches `ledge-raft`).
@@ -203,7 +212,7 @@ mod tests {
 
     use ledge_core::{ObjectId, RefStore};
 
-    use crate::ref_store::StoreApplier;
+    use crate::ref_store::{ClusterRefStore, StoreApplier};
     use crate::router::ShardId;
     use crate::shard_map::{Replica, ShardMap};
     use crate::testkit::MultiShardCluster;
@@ -331,5 +340,95 @@ mod tests {
             .apply_local_op(ShardId(1), ClusterOp::Get { name: "x".into() })
             .await;
         assert!(matches!(err, Err(ledge_core::LedgeError::Unavailable(_))));
+    }
+
+    /// LIVE end-to-end over a REAL localhost socket: an Axum server exposes the
+    /// `/cluster/ref-op` handler logic (decode `(ShardId, ClusterOp)` → verify
+    /// host via the map → `apply_local_op` → bincode `RefOpResponse`) backed by an
+    /// actual single-member `ClusterRefStore`; the production [`HttpForwarder`]
+    /// POSTs an `Update` to it over the wire and decodes the applied result.
+    /// Mirrors `net_http`'s `single_rpc_against_served_endpoint` (real socket,
+    /// real reqwest POST) but for the ref-op forward path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_ref_op_forwarder_roundtrips_over_socket() {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+
+        // Bind first so the addr is known, then build a 1-member shard-0 map whose
+        // sole member's addr is this socket (the served node IS the host).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let map = ShardMap::from_entries([(
+            ShardId(0),
+            vec![Replica { node_id: 1, addr: base.clone() }],
+        )])
+        .unwrap();
+
+        // The served node's ClusterRefStore (hosts shard 0). start_placed
+        // initializes + awaits the leader; node 1 leads its single-member shard.
+        // It never forwards (it hosts the shard), so its forwarder is inert.
+        let cluster = MultiShardCluster::start_placed(&map).await;
+        let served =
+            cluster.cluster_ref_store_hosting(1, &map, Arc::new(InMemoryForwarder::new()));
+        let served_map = map.clone();
+
+        // Minimal /cluster/ref-op server: the real handler logic inlined (decode
+        // the forwarder's `(ShardId, ClusterOp)` tuple → host check → apply →
+        // encode `RefOpResponse`), mirroring the server crate's `cluster_ref_op`.
+        async fn route(
+            State((refs, map)): State<(Arc<ClusterRefStore>, ShardMap)>,
+            body: axum::body::Bytes,
+        ) -> std::result::Result<Vec<u8>, (StatusCode, String)> {
+            let cfg = bincode::config::standard();
+            let ((shard, op), _): ((ShardId, ClusterOp), usize) =
+                bincode::serde::decode_from_slice(&body, cfg)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            if !map.hosts(shard, refs.node_id()) {
+                return Err((StatusCode::MISDIRECTED_REQUEST, "wrong host".into()));
+            }
+            let resp = refs
+                .apply_local_op(shard, op)
+                .await
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+            bincode::serde::encode_to_vec(&resp, cfg)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+
+        let app = Router::new()
+            .route("/cluster/ref-op", post(route))
+            .with_state((served.clone(), served_map));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // The production HTTP forwarder, built over the SAME map (sole member is
+        // `base`). It POSTs `(ShardId, ClusterOp)` to `base/cluster/ref-op`.
+        let forwarder = HttpForwarder::new(map.clone(), reqwest::Client::new());
+        let op = ClusterOp::Update {
+            name: "refs/heads/forwarded".into(),
+            target_bytes: [0x5a; 32],
+            expected_bytes: None,
+        };
+        let resp = forwarder
+            .forward(ShardId(0), op)
+            .await
+            .expect("forward over HTTP");
+        match resp {
+            RefOpResponse::Updated(e) => assert_eq!(e.target, oid(0x5a)),
+            other => panic!("expected Updated, got {other:?}"),
+        }
+
+        // The served node actually applied it (read its SM through the cluster).
+        let name = ledge_core::RefName::new("refs/heads/forwarded").unwrap();
+        assert!(cluster.shard_sm_has_ref(ShardId(0), &name).await);
+
+        // A misdirected shard (shard 1 — not in this map) → the forwarder cannot
+        // pick a target and surfaces Unavailable (no host for the shard).
+        let miss = forwarder
+            .forward(ShardId(1), ClusterOp::Get { name: "x".into() })
+            .await;
+        assert!(matches!(miss, Err(ledge_core::LedgeError::Unavailable(_))));
+
+        server.abort();
     }
 }

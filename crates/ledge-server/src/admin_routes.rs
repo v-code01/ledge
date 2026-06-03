@@ -159,6 +159,8 @@ mod route_tests {
             default_ttl_secs: 3600,
             data_dir: p,
             raft_shards: None,
+            cluster_refs: None,
+            shard_map: None,
         }
     }
 

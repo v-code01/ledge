@@ -270,6 +270,12 @@ impl ClusterRefStore {
         &self.map
     }
 
+    /// This node's id. Needed by the `/cluster/ref-op` handler to ask the shard
+    /// map "do I (this node) host the target shard?" before applying locally.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
     /// The router this store partitions through (for tests / introspection).
     pub fn router(&self) -> &ShardRouter {
         &self.router

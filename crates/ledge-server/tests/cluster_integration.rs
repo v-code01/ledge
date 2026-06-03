@@ -68,6 +68,8 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
         default_ttl_secs: 3600,
         data_dir: p,
         raft_shards,
+        cluster_refs: None,
+        shard_map: None,
     }
 }
 
@@ -253,4 +255,184 @@ async fn raft_append_endpoint_feeds_local_raft() {
     );
 
     raft.shutdown().await.ok();
+}
+
+// ── `/cluster/ref-op` end-to-end through the real server handler ──────────────
+
+use ledge_cluster::{ClusterOp, ClusterRefStore, RefOpResponse, Replica, ShardMap};
+
+/// Build a cluster-mode `AppState` over a started in-process cluster: wires the
+/// per-shard Raft handles, the concrete `ClusterRefStore` (for `apply_local_op`),
+/// and the shard map (placement). Node `node`'s store hosts only the shards the
+/// map assigns it; remote shards are 421'd by the handler (it never forwards a
+/// shard-targeted op that landed on the wrong host).
+fn cluster_state(
+    dir: &TempDir,
+    cluster: &MultiShardCluster,
+    node: NodeId,
+    map: &ShardMap,
+) -> AppState {
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(HLC::new());
+    let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
+    let refs_disk = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    let (workspaces, leases, gc) =
+        build_workspace_stack(p.clone(), objects.clone(), refs_disk.clone(), hlc).unwrap();
+    // The node's clustered ref store (hosts only its mapped shards); the handler
+    // never forwards, so an inert in-memory forwarder is fine.
+    let cluster_refs: Arc<ClusterRefStore> = cluster.cluster_ref_store_hosting(
+        node,
+        map,
+        Arc::new(ledge_cluster::InMemoryForwarder::new()),
+    );
+    // Only the shards `node` actually hosts (node 1 hosts shard 0, not shard 1).
+    let mut hosted: ClusterHandles = BTreeMap::new();
+    for s in 0..cluster.num_shards {
+        let shard = ShardId(s);
+        if let Some(rep) = cluster.replicas_of(shard).iter().find(|r| r.node == node) {
+            hosted.insert(shard, rep.raft.clone());
+        }
+    }
+    let handles = Arc::new(hosted);
+    AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: cluster_refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards: Some(handles),
+        cluster_refs: Some(cluster_refs),
+        shard_map: Some(map.clone()),
+    }
+}
+
+/// The 2-shard distinct-subset map used by the ref-op tests: shard0={1}, so node
+/// 1 hosts shard 0 only; shard1={2,3} (node 1 does NOT host it → 421).
+fn two_shard_map() -> ShardMap {
+    ShardMap::from_entries([
+        (
+            ShardId(0),
+            vec![Replica {
+                node_id: 1,
+                addr: "inproc-1".into(),
+            }],
+        ),
+        (
+            ShardId(1),
+            vec![
+                Replica {
+                    node_id: 2,
+                    addr: "http://n2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "http://n3".into(),
+                },
+            ],
+        ),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cluster_ref_op_applies_to_hosted_shard() {
+    let map = two_shard_map();
+    let cluster = MultiShardCluster::start_placed(&map).await;
+    let dir = TempDir::new().unwrap();
+    let app = build_app(cluster_state(&dir, &cluster, 1, &map));
+
+    // A ref-op targeted at shard 0 (which node 1 hosts) applies and returns the
+    // bincode `RefOpResponse::Updated`. Wire body = forwarder's `(ShardId, op)`.
+    let cfg = bincode::config::standard();
+    let op = ClusterOp::Update {
+        name: "refs/heads/applied".into(),
+        target_bytes: [0x42; 32],
+        expected_bytes: None,
+    };
+    let body = bincode::serde::encode_to_vec((ShardId(0), &op), cfg).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/ref-op")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let (decoded, _): (RefOpResponse, usize) =
+        bincode::serde::decode_from_slice(&out, cfg).unwrap();
+    match decoded {
+        RefOpResponse::Updated(e) => {
+            assert_eq!(e.target, ledge_core::ObjectId::from_bytes([0x42; 32]));
+        }
+        other => panic!("expected Updated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cluster_ref_op_misdirected_returns_421_with_members() {
+    let map = two_shard_map();
+    let cluster = MultiShardCluster::start_placed(&map).await;
+    let dir = TempDir::new().unwrap();
+    // Node 1 does NOT host shard 1 → a shard-1 op must 421 with shard 1's members.
+    let app = build_app(cluster_state(&dir, &cluster, 1, &map));
+
+    let cfg = bincode::config::standard();
+    let op = ClusterOp::Get {
+        name: "refs/heads/elsewhere".into(),
+    };
+    let body = bincode::serde::encode_to_vec((ShardId(1), &op), cfg).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/ref-op")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::MISDIRECTED_REQUEST,
+        "a shard this node does not host must 421"
+    );
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let (members, _): (Vec<(u64, String)>, usize) =
+        bincode::serde::decode_from_slice(&out, cfg).unwrap();
+    // The 421 body carries shard 1's declared hosting members so the caller can
+    // retry against a real host.
+    assert_eq!(
+        members,
+        vec![
+            (2u64, "http://n2".to_string()),
+            (3u64, "http://n3".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cluster_ref_op_503_when_single_node() {
+    // Single-node AppState (no cluster_refs/shard_map) → the route is inert (503).
+    let dir = TempDir::new().unwrap();
+    let app = build_app(state_with_shards(&dir, None));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/ref-op")
+                .body(Body::from(vec![0u8; 4]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

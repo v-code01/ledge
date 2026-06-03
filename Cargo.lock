@@ -1532,6 +1532,7 @@ dependencies = [
  "ledge-raft",
  "ledge-ref-store",
  "ledge-workspace",
+ "metrics",
  "openraft",
  "reqwest",
  "serde",

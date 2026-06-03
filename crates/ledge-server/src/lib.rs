@@ -70,12 +70,19 @@ pub fn build_workspace_stack_dyn(
 pub struct ClusterStack {
     /// `Arc<ClusterRefStore>` up-cast — `AppState.refs`.
     pub refs: Arc<dyn RefStore>,
+    /// The SAME `ClusterRefStore` as a concrete `Arc`, for `AppState.cluster_refs`
+    /// — the `/cluster/ref-op` handler needs `apply_local_op`, which is not on the
+    /// `dyn RefStore` seam. One store, two views (no duplicate state machine).
+    pub cluster_refs: Arc<ClusterRefStore>,
     /// `Arc<ReplicatedObjectStore>` up-cast — `AppState.objects`.
     pub objects: Arc<dyn ObjectStore>,
     /// Node-local concrete disk store — `AppState.objects_disk` (git/RPC/GC).
     pub objects_disk: Arc<DiskObjectStore>,
     /// Per-shard Raft handles for this node — `AppState.raft_shards`.
     pub shards: Arc<ClusterHandles>,
+    /// The authoritative shard map — `AppState.shard_map` (placement for
+    /// `/cluster/status` + the `/cluster/ref-op` misdirect body).
+    pub map: ShardMap,
 }
 
 /// Assemble the clustered storage stack: one Raft group per shard THIS node
@@ -171,6 +178,14 @@ pub async fn build_cluster_stack(
         forwarder,
     ));
 
+    // Placement gauge: emit `ledge_shard_hosted{shard}=1` for each shard this
+    // node hosts, `=0` for the rest, so a scrape shows the full placement vector
+    // for this node (not just the ones it serves). Cluster-only; single-node
+    // never reaches here so the series is absent in single-node `/metrics`.
+    for s in 0..map.num_shards() {
+        crate::metrics::set_shard_hosted(s, map.hosts(ShardId(s), node_id));
+    }
+
     // Object peers = union of the OTHER replicas of the shards THIS node hosts,
     // deduped by addr (spec §3.5): a node replicates a shard's objects to that
     // shard's co-replicas; a node hosting multiple shards unions their peers.
@@ -197,10 +212,12 @@ pub async fn build_cluster_stack(
     let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), object_peers));
 
     Ok(ClusterStack {
-        refs: cluster_refs as Arc<dyn RefStore>,
+        refs: cluster_refs.clone() as Arc<dyn RefStore>,
+        cluster_refs,
         objects: replicated as Arc<dyn ObjectStore>,
         objects_disk,
         shards: Arc::new(raft_handles),
+        map,
     })
 }
 
@@ -246,6 +263,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/cluster/status",
             axum::routing::get(cluster_routes::cluster_status),
+        )
+        .route(
+            "/cluster/ref-op",
+            axum::routing::post(cluster_routes::cluster_ref_op),
         )
         // ── Object replication (spec §2.5) — content-addressed peer endpoints.
         // Active in both modes: in single-node they harmlessly serve the local

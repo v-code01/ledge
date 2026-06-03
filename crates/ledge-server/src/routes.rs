@@ -51,6 +51,18 @@ pub struct AppState {
     /// the `/raft/*` and `/cluster/*` handlers; single-node leaves it `None` so
     /// those handlers report not-clustered (503) and nothing else is affected.
     pub raft_shards: Option<Arc<ClusterHandles>>,
+    /// The concrete clustered ref store, when `cluster.enabled`. Used ONLY by the
+    /// `POST /cluster/ref-op` handler to apply a shard-targeted op to a LOCAL
+    /// shard handle (the `dyn RefStore` seam in [`refs`](Self::refs) is too narrow
+    /// for that — it re-routes by name). `None` single-node ⇒ the handler 503s,
+    /// consistent with the other cluster routes. It is the SAME `Arc` underlying
+    /// `refs` in cluster mode (one store, two views).
+    pub cluster_refs: Option<Arc<ledge_cluster::ClusterRefStore>>,
+    /// The authoritative shard map, when `cluster.enabled`. Lets `/cluster/ref-op`
+    /// answer "you misrouted — shard S lives on these members" and lets
+    /// `/cluster/status` report declared placement (members) for EVERY shard, not
+    /// just the locally-hosted ones. `None` single-node.
+    pub shard_map: Option<ledge_cluster::ShardMap>,
 }
 
 #[derive(Deserialize)]

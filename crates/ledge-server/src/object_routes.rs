@@ -125,6 +125,8 @@ mod tests {
             default_ttl_secs: 3600,
             data_dir,
             raft_shards: None,
+            cluster_refs: None,
+            shard_map: None,
         };
         (state, dir, objects)
     }

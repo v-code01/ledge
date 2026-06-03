@@ -39,6 +39,18 @@ pub const RAFT_LAST_APPLIED: &str = "ledge_raft_last_applied";
 pub const RAFT_COMMIT_INDEX: &str = "ledge_raft_commit_index";
 pub const RAFT_ELECTIONS_TOTAL: &str = "ledge_raft_elections_total";
 
+// ── Per-shard placement metrics (Phase 4a §5). `ledge_shard_hosted` is set once
+//    per shard at `build_cluster_stack` time; the applied/forwarded counters are
+//    bumped on the `/cluster/ref-op` apply path and the forwarder's POST path
+//    respectively. Single-node never emits any of these series. ────────────────
+pub const SHARD_HOSTED: &str = "ledge_shard_hosted";
+pub const REF_OP_APPLIED_TOTAL: &str = "ledge_ref_op_applied_total";
+/// Name of the forward counter. Defined here for documentation/parity; the
+/// counter is INCREMENTED in `ledge-cluster`'s `HttpForwarder::forward` at the
+/// true forward site (see [`ledge_cluster::forward::REF_OP_FORWARDED_TOTAL`]),
+/// which uses this identical name so both crates agree on the series.
+pub const REF_OP_FORWARDED_TOTAL: &str = "ledge_ref_op_forwarded_total";
+
 pub fn install_recorder() -> ledge_core::Result<()> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
@@ -126,6 +138,18 @@ pub fn record_raft_metrics(
     metrics::gauge!(RAFT_ELECTIONS_TOTAL, "shard" => shard_label).set(current_term as f64);
 }
 
+/// Gauge: `1` if this node hosts `shard`, else `0`. Set once at host-build time
+/// in `build_cluster_stack` (cluster only); single-node never emits this series.
+pub fn set_shard_hosted(shard: u32, hosted: bool) {
+    metrics::gauge!(SHARD_HOSTED, "shard" => shard.to_string())
+        .set(if hosted { 1.0 } else { 0.0 });
+}
+
+/// Counter: a shard-targeted ref op was APPLIED locally via `/cluster/ref-op`.
+pub fn record_ref_op_applied(shard: u32) {
+    metrics::counter!(REF_OP_APPLIED_TOTAL, "shard" => shard.to_string()).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +166,21 @@ mod tests {
         // Safe to call without a recorder installed (mirrors the other helpers).
         record_raft_metrics(0, Some(1), 3, Some(7), Some(7));
         record_raft_metrics(1, None, 0, None, None);
+    }
+
+    #[test]
+    fn shard_placement_metric_constants_correct() {
+        assert_eq!(SHARD_HOSTED, "ledge_shard_hosted");
+        assert_eq!(REF_OP_APPLIED_TOTAL, "ledge_ref_op_applied_total");
+        assert_eq!(REF_OP_FORWARDED_TOTAL, "ledge_ref_op_forwarded_total");
+    }
+
+    #[test]
+    fn shard_placement_metric_helpers_no_panic() {
+        // Safe to call without a recorder installed (mirrors the other helpers).
+        set_shard_hosted(0, true);
+        set_shard_hosted(1, false);
+        record_ref_op_applied(0);
     }
 
     #[test]
