@@ -22,7 +22,9 @@ use ledge_workspace::{Gc, LeaseStore, WorkspaceManager};
 use std::collections::{BTreeMap, HashMap};
 use ledge_cluster::net_http::{HttpObjectPeer, HttpRaftNetworkFactory};
 use ledge_cluster::ref_store::ShardHandle;
-use ledge_cluster::{ClusterRefStore, ReplicatedObjectStore, ShardId, ShardRouter};
+use ledge_cluster::{
+    ClusterRefStore, HttpForwarder, ReplicatedObjectStore, ShardId, ShardMap, ShardRouter,
+};
 use ledge_raft::{StateMachineStore, TypeConfig, WalLogStore};
 use routes::ClusterHandles;
 
@@ -76,10 +78,10 @@ pub struct ClusterStack {
     pub shards: Arc<ClusterHandles>,
 }
 
-/// Assemble the clustered storage stack: one Raft group per shard over a
-/// disk-backed [`WalLogStore`], wired to a [`ClusterRefStore`] (`dyn RefStore`
-/// seam) and a [`ReplicatedObjectStore`] (`dyn ObjectStore` seam) atop the
-/// node-local [`DiskObjectStore`].
+/// Assemble the clustered storage stack: one Raft group per shard THIS node
+/// hosts over a disk-backed [`WalLogStore`], wired to a [`ClusterRefStore`]
+/// (`dyn RefStore` seam) and a [`ReplicatedObjectStore`] (`dyn ObjectStore`
+/// seam) atop the node-local [`DiskObjectStore`].
 ///
 /// This runs ONLY when `cluster.enabled` (gated in `main.rs`); the single-node
 /// path is byte-identical to Phase 1/2 and never touches this. The per-shard
@@ -87,32 +89,41 @@ pub struct ClusterStack {
 /// inbound RPCs into the local node and the metrics poller can read each shard's
 /// `Raft::metrics()`.
 ///
-/// # Phase 3 scope notes
+/// # Placement (Phase 4a §3)
+/// The cluster's [`ShardMap`] is the authoritative, per-node-identical
+/// shard→replica-set placement. This node builds a Raft group ONLY for the
+/// shards [`ShardMap::shards_hosted_by`] reports it is a member of; each such
+/// shard's [`HttpRaftNetworkFactory`] is keyed on ONLY that shard's members
+/// ([`ShardMap::member_map`]), so a shard's RPCs only ever reach its own member
+/// subset. A ref whose target shard this node does NOT host is forwarded to a
+/// hosting member by the [`HttpForwarder`] inside [`ClusterRefStore`].
+///
+/// # Scope notes
 /// - The state machine is built with [`StateMachineStore::open`]: applied
 ///   ref/lease state, the last-applied log id + membership, and the current
 ///   snapshot all persist under `shard-{s}/sm`, so a node survives restart even
 ///   after openraft purges the snapshotted log prefix. The Raft **log** IS also
 ///   disk-durable via `WalLogStore`.
-/// - `ReplicatedObjectStore` is constructed with **no peers** here (a node knows
-///   its own local store; cross-node object peering is wired with the same HTTP
-///   transport as the ref Raft in a follow-up). The git/object wire path is
-///   node-local in Phase 3 (see [`AppState`]).
-#[allow(clippy::too_many_arguments)]
+/// - `ReplicatedObjectStore` peers are the union of the OTHER replicas of the
+///   shards this node hosts, deduped by addr: a node replicates a shard's
+///   objects to that shard's co-replicas, and a node hosting multiple shards
+///   unions their peer sets.
 pub async fn build_cluster_stack(
     data_dir: std::path::PathBuf,
     objects_disk: Arc<DiskObjectStore>,
     hlc: Arc<HLC>,
     node_id: u64,
-    num_shards: u32,
-    peers: HashMap<u64, String>,
+    map: ShardMap,
     raft_config: Arc<openraft::Config>,
 ) -> ledge_core::Result<ClusterStack> {
-    let router = ShardRouter::new(num_shards);
+    // Router's shard count comes from the map so routing & placement agree.
+    let router = ShardRouter::new(map.num_shards());
     let mut shard_handles: BTreeMap<ShardId, Vec<ShardHandle>> = BTreeMap::new();
     let mut raft_handles: ClusterHandles = BTreeMap::new();
 
-    for s in 0..num_shards {
-        let shard = ShardId(s);
+    // Build a Raft group ONLY for the shards this node is a member of.
+    for shard in map.shards_hosted_by(node_id) {
+        let s = shard.0;
         let shard_dir = data_dir.join(format!("shard-{s}"));
         let log = WalLogStore::open(shard_dir.join("raft-log"))
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -124,13 +135,16 @@ pub async fn build_cluster_stack(
         // Capture the read handle BEFORE the SM moves into Raft::new (the SM is
         // not Clone; the handle shares its ArcSwap'd applied state).
         let read = sm.read_handle();
-        let net = HttpRaftNetworkFactory::new(shard, peers.clone());
+        // Per-shard network knows ONLY this shard's members (spec §3.3): id→addr
+        // from the map. member_map → BTreeMap; the factory wants a HashMap.
+        let peers: HashMap<u64, String> = map.member_map(shard).into_iter().collect();
+        let net = HttpRaftNetworkFactory::new(shard, peers);
         let raft = openraft::Raft::<TypeConfig>::new(node_id, raft_config.clone(), net, log, sm)
             .await
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Each node holds only its OWN replica handle here (production shape):
-        // peers are reached by the HTTP Raft network, not an in-process registry.
+        // This node holds only its OWN replica handle (production shape): peers
+        // are reached by the HTTP Raft network, not an in-process registry.
         shard_handles.insert(
             shard,
             vec![ShardHandle {
@@ -144,31 +158,42 @@ pub async fn build_cluster_stack(
         raft_handles.insert(shard, raft);
     }
 
-    let cluster_refs = Arc::new(ClusterRefStore::new(node_id, router, shard_handles));
-    // Within-shard content-addressed quorum replication (spec §2.5): every OTHER
-    // node in the cluster is a replica of this shard's objects, reached over the
-    // same HTTP base URL it serves `/raft/*` on (the `/objects/*` routes are
-    // mounted on the same router). One `HttpObjectPeer` per peer (excluding
-    // self). A `write` returns once a quorum (`n/2+1` of local + peers) is
-    // durable; missing replicas self-repair via anti-entropy on read.
-    //
-    // Phase 3 replica-set model: one replica set per shard spanning all nodes.
-    // `ShardId(0)` is used as the peer's shard segment — it is accepted for
-    // routing symmetry and the node-local store holds whatever shards it hosts;
-    // the content address is shard-independent, so the segment does not affect
-    // correctness here.
+    // The ref store gets the map + an HTTP forwarder so a ref routed to a shard
+    // this node does NOT host is forwarded to a hosting member (spec §3.4/§4.3).
+    let forward_client = reqwest::Client::new();
+    let forwarder: Arc<dyn ledge_cluster::RefOpForwarder> =
+        Arc::new(HttpForwarder::new(map.clone(), forward_client));
+    let cluster_refs = Arc::new(ClusterRefStore::with_placement(
+        node_id,
+        router,
+        shard_handles,
+        map.clone(),
+        forwarder,
+    ));
+
+    // Object peers = union of the OTHER replicas of the shards THIS node hosts,
+    // deduped by addr (spec §3.5): a node replicates a shard's objects to that
+    // shard's co-replicas; a node hosting multiple shards unions their peers.
+    // The `shard` segment passed to each `HttpObjectPeer` is the shard under
+    // which we first met that addr — content addressing makes the segment
+    // non-load-bearing for correctness, so deduping across shards is safe.
     let object_client = reqwest::Client::new();
-    let object_peers: Vec<Arc<dyn ledge_cluster::ObjectPeer>> = peers
-        .iter()
-        .filter(|(id, _)| **id != node_id)
-        .map(|(_, addr)| {
-            Arc::new(HttpObjectPeer::with_client(
-                addr.clone(),
-                ShardId(0),
-                object_client.clone(),
-            )) as Arc<dyn ledge_cluster::ObjectPeer>
-        })
-        .collect();
+    let mut seen_addrs: std::collections::HashSet<String> = Default::default();
+    let mut object_peers: Vec<Arc<dyn ledge_cluster::ObjectPeer>> = Vec::new();
+    for shard in map.shards_hosted_by(node_id) {
+        for rep in map.members(shard) {
+            if rep.node_id == node_id {
+                continue; // skip self
+            }
+            if seen_addrs.insert(rep.addr.clone()) {
+                object_peers.push(Arc::new(HttpObjectPeer::with_client(
+                    rep.addr.clone(),
+                    shard,
+                    object_client.clone(),
+                )) as Arc<dyn ledge_cluster::ObjectPeer>);
+            }
+        }
+    }
     let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), object_peers));
 
     Ok(ClusterStack {
@@ -263,4 +288,75 @@ pub fn build_app(state: AppState) -> Router {
                     Duration::from_secs(60),
                 )),
         )
+}
+
+#[cfg(test)]
+mod build_cluster_stack_tests {
+    use super::*;
+    use ledge_cluster::{Replica, ShardMap};
+
+    fn raft_cfg() -> Arc<openraft::Config> {
+        Arc::new(
+            openraft::Config {
+                heartbeat_interval: 250,
+                election_timeout_min: 1000,
+                election_timeout_max: 2000,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn builds_only_locally_hosted_shards() {
+        // shard0={1,2,3}, shard1={2,3,4}. Build the stack AS NODE 1.
+        let map = ShardMap::from_entries([
+            (
+                ShardId(0),
+                vec![
+                    Replica { node_id: 1, addr: "http://n1".into() },
+                    Replica { node_id: 2, addr: "http://n2".into() },
+                    Replica { node_id: 3, addr: "http://n3".into() },
+                ],
+            ),
+            (
+                ShardId(1),
+                vec![
+                    Replica { node_id: 2, addr: "http://n2".into() },
+                    Replica { node_id: 3, addr: "http://n3".into() },
+                    Replica { node_id: 4, addr: "http://n4".into() },
+                ],
+            ),
+        ])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Arc::new(DiskObjectStore::new(dir.path().to_path_buf()).unwrap());
+        let hlc = Arc::new(HLC::new());
+
+        let stack = build_cluster_stack(
+            dir.path().to_path_buf(),
+            objects,
+            hlc,
+            1, // node_id = 1 → hosts shard0 ONLY
+            map,
+            raft_cfg(),
+        )
+        .await
+        .unwrap();
+
+        // Node 1 built exactly shard 0's Raft group, and NOT shard 1's.
+        assert!(stack.shards.contains_key(&ShardId(0)), "node 1 hosts shard 0");
+        assert!(
+            !stack.shards.contains_key(&ShardId(1)),
+            "node 1 must NOT host shard 1"
+        );
+        assert_eq!(stack.shards.len(), 1);
+
+        // Tear down the one Raft we started (no init → no leader; just shut it).
+        for raft in stack.shards.values() {
+            raft.shutdown().await.ok();
+        }
+    }
 }

@@ -248,6 +248,115 @@ impl MultiShardCluster {
         cluster
     }
 
+    /// Build, initialize, and elect leaders for a cluster whose shards live on
+    /// DISTINCT node subsets, per `map`. Mirrors `build_cluster_stack`'s
+    /// placement decision over the in-memory transport: a (shard, node) Raft
+    /// group is built IFF `map.hosts(shard, node)`, and each shard's membership
+    /// is exactly `map.members(shard)` — so a node hosts only its assigned
+    /// shards and each shard elects among only its own members.
+    pub async fn start_placed(map: &crate::shard_map::ShardMap) -> Self {
+        let registry = Registry::new();
+        // The union of all node ids appearing in any shard (for `node_ids`).
+        let mut all_nodes: std::collections::BTreeSet<NodeId> = Default::default();
+        let mut replicas: BTreeMap<ShardId, Vec<ShardReplica>> = BTreeMap::new();
+        // Per-shard membership (id→Node) for initialize: the shard's OWN members.
+        let mut per_shard_members: BTreeMap<ShardId, BTreeMap<NodeId, Node>> = BTreeMap::new();
+
+        for s in 0..map.num_shards() {
+            let shard = ShardId(s);
+            let members = map.members(shard);
+            // One HLC per shard, shared by that shard's replicas in-process.
+            let hlc = Arc::new(ledge_core::HLC::new());
+            let mut shard_replicas = Vec::with_capacity(members.len());
+            let mut members_map: BTreeMap<NodeId, Node> = BTreeMap::new();
+            for rep in members {
+                let id = rep.node_id;
+                all_nodes.insert(id);
+                members_map.insert(id, Node::new(rep.addr.clone()));
+                let log = LogStore::default();
+                let sm = StateMachineStore::new_temp().await;
+                let read = sm.read_handle();
+                // The in-mem network is keyed on (shard, node); registering only
+                // this shard's members means a shard's RPCs only ever reach its
+                // own members — the same isolation `member_map(shard)` gives the
+                // HTTP factory in build_cluster_stack.
+                let net = MemNetworkFactory::new(shard, registry.clone());
+                let raft = openraft::Raft::new(id, test_config(None), net, log, sm)
+                    .await
+                    .expect("Raft::new");
+                registry.register(shard, id, raft.clone());
+                shard_replicas.push(ShardReplica {
+                    shard,
+                    node: id,
+                    raft,
+                    sm: read,
+                    hlc: hlc.clone(),
+                });
+            }
+            per_shard_members.insert(shard, members_map);
+            replicas.insert(shard, shard_replicas);
+        }
+
+        // `members` (the struct field) is unused by the placed path's election
+        // (each shard initializes with its OWN member set), but keep the field
+        // populated as the union for any introspection callers.
+        let members_union: BTreeMap<NodeId, Node> = all_nodes
+            .iter()
+            .map(|&id| (id, Node::new("inproc")))
+            .collect();
+
+        let cluster = Self {
+            num_shards: map.num_shards(),
+            node_ids: all_nodes.into_iter().collect(),
+            registry,
+            members: members_union,
+            replicas,
+        };
+
+        // Initialize EACH shard with ITS OWN member set on the shard's first
+        // member (NOT the global node 0, which may not host the shard).
+        for s in 0..cluster.num_shards {
+            let shard = ShardId(s);
+            let members = per_shard_members.get(&shard).unwrap().clone();
+            let seed = *members.keys().next().expect("shard has >=1 member");
+            let seed_raft = cluster
+                .replicas
+                .get(&shard)
+                .unwrap()
+                .iter()
+                .find(|r| r.node == seed)
+                .unwrap()
+                .raft
+                .clone();
+            seed_raft
+                .initialize(members)
+                .await
+                .expect("initialize shard membership");
+        }
+        for s in 0..cluster.num_shards {
+            cluster.wait_for_leader(ShardId(s)).await;
+        }
+        cluster
+    }
+
+    /// Does this cluster host a replica of `shard` on `node`? (Placement probe.)
+    pub fn hosts(&self, shard: ShardId, node: NodeId) -> bool {
+        self.replicas
+            .get(&shard)
+            .is_some_and(|reps| reps.iter().any(|r| r.node == node))
+    }
+
+    /// Sorted node ids that are members of `shard`.
+    pub fn member_ids(&self, shard: ShardId) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .replicas
+            .get(&shard)
+            .map(|reps| reps.iter().map(|r| r.node).collect())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Poll until `shard` has a node confirming `ServerState::Leader`.
     pub async fn wait_for_leader(&self, shard: ShardId) -> NodeId {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -484,5 +593,61 @@ impl MultiShardCluster {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("shard {shard:?}: ref {} not replicated to all replicas", name.as_str());
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::router::ShardId;
+    use crate::shard_map::{Replica, ShardMap};
+
+    /// 4 nodes, 2 shards on DISTINCT subsets:
+    ///   shard 0 = {1,2,3}, shard 1 = {2,3,4}.
+    /// node 1 hosts ONLY shard 0; node 4 hosts ONLY shard 1; nodes 2,3 host both.
+    fn distinct_subset_map() -> ShardMap {
+        ShardMap::from_entries([
+            (
+                ShardId(0),
+                vec![
+                    Replica { node_id: 1, addr: "inproc-1".into() },
+                    Replica { node_id: 2, addr: "inproc-2".into() },
+                    Replica { node_id: 3, addr: "inproc-3".into() },
+                ],
+            ),
+            (
+                ShardId(1),
+                vec![
+                    Replica { node_id: 2, addr: "inproc-2".into() },
+                    Replica { node_id: 3, addr: "inproc-3".into() },
+                    Replica { node_id: 4, addr: "inproc-4".into() },
+                ],
+            ),
+        ])
+        .expect("valid distinct-subset map")
+    }
+
+    #[tokio::test]
+    async fn placement_hosts_only_assigned_shards_and_each_shard_elects() {
+        let map = distinct_subset_map();
+        let cluster = MultiShardCluster::start_placed(&map).await;
+
+        // Hosting: node 1 builds shard 0 only; node 4 builds shard 1 only;
+        // node 2 builds both. (start_placed records (shard,node) hosting.)
+        assert!(cluster.hosts(ShardId(0), 1));
+        assert!(!cluster.hosts(ShardId(1), 1), "node 1 must NOT build shard 1");
+        assert!(cluster.hosts(ShardId(1), 4));
+        assert!(!cluster.hosts(ShardId(0), 4), "node 4 must NOT build shard 0");
+        assert!(cluster.hosts(ShardId(0), 2) && cluster.hosts(ShardId(1), 2));
+
+        // Each shard built a Raft group spanning exactly its members.
+        assert_eq!(cluster.member_ids(ShardId(0)), vec![1, 2, 3]);
+        assert_eq!(cluster.member_ids(ShardId(1)), vec![2, 3, 4]);
+
+        // Each shard elects a leader AMONG ITS OWN MEMBERS (not a foreign node).
+        let l0 = cluster.wait_for_leader(ShardId(0)).await;
+        let l1 = cluster.wait_for_leader(ShardId(1)).await;
+        assert!([1, 2, 3].contains(&l0), "shard0 leader {l0} must be a shard0 member");
+        assert!([2, 3, 4].contains(&l1), "shard1 leader {l1} must be a shard1 member");
     }
 }

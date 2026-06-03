@@ -67,12 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // ReplicatedObjectStore over per-shard Raft, plus the per-shard handles for
     // the /raft + /cluster routes and the metrics poller.
     let (objects_dyn, refs_dyn, raft_shards): StorageSeams = if cfg.cluster.enabled {
-        let peers: std::collections::HashMap<u64, String> = cfg
+        // Build the authoritative shard map from config (identical on every
+        // node). This SUPERSEDES the flat num_shards/peers fields; routing,
+        // per-shard Raft membership, and ref-op forwarding all derive from it.
+        let map = cfg
             .cluster
-            .peers
-            .iter()
-            .map(|p| (p.id, p.addr.clone()))
-            .collect();
+            .shard_map()
+            .map_err(|e| anyhow::anyhow!("invalid [[cluster.shards]] map: {e}"))?;
         // openraft timer config: production-leaning defaults; election window
         // comfortably above the heartbeat so a stable leader holds the lease.
         let raft_config = Arc::new(
@@ -87,17 +88,16 @@ async fn main() -> anyhow::Result<()> {
         );
         info!(
             node_id = cfg.cluster.node_id,
-            num_shards = cfg.cluster.num_shards,
-            peers = peers.len(),
-            "cluster mode enabled: assembling per-shard Raft groups"
+            num_shards = map.num_shards(),
+            hosted = map.shards_hosted_by(cfg.cluster.node_id).len(),
+            "cluster mode enabled: assembling per-shard Raft groups for hosted shards"
         );
         let stack = ledge_server::build_cluster_stack(
             data_dir.clone(),
             objects.clone(),
             hlc.clone(),
             cfg.cluster.node_id,
-            cfg.cluster.num_shards,
-            peers,
+            map,
             raft_config,
         )
         .await?;
