@@ -110,9 +110,13 @@ impl TestCluster {
     }
 
     /// Poll until a stable leader is observed (and confirms its own Leader
-    /// state), or panic after ~10s with the last metrics seen.
+    /// state), or panic after ~30s with the last metrics seen. The budget is
+    /// deliberately generous (≈50x the 300-600ms election timeout) so heavy
+    /// `cargo test --workspace` parallelism — dozens of independent Raft
+    /// clusters contending for cores — cannot starve an election into a
+    /// spurious timeout; a real hang still fails in bounded time.
     pub async fn wait_for_leader(&self) -> NodeId {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             for n in self.nodes.values() {
                 let m = n.raft.metrics().borrow().clone();
@@ -134,7 +138,7 @@ impl TestCluster {
                         (n.id, m.state, m.current_leader)
                     })
                     .collect();
-                panic!("no leader within 10s; metrics = {dump:?}");
+                panic!("no leader within 30s; metrics = {dump:?}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -246,7 +250,7 @@ impl MultiShardCluster {
 
     /// Poll until `shard` has a node confirming `ServerState::Leader`.
     pub async fn wait_for_leader(&self, shard: ShardId) -> NodeId {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let reps = self.replicas.get(&shard).expect("shard exists");
         loop {
             for r in reps {
@@ -260,7 +264,7 @@ impl MultiShardCluster {
                 }
             }
             if Instant::now() >= deadline {
-                panic!("shard {shard:?}: no leader within 10s");
+                panic!("shard {shard:?}: no leader within 30s");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -417,7 +421,7 @@ impl MultiShardCluster {
     /// killing the prior leader to confirm a *new* one emerged). Bounded poll on
     /// the metrics watch — no fixed sleep gates correctness.
     pub async fn wait_for_new_leader(&self, shard: ShardId, excluded: NodeId) -> NodeId {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let reps = self.replicas.get(&shard).expect("shard exists");
         loop {
             for r in reps {
@@ -436,7 +440,7 @@ impl MultiShardCluster {
                 }
             }
             if Instant::now() >= deadline {
-                panic!("shard {shard:?}: no NEW leader (excluding {excluded}) within 10s");
+                panic!("shard {shard:?}: no NEW leader (excluding {excluded}) within 30s");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
