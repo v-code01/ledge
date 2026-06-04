@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ledge_cluster::shard_map::{Replica, ShardMap};
 use ledge_cluster::testkit::MultiShardCluster;
 use ledge_cluster::ShardId;
 use ledge_core::{LedgeError, ObjectId, RefName, RefStore, HLC};
@@ -279,6 +280,138 @@ async fn leader_failover_mid_workload_no_data_loss() {
     };
     store.update(&s1_fresh, oid(0x5b), None).await.unwrap();
     assert_eq!(store.get(&s1_fresh).await.unwrap().unwrap().target, oid(0x5b));
+}
+
+// ---------------------------------------------------------------------------
+// Task 6.1 — per-shard failover RESPECTS PLACEMENT (distinct node subsets)
+// ---------------------------------------------------------------------------
+//
+// Unlike the failover test above (every node hosts every shard), this builds a
+// PLACED cluster where the two shards live on DISTINCT node subsets:
+//   shard0 = {1,2,3}, shard1 = {2,3,4}   (4 nodes; node 1 hosts only shard0,
+//   node 4 only shard1, nodes 2 & 3 host both).
+//
+// It proves PER-SHARD FAULT INDEPENDENCE under real placement: killing shard0's
+// leader (always a {1,2,3} member) forces a re-election strictly among shard0's
+// surviving members, the committed shard0 ref survives on a survivor, and
+// shard1 — whose quorum {2,3,4} loses at most one member (2 or 3) and so still
+// holds majority — keeps a member-local leader and its own committed ref.
+// `kill_replica` deregisters only the (shard0, leader) Raft handle, so if the
+// killed node also hosts shard1 (node 2 or 3), that node's INDEPENDENT shard1
+// handle is untouched: placement isolation, not just shard isolation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_shard_failover_respects_placement() {
+    let map = ShardMap::from_entries([
+        (
+            ShardId(0),
+            vec![
+                Replica { node_id: 1, addr: "inproc-1".into() },
+                Replica { node_id: 2, addr: "inproc-2".into() },
+                Replica { node_id: 3, addr: "inproc-3".into() },
+            ],
+        ),
+        (
+            ShardId(1),
+            vec![
+                Replica { node_id: 2, addr: "inproc-2".into() },
+                Replica { node_id: 3, addr: "inproc-3".into() },
+                Replica { node_id: 4, addr: "inproc-4".into() },
+            ],
+        ),
+    ])
+    .unwrap();
+    let h = MultiShardCluster::start_placed(&map).await;
+
+    // Confirm the placement the rest of the test relies on.
+    assert_eq!(h.member_ids(ShardId(0)), vec![1, 2, 3]);
+    assert_eq!(h.member_ids(ShardId(1)), vec![2, 3, 4]);
+
+    // Node 3 hosts BOTH shards, so both writes below take the local-shard path
+    // (the cross-host forward path is proven separately in the forward tests).
+    let store = h.cluster_ref_store(3);
+    let router = *store.router();
+
+    // Two ref names the router places on distinct shards; bind each to its shard.
+    let (a, b) = h.two_names_on_distinct_shards();
+    let (name0, name1) = if router.shard_for(a.as_str()) == ShardId(0) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(router.shard_for(name0.as_str()), ShardId(0));
+    assert_eq!(router.shard_for(name1.as_str()), ShardId(1));
+
+    // Commit one ref to each shard through the cluster ref store, then wait for
+    // each to replicate to ALL of that shard's members (deterministic barrier).
+    store.update(&name0, oid(0xa0), None).await.unwrap();
+    store.update(&name1, oid(0xb1), None).await.unwrap();
+    h.await_applied(ShardId(0), &name0).await;
+    h.await_applied(ShardId(1), &name1).await;
+
+    // Record shard1's pre-failover leader so we can assert it stays member-local
+    // (and confirm placement isolation regardless of which shard0 node dies).
+    let s1_leader_before = h.wait_for_leader(ShardId(1)).await;
+    assert!([2, 3, 4].contains(&s1_leader_before));
+
+    // --- kill shard0's CURRENT leader (a {1,2,3} member; a hard partition) ---
+    let s0_leader = h.wait_for_leader(ShardId(0)).await;
+    assert!([1, 2, 3].contains(&s0_leader));
+    h.kill_replica(ShardId(0), s0_leader).await;
+
+    // shard0 re-elects a NEW leader strictly among its surviving members.
+    let new_leader = h.wait_for_new_leader(ShardId(0), s0_leader).await;
+    assert_ne!(new_leader, s0_leader);
+    assert!(
+        [1, 2, 3].contains(&new_leader),
+        "new shard0 leader {new_leader} must be a shard0 member"
+    );
+
+    // shard0's committed ref survived the failover on a live replica, and reads
+    // back through the cluster store (node 3 always survives — it is in {1,2,3}
+    // but is never the killed leader unless it WAS the leader, in which case the
+    // store still resolves a survivor leader via the registry).
+    assert!(
+        h.surviving_replica_has_ref(ShardId(0), s0_leader, &name0).await,
+        "committed shard0 ref must survive re-election"
+    );
+    assert_eq!(
+        store.get(&name0).await.unwrap().unwrap().target,
+        oid(0xa0),
+        "shard0 ref reads back through the cluster store after failover"
+    );
+
+    // --- shard1 is UNAFFECTED: its quorum {2,3,4} never dropped below majority ---
+    // Even if s0_leader was node 2 or 3 (a shard1 member too), shard1 retains 2/3
+    // and keeps/elects a member-local leader; its committed ref is intact.
+    let s1_leader = h.wait_for_leader(ShardId(1)).await;
+    assert!(
+        [2, 3, 4].contains(&s1_leader),
+        "shard1 leader {s1_leader} must remain a shard1 member"
+    );
+    assert!(
+        h.surviving_replica_has_ref(ShardId(1), s0_leader, &name1).await,
+        "shard1 ref must be intact (its quorum was never lost)"
+    );
+    assert_eq!(
+        store.get(&name1).await.unwrap().unwrap().target,
+        oid(0xb1),
+        "shard1 ref reads back unchanged through the cluster store"
+    );
+
+    // And shard1 still accepts a fresh write after shard0's failover (liveness
+    // of the bystander shard is preserved — its Raft group never lost quorum).
+    let s1_fresh = {
+        let mut i = 0u32;
+        loop {
+            let n = name(&format!("refs/workspaces/p{i}/main"));
+            if router.shard_for(n.as_str()) == ShardId(1) {
+                break n;
+            }
+            i += 1;
+        }
+    };
+    store.update(&s1_fresh, oid(0xb2), None).await.unwrap();
+    assert_eq!(store.get(&s1_fresh).await.unwrap().unwrap().target, oid(0xb2));
 }
 
 // ---------------------------------------------------------------------------
