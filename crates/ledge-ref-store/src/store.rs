@@ -28,6 +28,7 @@ use ledge_core::{HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefS
 use tracing::{debug, instrument, warn};
 
 use crate::art::{art_delete, art_insert, art_lookup, art_prefix_iter, ArtNode};
+use crate::slot::RefSlot;
 use crate::snapshot::ArtSnapshot;
 use crate::wal::{Wal, WalEntry};
 
@@ -94,11 +95,21 @@ impl RefStoreImpl {
                     // Checkpoint replaces all prior state with its full snapshot.
                     root = None;
                     for (name, ref_entry) in leaves {
-                        root = Some(art_insert(root, name.as_bytes(), ref_entry, 0));
+                        root = Some(art_insert(
+                            root,
+                            name.as_bytes(),
+                            RefSlot::committed(ref_entry),
+                            0,
+                        ));
                     }
                 }
                 WalEntry::Update { name, entry: ref_entry } => {
-                    root = Some(art_insert(root, name.as_bytes(), ref_entry, 0));
+                    root = Some(art_insert(
+                        root,
+                        name.as_bytes(),
+                        RefSlot::committed(ref_entry),
+                        0,
+                    ));
                 }
                 WalEntry::Delete { name, .. } => {
                     if let Some(r) = root.take() {
@@ -172,7 +183,12 @@ impl RefStoreImpl {
         let mut root: Option<Arc<ArtNode>> = None;
         for (name, entry) in entries {
             debug_assert!(entry.version >= 1, "restored version invariant: version >= 1");
-            root = Some(art_insert(root, name.as_str().as_bytes(), entry, 0));
+            root = Some(art_insert(
+                root,
+                name.as_str().as_bytes(),
+                RefSlot::committed(entry),
+                0,
+            ));
         }
 
         // Atomically publish the new root.
@@ -278,7 +294,7 @@ impl RefStoreImpl {
                     let current_root = current_arc.as_ref();
                     let current_entry: Option<RefEntry> = match current_root {
                         None => None,
-                        Some(root) => art_lookup(root, &key, 0).cloned(),
+                        Some(root) => art_lookup(root, &key, 0).map(|s| s.committed.clone()),
                     };
 
                     // Same precondition checks as `update`, returned as outcomes.
@@ -306,7 +322,12 @@ impl RefStoreImpl {
                         version: new_version,
                     };
 
-                    let new_root = art_insert(current_root.clone(), &key, new_entry.clone(), 0);
+                    let new_root = art_insert(
+                        current_root.clone(),
+                        &key,
+                        RefSlot::committed(new_entry.clone()),
+                        0,
+                    );
                     let new_root_arc = Arc::new(Some(new_root));
                     let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                     if Arc::ptr_eq(&prev, &current_arc) {
@@ -338,7 +359,7 @@ impl RefStoreImpl {
                         None => return AppliedOutcome::NotFound,
                         Some(root) => match art_lookup(root, &key, 0) {
                             None => return AppliedOutcome::NotFound,
-                            Some(e) => e.clone(),
+                            Some(s) => s.committed.clone(),
                         },
                     };
                     if current_entry.target != *expected {
@@ -384,7 +405,12 @@ impl RefStore for RefStoreImpl {
         let root_guard = self.root.load();
         Ok(match root_guard.as_ref() {
             None => None,
-            Some(root) => art_lookup(root, name.as_str().as_bytes(), 0).cloned(),
+            // Project `.committed`. A `version == 0` committed is the absent-ref
+            // sentinel left by a `Prepare` on a not-yet-created ref — treat it as
+            // absent so reads never observe a prepared-but-uncommitted creation.
+            Some(root) => art_lookup(root, name.as_str().as_bytes(), 0)
+                .map(|s| s.committed.clone())
+                .filter(|c| c.version != 0),
         })
     }
 
@@ -406,11 +432,25 @@ impl RefStore for RefStoreImpl {
             let current_arc = self.root.load_full();
             let current_root = current_arc.as_ref();
 
-            // Read the entry that exists right now (if any).
-            let current_entry: Option<RefEntry> = match current_root {
+            // Read the slot that exists right now (if any).
+            let current_slot: Option<RefSlot> = match current_root {
                 None => None,
                 Some(root) => art_lookup(root, &key, 0).cloned(),
             };
+
+            // A prepared lock makes the ref busy: a 2PC txn holds it and must be
+            // resolved (commit/abort) before any single-ref write may proceed.
+            if let Some(slot) = &current_slot {
+                if slot.prepared.is_some() {
+                    return Err(LedgeError::Conflict { current: slot.committed.clone() });
+                }
+            }
+
+            // Project committed, treating the version-0 sentinel as absent.
+            let current_entry: Option<RefEntry> = current_slot
+                .as_ref()
+                .map(|s| s.committed.clone())
+                .filter(|c| c.version != 0);
 
             // Validate optimistic preconditions.
             match (&current_entry, &expected) {
@@ -442,7 +482,12 @@ impl RefStore for RefStoreImpl {
             };
 
             // Produce the new root via CoW ART insert.
-            let new_root = art_insert(current_root.clone(), &key, new_entry.clone(), 0);
+            let new_root = art_insert(
+                current_root.clone(),
+                &key,
+                RefSlot::committed(new_entry.clone()),
+                0,
+            );
             let new_root_arc = Arc::new(Some(new_root));
 
             // Attempt the atomic swap.
@@ -473,14 +518,25 @@ impl RefStore for RefStoreImpl {
             let current_arc = self.root.load_full();
             let current_root = current_arc.as_ref();
 
-            // Read and validate the current entry.
-            let current_entry: RefEntry = match current_root {
+            // Read and validate the current slot.
+            let current_slot: RefSlot = match current_root {
                 None => return Err(LedgeError::NotFound(expected)),
                 Some(root) => match art_lookup(root, &key, 0) {
                     None => return Err(LedgeError::NotFound(expected)),
-                    Some(e) => e.clone(),
+                    Some(s) => s.clone(),
                 },
             };
+
+            // A prepared lock makes the ref busy: it must be resolved first.
+            if current_slot.prepared.is_some() {
+                return Err(LedgeError::Conflict { current: current_slot.committed.clone() });
+            }
+
+            // A version-0 sentinel committed means the ref is logically absent.
+            if current_slot.committed.version == 0 {
+                return Err(LedgeError::NotFound(expected));
+            }
+            let current_entry = current_slot.committed.clone();
 
             if current_entry.target != expected {
                 return Err(LedgeError::Conflict { current: current_entry });
@@ -515,10 +571,14 @@ impl RefStore for RefStoreImpl {
             Some(root) => {
                 let pairs = art_prefix_iter(root, prefix.as_bytes(), 0);
                 let mut results = Vec::with_capacity(pairs.len());
-                for (key_bytes, entry) in pairs {
+                for (key_bytes, slot) in pairs {
+                    // Skip prepared-only refs (version-0 sentinel): never created.
+                    if slot.committed.version == 0 {
+                        continue;
+                    }
                     if let Ok(s) = std::str::from_utf8(&key_bytes) {
                         if let Ok(n) = RefName::new(s) {
-                            results.push((n, entry));
+                            results.push((n, slot.committed));
                         }
                     }
                 }

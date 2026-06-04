@@ -24,9 +24,14 @@ pub struct ArtSnapshot {
 
 impl RefSnapshot for ArtSnapshot {
     /// O(k) lookup where k is the key length; no locking.
+    ///
+    /// Projects `.committed`. A `version == 0` committed is the absent-ref
+    /// sentinel left by a `Prepare` on a not-yet-created ref — treated as absent.
     fn get(&self, name: &RefName) -> Option<RefEntry> {
         let root = self.root.as_ref()?;
-        art_lookup(root, name.as_str().as_bytes(), 0).cloned()
+        art_lookup(root, name.as_str().as_bytes(), 0)
+            .map(|s| s.committed.clone())
+            .filter(|c| c.version != 0)
     }
 
     /// O(n_matches * k) prefix scan; no locking.
@@ -37,10 +42,14 @@ impl RefSnapshot for ArtSnapshot {
         };
         art_prefix_iter(root, prefix.as_bytes(), 0)
             .into_iter()
-            .filter_map(|(key_bytes, entry)| {
+            .filter_map(|(key_bytes, slot)| {
+                // Skip prepared-only refs (version-0 sentinel): never created.
+                if slot.committed.version == 0 {
+                    return None;
+                }
                 let key_str = std::str::from_utf8(&key_bytes).ok()?;
                 let name = RefName::new(key_str).ok()?;
-                Some((name, entry))
+                Some((name, slot.committed))
             })
             .collect()
     }
