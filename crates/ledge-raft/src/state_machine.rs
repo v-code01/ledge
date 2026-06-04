@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ledge_core::{RefEntry, RefName, TxnId, HLC};
-use ledge_ref_store::RefStoreImpl;
+use ledge_ref_store::{AppliedOutcome, RefStoreImpl};
 use ledge_workspace::id::WorkspaceId;
 use ledge_workspace::lease::{Lease, LeaseStore};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -38,7 +38,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use crate::op::{outcome_to_resp, LedgeOp, LedgeResp, TxnDecision};
+use crate::op::{outcome_to_resp, BatchOutcome, LedgeOp, LedgeResp, TxnDecision};
 use crate::type_config::TypeConfig;
 
 /// Durable per-transaction record kept on the coordinator shard's state machine.
@@ -420,12 +420,94 @@ impl StateMachineStore {
                 });
                 LedgeResp::TxnState(None)
             }
-            // Ref-2PC routing is wired in the next step.
-            LedgeOp::RefPrepare { .. }
-            | LedgeOp::RefCommitPrepared { .. }
-            | LedgeOp::RefAbortPrepared { .. }
-            | LedgeOp::RefBatch { .. } => {
-                unreachable!("ref-2PC op routing not yet wired into apply_one")
+            LedgeOp::RefPrepare { .. } => {
+                let applied = op
+                    .to_applied()
+                    .expect("ref-2pc op converts")
+                    .expect("committed ref name is valid");
+                match self.refs_arc().apply_op(&applied).await {
+                    AppliedOutcome::VoteYes => LedgeResp::Vote(true),
+                    AppliedOutcome::VoteNo => LedgeResp::Vote(false),
+                    other => {
+                        unreachable!("RefPrepare apply yielded non-vote outcome: {other:?}")
+                    }
+                }
+            }
+            LedgeOp::RefCommitPrepared { .. } => {
+                let applied = op
+                    .to_applied()
+                    .expect("ref-2pc op converts")
+                    .expect("committed ref name is valid");
+                match self.refs_arc().apply_op(&applied).await {
+                    AppliedOutcome::CommitedPrepared(e) => LedgeResp::CommittedPrepared(e),
+                    // The lock vanished / txn already aborted: surface as aborted.
+                    AppliedOutcome::AbortedPrepared => LedgeResp::AbortedPrepared,
+                    other => unreachable!("RefCommitPrepared yielded {other:?}"),
+                }
+            }
+            LedgeOp::RefAbortPrepared { .. } => {
+                let applied = op
+                    .to_applied()
+                    .expect("ref-2pc op converts")
+                    .expect("committed ref name is valid");
+                match self.refs_arc().apply_op(&applied).await {
+                    AppliedOutcome::AbortedPrepared => LedgeResp::AbortedPrepared,
+                    other => unreachable!("RefAbortPrepared yielded {other:?}"),
+                }
+            }
+            LedgeOp::RefBatch { ops } => {
+                // Convert wire BatchOps to the store's batch-input tuples. Atomicity
+                // (all-or-nothing in one ART-root swap) is the ref store's job; we
+                // forward and map the result back to per-op outcomes in input order.
+                let inputs: Vec<(RefName, ledge_core::ObjectId, Option<ledge_core::ObjectId>, u64)> =
+                    ops.iter()
+                        .map(|b| {
+                            (
+                                RefName::new(&b.name).expect("committed batch ref name is valid"),
+                                ledge_core::ObjectId::from_bytes(b.target),
+                                b.expected.map(ledge_core::ObjectId::from_bytes),
+                                b.hlc,
+                            )
+                        })
+                        .collect();
+                let refs = self.refs_arc();
+                let outcomes = match refs.commit_batch(inputs).await {
+                    // All applied: results are in input order, each a new committed entry.
+                    Ok(applied) => applied.into_iter().map(BatchOutcome::Ok).collect(),
+                    // Atomic failure: NO ref advanced. `conflicts` lists only the
+                    // refs whose CAS/lock blocked the batch; build a name→entry map
+                    // and align every input op against it. A non-conflicting op
+                    // still did not apply, so its outcome reports the current
+                    // committed entry (or a version-0 sentinel if absent).
+                    Err(conflicts) => {
+                        use std::collections::HashMap;
+                        let by_name: HashMap<String, RefEntry> = conflicts
+                            .into_iter()
+                            .map(|(n, e)| (n.as_str().to_string(), e))
+                            .collect();
+                        let mut out = Vec::with_capacity(ops.len());
+                        for b in ops {
+                            let entry = match by_name.get(&b.name) {
+                                Some(e) => e.clone(),
+                                None => {
+                                    // Not the blocker; report its current committed
+                                    // (absent ⇒ version-0 sentinel at the staged target).
+                                    use ledge_core::RefStore;
+                                    let rn = RefName::new(&b.name)
+                                        .expect("committed batch ref name is valid");
+                                    refs.get(&rn).await.ok().flatten().unwrap_or(RefEntry {
+                                        target: ledge_core::ObjectId::from_bytes(b.target),
+                                        hlc: 0,
+                                        version: 0,
+                                    })
+                                }
+                            };
+                            out.push(BatchOutcome::Conflict(entry));
+                        }
+                        out
+                    }
+                };
+                LedgeResp::BatchResult(outcomes)
             }
         }
     }
@@ -826,8 +908,299 @@ mod tests {
             .collect()
     }
 
-    use crate::op::TxnDecision;
-    use ledge_core::TxnId;
+    use crate::op::{BatchOp, BatchOutcome, TxnDecision};
+    use ledge_core::{ObjectId, TxnId};
+
+    #[tokio::test]
+    async fn prepare_unlocked_votes_yes_then_commit_applies_staged() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([1u8; 16]);
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::RefUpdate {
+                name: "refs/heads/m".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+        )])
+        .await
+        .unwrap();
+        let r = sm
+            .apply([entry(
+                1,
+                2,
+                LedgeOp::RefPrepare {
+                    txn_id: txn,
+                    coord_shard: 0,
+                    name: "refs/heads/m".into(),
+                    target: [2u8; 32],
+                    expected: Some([1u8; 32]),
+                    hlc: 20,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::Vote(true)]);
+        // Committed read still sees v1 (staged value is invisible until commit).
+        assert_eq!(
+            sm.refs_get(&RefName::new("refs/heads/m").unwrap())
+                .await
+                .unwrap()
+                .target,
+            ObjectId::from_bytes([1u8; 32])
+        );
+        let r = sm
+            .apply([entry(
+                1,
+                3,
+                LedgeOp::RefCommitPrepared {
+                    txn_id: txn,
+                    name: "refs/heads/m".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        match &r[0] {
+            LedgeResp::CommittedPrepared(e) => {
+                assert_eq!(e.target, ObjectId::from_bytes([2u8; 32]));
+                assert_eq!(e.version, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            sm.refs_get(&RefName::new("refs/heads/m").unwrap())
+                .await
+                .unwrap()
+                .target,
+            ObjectId::from_bytes([2u8; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_on_locked_ref_votes_no() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let (t1, t2) = (TxnId::from_bytes([1u8; 16]), TxnId::from_bytes([2u8; 16]));
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::RefUpdate {
+                name: "refs/heads/m".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+        )])
+        .await
+        .unwrap();
+        sm.apply([entry(
+            1,
+            2,
+            LedgeOp::RefPrepare {
+                txn_id: t1,
+                coord_shard: 0,
+                name: "refs/heads/m".into(),
+                target: [2u8; 32],
+                expected: Some([1u8; 32]),
+                hlc: 20,
+            },
+        )])
+        .await
+        .unwrap();
+        let r = sm
+            .apply([entry(
+                1,
+                3,
+                LedgeOp::RefPrepare {
+                    txn_id: t2,
+                    coord_shard: 0,
+                    name: "refs/heads/m".into(),
+                    target: [3u8; 32],
+                    expected: Some([1u8; 32]),
+                    hlc: 30,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            vec![LedgeResp::Vote(false)],
+            "second prepare on a locked ref votes no"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_prepared_releases_lock_then_prepare_votes_yes_again() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let (t1, t2) = (TxnId::from_bytes([1u8; 16]), TxnId::from_bytes([2u8; 16]));
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::RefUpdate {
+                name: "refs/heads/m".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+        )])
+        .await
+        .unwrap();
+        sm.apply([entry(
+            1,
+            2,
+            LedgeOp::RefPrepare {
+                txn_id: t1,
+                coord_shard: 0,
+                name: "refs/heads/m".into(),
+                target: [2u8; 32],
+                expected: Some([1u8; 32]),
+                hlc: 20,
+            },
+        )])
+        .await
+        .unwrap();
+        let r = sm
+            .apply([entry(
+                1,
+                3,
+                LedgeOp::RefAbortPrepared {
+                    txn_id: t1,
+                    name: "refs/heads/m".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::AbortedPrepared]);
+        // Lock released → a fresh prepare on the same ref votes YES again.
+        let r = sm
+            .apply([entry(
+                1,
+                4,
+                LedgeOp::RefPrepare {
+                    txn_id: t2,
+                    coord_shard: 0,
+                    name: "refs/heads/m".into(),
+                    target: [3u8; 32],
+                    expected: Some([1u8; 32]),
+                    hlc: 40,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::Vote(true)]);
+    }
+
+    #[tokio::test]
+    async fn ref_batch_all_or_none_atomic() {
+        let mut sm = StateMachineStore::new_temp().await;
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::RefUpdate {
+                name: "refs/heads/a".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+        )])
+        .await
+        .unwrap();
+        // a:1→2 would hold, but b's CAS (expected present-but-absent) conflicts ⇒
+        // the whole batch fails atomically.
+        let r = sm
+            .apply([entry(
+                1,
+                2,
+                LedgeOp::RefBatch {
+                    ops: vec![
+                        BatchOp {
+                            name: "refs/heads/a".into(),
+                            target: [2u8; 32],
+                            expected: Some([1u8; 32]),
+                            hlc: 20,
+                        },
+                        BatchOp {
+                            name: "refs/heads/b".into(),
+                            target: [9u8; 32],
+                            expected: Some([8u8; 32]),
+                            hlc: 21,
+                        },
+                    ],
+                },
+            )])
+            .await
+            .unwrap();
+        match &r[0] {
+            LedgeResp::BatchResult(outcomes) => {
+                assert_eq!(outcomes.len(), 2);
+                assert!(matches!(outcomes[1], BatchOutcome::Conflict(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Atomicity: a NOT advanced (still target 1), b still absent.
+        assert_eq!(
+            sm.refs_get(&RefName::new("refs/heads/a").unwrap())
+                .await
+                .unwrap()
+                .target,
+            ObjectId::from_bytes([1u8; 32])
+        );
+        assert!(sm
+            .refs_get(&RefName::new("refs/heads/b").unwrap())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ref_batch_all_ok_applies_every_ref() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let r = sm
+            .apply([entry(
+                1,
+                1,
+                LedgeOp::RefBatch {
+                    ops: vec![
+                        BatchOp {
+                            name: "refs/heads/a".into(),
+                            target: [1u8; 32],
+                            expected: None,
+                            hlc: 10,
+                        },
+                        BatchOp {
+                            name: "refs/heads/b".into(),
+                            target: [2u8; 32],
+                            expected: None,
+                            hlc: 11,
+                        },
+                    ],
+                },
+            )])
+            .await
+            .unwrap();
+        match &r[0] {
+            LedgeResp::BatchResult(outcomes) => {
+                assert_eq!(outcomes.len(), 2);
+                assert!(matches!(outcomes[0], BatchOutcome::Ok(_)));
+                assert!(matches!(outcomes[1], BatchOutcome::Ok(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            sm.refs_get(&RefName::new("refs/heads/a").unwrap())
+                .await
+                .unwrap()
+                .target,
+            ObjectId::from_bytes([1u8; 32])
+        );
+        assert_eq!(
+            sm.refs_get(&RefName::new("refs/heads/b").unwrap())
+                .await
+                .unwrap()
+                .target,
+            ObjectId::from_bytes([2u8; 32])
+        );
+    }
 
     #[tokio::test]
     async fn txn_record_lifecycle_begin_decide_end() {
