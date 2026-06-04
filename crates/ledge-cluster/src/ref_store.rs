@@ -511,6 +511,87 @@ impl RefStore for ClusterRefStore {
 }
 
 impl ClusterRefStore {
+    /// Apply a shard-targeted op on `shard` from THIS node's vantage: locally if
+    /// hosted, else forwarded. The unified seam the `TxnCoordinator` drives
+    /// prepare/commit/abort/txn-status through without caring where the shard
+    /// lives (spec §4.3).
+    pub async fn op_on_shard(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse> {
+        if self.hosts_locally(shard) {
+            self.apply_local_op(shard, op).await
+        } else {
+            self.forwarder.forward(shard, op).await
+        }
+    }
+
+    /// Apply a coordinator-shard txn-record op (`TxnBegin`/`TxnDecide`/`TxnEnd`)
+    /// on the LOCALLY-hosted coordinator shard's leader. Errors if this node does
+    /// not host `coord_shard` (the coordinator must run where it hosts the coord
+    /// shard — guaranteed by 4a placement; spec §3.1). Returns the applied resp.
+    ///
+    /// These ops carry no HLC: `TxnBegin`/`TxnEnd` are pure record lifecycle and
+    /// `TxnDecide` is a boolean decision, so there is nothing to stamp.
+    pub async fn apply_txn_record_op(
+        &self,
+        coord_shard: ShardId,
+        op: LedgeOp,
+    ) -> Result<LedgeResp> {
+        if !self.hosts_locally(coord_shard) {
+            return Err(infra(format!(
+                "coordinator must host coord shard {coord_shard:?}"
+            )));
+        }
+        self.client_write_routed(coord_shard, op).await
+    }
+
+    /// The shard-local HLC source for `shard` (for generating a txn id on the
+    /// coordinator shard). Errors if the shard is not locally hosted.
+    pub fn hlc_for(&self, shard: ShardId) -> Result<&Arc<HLC>> {
+        let reps = self.replicas(shard)?;
+        // Prefer this node's own replica (single-ownership in production); any
+        // replica's HLC works in-process since the value travels in the op.
+        reps.iter()
+            .find(|r| r.node_id == self.node_id)
+            .or_else(|| reps.first())
+            .map(|h| &h.hlc)
+            .ok_or_else(|| infra(format!("no hlc for shard {shard:?}")))
+    }
+
+    /// Apply a single-shard atomic `RefBatch` (spec §3.5) on `shard`. The host
+    /// leader stamps each op's HLC at apply (deterministic: the value travels in
+    /// the log entry). Returns the per-ref outcomes in input order. Errors if the
+    /// shard is not locally hosted (remote single-shard batch forwarding is not
+    /// exercised under the 4a coordinator placement, where the single mapped
+    /// shard is always local).
+    pub async fn apply_batch_on_shard(
+        &self,
+        shard: ShardId,
+        ops: Vec<(String, [u8; 32], Option<[u8; 32]>)>,
+    ) -> Result<Vec<ledge_raft::BatchOutcome>> {
+        if !self.hosts_locally(shard) {
+            return Err(infra(
+                "remote single-shard batch forwarding not yet wired",
+            ));
+        }
+        let leader = self.leader_of(shard).await?;
+        // Build the wire batch, stamping a monotonically increasing HLC per op.
+        let batch: Vec<ledge_raft::BatchOp> = ops
+            .into_iter()
+            .map(|(name, target, expected)| ledge_raft::BatchOp {
+                name,
+                target,
+                expected,
+                hlc: leader.hlc.tick(),
+            })
+            .collect();
+        match self
+            .client_write_routed(shard, LedgeOp::RefBatch { ops: batch })
+            .await?
+        {
+            LedgeResp::BatchResult(v) => Ok(v),
+            other => Err(infra(format!("unexpected resp for batch: {other:?}"))),
+        }
+    }
+
     /// Apply an ALREADY shard-targeted op via the LOCAL shard handle (no
     /// re-routing): the entry point for the in-memory forwarder and the
     /// `/cluster/ref-op` HTTP handler. Errors if this node does not host

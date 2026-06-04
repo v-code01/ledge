@@ -11,6 +11,7 @@ pub mod object_store;
 pub mod ref_store;
 pub mod router;
 pub mod shard_map;
+pub mod txn;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
@@ -22,3 +23,4 @@ pub use object_store::{LocalObjectPeer, ObjectPeer, ReplicatedObjectStore};
 pub use ref_store::{ClusterLeaseStore, ClusterRefStore, ConsistencyMode, ShardHandle};
 pub use router::{ShardId, ShardRouter, ShardSpan};
 pub use shard_map::{Replica, ShardMap, ShardMapError};
+pub use txn::{AtomicCommit, AtomicCommitResult, Mapping, TxnCoordinator};
