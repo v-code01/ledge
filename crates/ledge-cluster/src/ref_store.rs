@@ -586,6 +586,71 @@ impl ClusterRefStore {
                         .collect(),
                 ))
             }
+            ClusterOp::Prepare {
+                txn_id,
+                coord_shard,
+                name,
+                target_bytes,
+                expected_bytes,
+            } => {
+                // Leader-assigned staged HLC on the HOST (like Update). The lock
+                // + vote are computed deterministically in the SM apply; the HLC
+                // travels in the op so every replica stages the identical value.
+                let leader = self.leader_of(shard).await?;
+                let hlc = leader.hlc.tick();
+                let lop = LedgeOp::RefPrepare {
+                    txn_id,
+                    coord_shard,
+                    name,
+                    target: target_bytes,
+                    expected: expected_bytes,
+                    hlc,
+                };
+                match self.client_write_routed(shard, lop).await? {
+                    LedgeResp::Vote(v) => Ok(RefOpResponse::Vote(v)),
+                    other => Err(infra(format!("unexpected resp for prepare: {other:?}"))),
+                }
+            }
+            ClusterOp::CommitPrepared { txn_id, name } => {
+                let lop = LedgeOp::RefCommitPrepared { txn_id, name };
+                match self.client_write_routed(shard, lop).await? {
+                    // The SM rolls the staged value forward and returns the new
+                    // committed entry (or the idempotent current committed).
+                    LedgeResp::CommittedPrepared(e) => Ok(RefOpResponse::CommittedPrepared(e)),
+                    other => {
+                        Err(infra(format!("unexpected resp for commit-prepared: {other:?}")))
+                    }
+                }
+            }
+            ClusterOp::AbortPrepared { txn_id, name } => {
+                let lop = LedgeOp::RefAbortPrepared { txn_id, name };
+                match self.client_write_routed(shard, lop).await? {
+                    // AbortPrepared just releases the lock (idempotent no-op if
+                    // already cleared); the committed value is untouched.
+                    LedgeResp::AbortedPrepared => Ok(RefOpResponse::AbortedPrepared),
+                    other => Err(infra(format!("unexpected resp for abort-prepared: {other:?}"))),
+                }
+            }
+            ClusterOp::TxnStatus {
+                txn_id,
+                coord_shard: _,
+            } => {
+                // The decision lives in THIS shard's txn-record SM (the caller
+                // already routed to coord_shard). Linearizable read on the leader.
+                let entry = match self.mode {
+                    ConsistencyMode::Linearizable => {
+                        let leader = self.leader_of(shard).await?;
+                        leader
+                            .raft
+                            .ensure_linearizable()
+                            .await
+                            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                        leader.sm.txn_decision(txn_id)
+                    }
+                    ConsistencyMode::Stale => self.local_handle(shard)?.sm.txn_decision(txn_id),
+                };
+                Ok(RefOpResponse::TxnDecisionResp(entry))
+            }
         }
     }
 }

@@ -25,9 +25,13 @@ pub mod type_config;
 
 pub use log_store::LogStore;
 pub use log_wal::WalLogStore;
-pub use op::{outcome_to_resp, LedgeOp, LedgeResp};
+pub use op::{outcome_to_resp, BatchOp, BatchOutcome, LedgeOp, LedgeResp, TxnDecision};
 pub use state_machine::{ReadHandle, StateMachineStore};
 pub use type_config::TypeConfig;
+
+/// 128-bit transaction id (re-exported from `ledge-core` so cluster-level code
+/// can name `ledge_raft::TxnId` alongside the 2PC ops that carry it).
+pub use ledge_core::TxnId;
 
 /// Raft node id type for the Ledge cluster (re-exported for downstream crates).
 pub type NodeId = u64;

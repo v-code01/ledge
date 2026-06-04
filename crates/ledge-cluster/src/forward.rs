@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use ledge_core::{RefEntry, Result};
+use ledge_raft::{TxnDecision, TxnId};
 
 use crate::router::ShardId;
 
@@ -57,6 +58,48 @@ pub enum ClusterOp {
         /// The prefix to enumerate within the target shard.
         prefix: String,
     },
+    /// 2PC phase-1 vote+lock on one durable ref (spec §3.2). The host leader
+    /// assigns the staged HLC at apply time (no HLC on the wire, like `Update`).
+    /// `coord_shard` is recorded in the prepared lock so a resolver can find the
+    /// transaction's decision record.
+    Prepare {
+        /// The transaction this prepare belongs to.
+        txn_id: TxnId,
+        /// The coordinator shard holding the durable txn record.
+        coord_shard: u32,
+        /// The durable ref name being prepared.
+        name: String,
+        /// The object id to stage (installed iff the txn commits).
+        target_bytes: [u8; 32],
+        /// CAS precondition: the committed target the ref must currently hold
+        /// (`None` ⇒ create-only).
+        expected_bytes: Option<[u8; 32]>,
+    },
+    /// 2PC phase-2 roll-forward: replace committed with the staged value and
+    /// release the lock for `txn_id` on `name`.
+    CommitPrepared {
+        /// The committing transaction.
+        txn_id: TxnId,
+        /// The locked ref to roll forward.
+        name: String,
+    },
+    /// 2PC phase-2 roll-back: release the lock for `txn_id` on `name`, leaving
+    /// the committed value untouched.
+    AbortPrepared {
+        /// The aborting transaction.
+        txn_id: TxnId,
+        /// The locked ref to release.
+        name: String,
+    },
+    /// Read a transaction's resolved decision from its coordinator shard's
+    /// durable record (recovery / resolve-on-access). `None` ⇒ no record (or a
+    /// PENDING record), which recovery treats as presumed-abort past TTL.
+    TxnStatus {
+        /// The transaction to query.
+        txn_id: TxnId,
+        /// The coordinator shard whose SM holds the record.
+        coord_shard: u32,
+    },
 }
 
 /// The applied result of a forwarded [`ClusterOp`]. Mirrors the `LedgeResp`
@@ -75,6 +118,15 @@ pub enum RefOpResponse {
     Entry(Option<RefEntry>),
     /// List result for one shard (name string + entry pairs).
     Refs(Vec<(String, RefEntry)>),
+    /// Phase-1 vote: `true` = YES (locked), `false` = NO (precondition failed or
+    /// the ref is already locked by another live txn).
+    Vote(bool),
+    /// Phase-2 commit applied; carries the new committed entry (version+1).
+    CommittedPrepared(RefEntry),
+    /// Phase-2 abort applied; the lock was released (committed value unchanged).
+    AbortedPrepared,
+    /// Resolved decision for a `TxnStatus` query (`None` ⇒ no/PENDING record).
+    TxnDecisionResp(Option<TxnDecision>),
 }
 
 /// The forwarding seam: apply a shard-targeted op on a node that hosts `shard`.
@@ -293,6 +345,51 @@ mod tests {
         // Sanity: a LOCAL shard-0 write through node 1 stays on the fast path.
         let el = store1.update(&name_s0, oid(0x11), None).await.unwrap();
         assert_eq!(el.target, oid(0x11));
+    }
+
+    /// Every new 2PC wire op round-trips through the SAME bincode config the
+    /// HTTP forwarder uses, so prepare/commit/abort/txn-status forward exactly
+    /// like Update. Compile-fails until the variants exist (RED driver).
+    #[test]
+    fn txn_cluster_ops_roundtrip_bincode() {
+        use ledge_raft::TxnId;
+        let cfg = bincode::config::standard();
+        let txn = TxnId::from_bytes([7u8; 16]);
+        let ops = vec![
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: 0,
+                name: "refs/heads/main".into(),
+                target_bytes: [0xaa; 32],
+                expected_bytes: Some([0xbb; 32]),
+            },
+            ClusterOp::CommitPrepared { txn_id: txn, name: "refs/heads/main".into() },
+            ClusterOp::AbortPrepared { txn_id: txn, name: "refs/heads/main".into() },
+            ClusterOp::TxnStatus { txn_id: txn, coord_shard: 0 },
+        ];
+        for op in ops {
+            let bytes = bincode::serde::encode_to_vec(&op, cfg).unwrap();
+            let (back, _): (ClusterOp, usize) =
+                bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+            assert_eq!(op, back, "ClusterOp wire round-trip");
+        }
+
+        // RefOpResponse 2PC variants round-trip too.
+        let entry = RefEntry { target: ObjectId::from_bytes([1; 32]), version: 3, hlc: 9 };
+        let resps = vec![
+            RefOpResponse::Vote(true),
+            RefOpResponse::Vote(false),
+            RefOpResponse::CommittedPrepared(entry.clone()),
+            RefOpResponse::AbortedPrepared,
+            RefOpResponse::TxnDecisionResp(Some(ledge_raft::TxnDecision::Commit)),
+            RefOpResponse::TxnDecisionResp(None),
+        ];
+        for r in resps {
+            let bytes = bincode::serde::encode_to_vec(&r, cfg).unwrap();
+            let (back, _): (RefOpResponse, usize) =
+                bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+            assert_eq!(r, back, "RefOpResponse wire round-trip");
+        }
     }
 
     /// `apply_local_op` applies a SHARD-TARGETED op directly to the local handle
