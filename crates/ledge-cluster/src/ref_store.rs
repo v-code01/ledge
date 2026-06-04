@@ -461,10 +461,13 @@ impl RefStore for ClusterRefStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<(RefName, RefEntry)>> {
-        // TODO(p4a §4.3): fan out List to remote (non-locally-hosted) shards via
-        // the forwarder + merge. For now `list`/`snapshot` read LOCAL shards only;
-        // the in-memory forwarding test does not exercise cross-shard list, and
-        // the forward-and-merge `list` ships with the `/cluster/ref-op` endpoint.
+        // SCOPE (spec §10): `list`/`snapshot` read only the shards THIS node hosts.
+        // Cross-shard fan-out (forward `ClusterOp::List` to non-hosted shards and
+        // merge) is DEFERRED — it is not wired in Phase 4a. In practice the blast
+        // radius is nil: workspace/ref prefixes route to a single shard, so a
+        // single-tenant `list` already resolves to one (locally-or-remotely-owned)
+        // shard; only a broad multi-shard `list` on a partial-placement node sees a
+        // subset. Forward-and-merge lands with the cross-shard work in 4b.
         let shards: Vec<ShardId> = match self.router.shards_for_prefix(prefix) {
             ShardSpan::One(s) => vec![s],
             ShardSpan::All => self.shards.keys().copied().collect(),
