@@ -66,6 +66,26 @@ pub enum LedgeOp {
     TxnEnd { txn_id: TxnId },
 }
 
+/// Per-ref result of a single-shard atomic [`LedgeOp::RefBatch`]. `Ok` carries the
+/// newly-committed entry; `Conflict` carries the current committed entry of a ref
+/// that blocked the (all-or-nothing) batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchOutcome {
+    Ok(RefEntry),
+    Conflict(RefEntry),
+}
+
+/// Durable transaction decision recorded on the coordinator shard.
+///
+/// `Pending` ⟹ in-doubt; `Commit`/`Abort` are terminal. Presumed-abort: the
+/// ABSENCE of a record (`TxnState(None)`) is treated as Abort by recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxnDecision {
+    Pending,
+    Commit,
+    Abort,
+}
+
 /// The applied result returned through `client_write`. Mirrors `AppliedOutcome`
 /// for refs, plus the lease ack.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +104,18 @@ pub enum LedgeResp {
     /// applied. Carries no application result; distinct from `LeaseOk` so the
     /// wire result is not misattributed to a lease.
     Noop,
+
+    /// `RefPrepare` vote: `true` ⟹ YES (lock taken), `false` ⟹ NO (no lock).
+    Vote(bool),
+    /// `RefBatch` per-ref outcomes, in input order.
+    BatchResult(Vec<BatchOutcome>),
+    /// Durable transaction-record query/mutation result. `None` ⟹ no record
+    /// (presumed-abort), `Some(decision)` ⟹ the current durable decision.
+    TxnState(Option<TxnDecision>),
+    /// `RefCommitPrepared` promoted the staged value; carries the new committed entry.
+    CommittedPrepared(RefEntry),
+    /// `RefAbortPrepared` released the prepared lock (or was an idempotent no-op).
+    AbortedPrepared,
 }
 
 impl LedgeOp {
@@ -184,6 +216,35 @@ mod tests {
 
     fn cfg() -> bincode::config::Configuration {
         bincode::config::standard()
+    }
+
+    #[test]
+    fn ledge_resp_2pc_variants_serde_roundtrip() {
+        let e = RefEntry {
+            target: ObjectId::from_bytes([1u8; 32]),
+            hlc: 9,
+            version: 2,
+        };
+        let resps = vec![
+            LedgeResp::Vote(true),
+            LedgeResp::Vote(false),
+            LedgeResp::BatchResult(vec![
+                BatchOutcome::Ok(e.clone()),
+                BatchOutcome::Conflict(e.clone()),
+            ]),
+            LedgeResp::TxnState(Some(TxnDecision::Pending)),
+            LedgeResp::TxnState(Some(TxnDecision::Commit)),
+            LedgeResp::TxnState(Some(TxnDecision::Abort)),
+            LedgeResp::TxnState(None),
+            LedgeResp::CommittedPrepared(e.clone()),
+            LedgeResp::AbortedPrepared,
+        ];
+        for r in resps {
+            let bytes = bincode::serde::encode_to_vec(&r, cfg()).unwrap();
+            let (back, _): (LedgeResp, _) =
+                bincode::serde::decode_from_slice(&bytes, cfg()).unwrap();
+            assert_eq!(r, back);
+        }
     }
 
     #[test]
