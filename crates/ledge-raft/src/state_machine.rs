@@ -20,12 +20,13 @@
 //! - `SnapshotMeta { last_log_id, last_membership, snapshot_id: String }`.
 //! - `Snapshot { meta, snapshot: Box<SnapshotData> }`.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use ledge_core::{RefEntry, RefName, HLC};
+use ledge_core::{RefEntry, RefName, TxnId, HLC};
 use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::id::WorkspaceId;
 use ledge_workspace::lease::{Lease, LeaseStore};
@@ -37,14 +38,29 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use crate::op::{outcome_to_resp, LedgeOp, LedgeResp};
+use crate::op::{outcome_to_resp, LedgeOp, LedgeResp, TxnDecision};
 use crate::type_config::TypeConfig;
 
+/// Durable per-transaction record kept on the coordinator shard's state machine.
+///
+/// `decision` is the in-doubt/terminal status (`Pending`→`Commit`/`Abort`);
+/// `participants` is the shard set the coordinator must drive to resolution.
+/// Stored in a `BTreeMap` keyed by `TxnId` so snapshot bytes are deterministic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TxnRecord {
+    decision: TxnDecision,
+    participants: Vec<u32>,
+}
+
 /// Serializable full state, used as the snapshot payload.
+///
+/// `txn_records` is a sorted `Vec` (from the `BTreeMap`) so two replicas dumping
+/// the same applied state emit byte-identical snapshots.
 #[derive(Serialize, Deserialize, Default)]
 struct StateDump {
     refs: Vec<(String, RefEntry)>,
     leases: Vec<Lease>,
+    txn_records: Vec<(TxnId, TxnRecord)>,
 }
 
 /// Durable applied-state metadata, persisted on every `apply`/`install_snapshot`
@@ -94,6 +110,11 @@ pub struct StateMachineStore {
     /// so tests can read each replica's applied state directly. `ArcSwap` makes
     /// the snapshot-install replacement visible to those handles.
     stores: Arc<ArcSwap<Stores>>,
+    /// Durable transaction records (coordinator-shard 2PC state), keyed by
+    /// `TxnId`. Wrapped in `Arc<ArcSwap<_>>` (copy-on-write) so the write path
+    /// stays on `&self` and a cloned [`ReadHandle`] shares the same lock-free
+    /// read cell — mirroring how `stores` is shared. Part of the SM snapshot.
+    txn_records: Arc<ArcSwap<BTreeMap<TxnId, TxnRecord>>>,
     /// Last applied log id (`None` until the first entry is applied).
     last_applied_log: Option<LogId<u64>>,
     /// Last applied membership config.
@@ -125,6 +146,7 @@ impl StateMachineStore {
                 leases,
                 _dir: Some(dir),
             })),
+            txn_records: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             last_applied_log: None,
             last_membership: StoredMembership::default(),
             snapshot_idx: 0,
@@ -172,6 +194,9 @@ impl StateMachineStore {
                 leases,
                 _dir: None, // durable: no tempdir; the stores own real paths.
             })),
+            // Reconstructed from {snapshot restore} + {post-snapshot log replay}
+            // by openraft on resume; starts empty on a plain (no-snapshot) reopen.
+            txn_records: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             last_applied_log: meta.last_applied_log,
             last_membership: meta.last_membership,
             snapshot_idx: 0,
@@ -284,7 +309,14 @@ impl StateMachineStore {
     pub fn read_handle(&self) -> ReadHandle {
         ReadHandle {
             stores: self.stores.clone(),
+            txn_records: self.txn_records.clone(),
         }
+    }
+
+    /// Current durable decision for `txn_id`, or `None` if no record exists
+    /// (`None` ⟹ presumed-abort by recovery). Lock-free `ArcSwap` load.
+    pub fn txn_decision(&self, txn_id: TxnId) -> Option<TxnDecision> {
+        self.txn_records.load().get(&txn_id).map(|r| r.decision)
     }
 
     /// Snapshot the current stores (a cheap `ArcSwap` load + `Arc` clones).
@@ -340,16 +372,60 @@ impl StateMachineStore {
                     .expect("lease tombstone");
                 LedgeResp::LeaseOk
             }
-            // 2PC ops are routed in later steps of this task; the serde-only step
-            // does not drive them through `apply_one`.
+            LedgeOp::TxnBegin {
+                txn_id,
+                participants,
+            } => {
+                // Copy-on-write insert: clone the map, add the Pending record,
+                // publish atomically so a concurrent ReadHandle sees all-or-nothing.
+                self.txn_records.rcu(|m| {
+                    let mut m = (**m).clone();
+                    m.insert(
+                        *txn_id,
+                        TxnRecord {
+                            decision: TxnDecision::Pending,
+                            participants: participants.clone(),
+                        },
+                    );
+                    m
+                });
+                LedgeResp::TxnState(Some(TxnDecision::Pending))
+            }
+            LedgeOp::TxnDecide { txn_id, commit } => {
+                let decision = if *commit {
+                    TxnDecision::Commit
+                } else {
+                    TxnDecision::Abort
+                };
+                self.txn_records.rcu(|m| {
+                    let mut m = (**m).clone();
+                    // Commit point. If the record is missing (recovery/duplicate),
+                    // create it with empty participants so the durable decision
+                    // still lands.
+                    m.entry(*txn_id)
+                        .and_modify(|r| r.decision = decision)
+                        .or_insert_with(|| TxnRecord {
+                            decision,
+                            participants: Vec::new(),
+                        });
+                    m
+                });
+                LedgeResp::TxnState(Some(decision))
+            }
+            LedgeOp::TxnEnd { txn_id } => {
+                self.txn_records.rcu(|m| {
+                    let mut m = (**m).clone();
+                    m.remove(txn_id);
+                    m
+                });
+                LedgeResp::TxnState(None)
+            }
+            // Ref-2PC routing is wired in the next step.
             LedgeOp::RefPrepare { .. }
             | LedgeOp::RefCommitPrepared { .. }
             | LedgeOp::RefAbortPrepared { .. }
-            | LedgeOp::RefBatch { .. }
-            | LedgeOp::TxnBegin { .. }
-            | LedgeOp::TxnDecide { .. }
-            | LedgeOp::TxnEnd { .. } => {
-                unreachable!("2PC op routing not yet wired into apply_one")
+            | LedgeOp::RefBatch { .. } => {
+                unreachable!("ref-2PC op routing not yet wired into apply_one")
             }
         }
     }
@@ -365,7 +441,18 @@ impl StateMachineStore {
             .map(|(n, e)| (n.as_str().to_string(), e))
             .collect();
         let leases = self.leases_arc().live(0).await.unwrap_or_default();
-        let dump = StateDump { refs, leases };
+        // BTreeMap::iter yields keys in sorted order ⇒ deterministic dump bytes.
+        let txn_records: Vec<(TxnId, TxnRecord)> = self
+            .txn_records
+            .load()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let dump = StateDump {
+            refs,
+            leases,
+            txn_records,
+        };
         bincode::serde::encode_to_vec(&dump, bincode::config::standard()).unwrap()
     }
 
@@ -403,6 +490,14 @@ impl StateMachineStore {
             leases,
             _dir: Some(dir),
         }));
+        // Rebuild the durable txn records and publish atomically. A durable
+        // COMMIT/ABORT decision must survive snapshot install (recovery rolls
+        // forward/back from it), so it rides in the snapshot payload.
+        let mut map = BTreeMap::new();
+        for (k, v) in dump.txn_records {
+            map.insert(k, v);
+        }
+        self.txn_records.store(Arc::new(map));
     }
 }
 
@@ -414,9 +509,17 @@ impl StateMachineStore {
 #[derive(Clone)]
 pub struct ReadHandle {
     stores: Arc<ArcSwap<Stores>>,
+    /// Shares the SM's durable txn-record cell so coordinators/resolvers can
+    /// read a decision without a Raft round-trip (lock-free `ArcSwap` load).
+    txn_records: Arc<ArcSwap<BTreeMap<TxnId, TxnRecord>>>,
 }
 
 impl ReadHandle {
+    /// Current durable decision for `txn_id`, or `None` if absent (presumed-abort).
+    pub fn txn_decision(&self, txn_id: TxnId) -> Option<TxnDecision> {
+        self.txn_records.load().get(&txn_id).map(|r| r.decision)
+    }
+
     /// Current applied ref entry for `name`, or `None` if absent.
     pub async fn applied_ref(&self, name: &str) -> Option<RefEntry> {
         use ledge_core::RefStore;
@@ -484,6 +587,9 @@ impl ReadHandle {
 pub struct LedgeSnapshotBuilder {
     refs: Arc<RefStoreImpl>,
     leases: Arc<LeaseStore>,
+    /// Point-in-time snapshot of the durable txn records (cheap `ArcSwap` load),
+    /// captured at build-request time so the builder is self-contained.
+    txn_records: Arc<BTreeMap<TxnId, TxnRecord>>,
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     snapshot_id: String,
@@ -503,7 +609,16 @@ impl LedgeSnapshotBuilder {
             .map(|(n, e)| (n.as_str().to_string(), e))
             .collect();
         let leases = self.leases.live(0).await.unwrap_or_default();
-        let dump = StateDump { refs, leases };
+        let txn_records: Vec<(TxnId, TxnRecord)> = self
+            .txn_records
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let dump = StateDump {
+            refs,
+            leases,
+            txn_records,
+        };
         bincode::serde::encode_to_vec(&dump, bincode::config::standard()).unwrap()
     }
 }
@@ -584,6 +699,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         LedgeSnapshotBuilder {
             refs: self.refs_arc(),
             leases: self.leases_arc(),
+            txn_records: self.txn_records.load_full(),
             last_applied_log: self.last_applied_log,
             last_membership: self.last_membership.clone(),
             snapshot_id,
@@ -708,6 +824,105 @@ mod tests {
             .enumerate()
             .map(|(i, op)| entry(1, i as u64 + 1, op))
             .collect()
+    }
+
+    use crate::op::TxnDecision;
+    use ledge_core::TxnId;
+
+    #[tokio::test]
+    async fn txn_record_lifecycle_begin_decide_end() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([1u8; 16]);
+
+        let r = sm
+            .apply([entry(
+                1,
+                1,
+                LedgeOp::TxnBegin {
+                    txn_id: txn,
+                    participants: vec![0, 1],
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Pending))]);
+        assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Pending));
+        assert_eq!(sm.read_handle().txn_decision(txn), Some(TxnDecision::Pending));
+
+        let r = sm
+            .apply([entry(
+                1,
+                2,
+                LedgeOp::TxnDecide {
+                    txn_id: txn,
+                    commit: true,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Commit))]);
+        assert_eq!(
+            sm.txn_decision(txn),
+            Some(TxnDecision::Commit),
+            "TxnDecide is the commit point"
+        );
+
+        let r = sm
+            .apply([entry(1, 3, LedgeOp::TxnEnd { txn_id: txn })])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(None)]);
+        assert_eq!(sm.txn_decision(txn), None, "TxnEnd GCs the record");
+    }
+
+    #[tokio::test]
+    async fn txn_decide_abort_records_abort() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([2u8; 16]);
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![5],
+            },
+        )])
+        .await
+        .unwrap();
+        let r = sm
+            .apply([entry(
+                1,
+                2,
+                LedgeOp::TxnDecide {
+                    txn_id: txn,
+                    commit: false,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Abort))]);
+        assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Abort));
+    }
+
+    #[tokio::test]
+    async fn txn_decide_without_begin_creates_durable_decision() {
+        // Recovery/duplicate: a TxnDecide with no prior record still lands the
+        // durable decision (empty participants).
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([3u8; 16]);
+        let r = sm
+            .apply([entry(
+                1,
+                1,
+                LedgeOp::TxnDecide {
+                    txn_id: txn,
+                    commit: true,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Commit))]);
+        assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Commit));
     }
 
     // Apply the same op sequence to two fresh state machines and assert
