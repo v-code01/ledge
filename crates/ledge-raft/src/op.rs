@@ -195,18 +195,14 @@ pub fn outcome_to_resp(outcome: AppliedOutcome) -> LedgeResp {
         AppliedOutcome::Conflict(e) => LedgeResp::Conflict(e),
         AppliedOutcome::NotFound => LedgeResp::NotFound,
         AppliedOutcome::Deleted => LedgeResp::Deleted,
-        // 2PC outcomes (VoteYes/VoteNo/CommitedPrepared/AbortedPrepared) are
-        // produced only by the `Prepare`/`CommitPrepared`/`AbortPrepared`
-        // apply_op arms. No `LedgeOp` proposes those yet (cross-shard 2PC is
-        // wired through Raft in a later Phase-4b task), so they cannot reach
-        // this single-ref response mapper. The arm exists to keep the match
-        // exhaustive; it is unreachable on the current code path.
-        AppliedOutcome::VoteYes
-        | AppliedOutcome::VoteNo
-        | AppliedOutcome::CommitedPrepared(_)
-        | AppliedOutcome::AbortedPrepared => {
-            unreachable!("2PC AppliedOutcome reached the single-ref Raft resp mapper")
-        }
+        // 2PC outcomes. The `apply_one` Prepare/Commit/Abort arms also match these
+        // directly, but the mapping is centralized here (single source of truth)
+        // so both paths agree. Note Section 1's `CommitedPrepared` spelling (one
+        // `t`) maps to the `LedgeResp::CommittedPrepared` (two `t`) wire variant.
+        AppliedOutcome::VoteYes => LedgeResp::Vote(true),
+        AppliedOutcome::VoteNo => LedgeResp::Vote(false),
+        AppliedOutcome::CommitedPrepared(e) => LedgeResp::CommittedPrepared(e),
+        AppliedOutcome::AbortedPrepared => LedgeResp::AbortedPrepared,
     }
 }
 
@@ -216,6 +212,102 @@ mod tests {
 
     fn cfg() -> bincode::config::Configuration {
         bincode::config::standard()
+    }
+
+    #[test]
+    fn ref_2pc_ops_convert_to_applied() {
+        let txn = TxnId::from_bytes([1u8; 16]);
+        let p = LedgeOp::RefPrepare {
+            txn_id: txn,
+            coord_shard: 3,
+            name: "refs/heads/m".into(),
+            target: [8u8; 32],
+            expected: Some([9u8; 32]),
+            hlc: 77,
+        };
+        match p.to_applied().unwrap().unwrap() {
+            AppliedOp::Prepare {
+                txn_id,
+                coord_shard,
+                name,
+                target,
+                expected,
+                hlc,
+            } => {
+                assert_eq!(txn_id, txn);
+                assert_eq!(coord_shard, 3);
+                assert_eq!(name.as_str(), "refs/heads/m");
+                assert_eq!(target, ObjectId::from_bytes([8u8; 32]));
+                assert_eq!(expected, Some(ObjectId::from_bytes([9u8; 32])));
+                assert_eq!(hlc, 77);
+            }
+            other => panic!("expected Prepare, got {other:?}"),
+        }
+
+        match (LedgeOp::RefCommitPrepared {
+            txn_id: txn,
+            name: "refs/heads/m".into(),
+        })
+        .to_applied()
+        .unwrap()
+        .unwrap()
+        {
+            AppliedOp::CommitPrepared { txn_id, name } => {
+                assert_eq!(txn_id, txn);
+                assert_eq!(name.as_str(), "refs/heads/m");
+            }
+            other => panic!("expected CommitPrepared, got {other:?}"),
+        }
+
+        match (LedgeOp::RefAbortPrepared {
+            txn_id: txn,
+            name: "refs/heads/m".into(),
+        })
+        .to_applied()
+        .unwrap()
+        .unwrap()
+        {
+            AppliedOp::AbortPrepared { txn_id, name } => {
+                assert_eq!(txn_id, txn);
+                assert_eq!(name.as_str(), "refs/heads/m");
+            }
+            other => panic!("expected AbortPrepared, got {other:?}"),
+        }
+
+        // Batch + txn-record ops have no single AppliedOp equivalent.
+        assert!(LedgeOp::RefBatch { ops: vec![] }.to_applied().is_none());
+        assert!(LedgeOp::TxnBegin {
+            txn_id: txn,
+            participants: vec![]
+        }
+        .to_applied()
+        .is_none());
+        assert!(LedgeOp::TxnDecide {
+            txn_id: txn,
+            commit: true
+        }
+        .to_applied()
+        .is_none());
+        assert!(LedgeOp::TxnEnd { txn_id: txn }.to_applied().is_none());
+    }
+
+    #[test]
+    fn outcome_to_resp_maps_2pc_outcomes() {
+        let e = RefEntry {
+            target: ObjectId::from_bytes([5u8; 32]),
+            hlc: 1,
+            version: 1,
+        };
+        assert_eq!(outcome_to_resp(AppliedOutcome::VoteYes), LedgeResp::Vote(true));
+        assert_eq!(outcome_to_resp(AppliedOutcome::VoteNo), LedgeResp::Vote(false));
+        assert_eq!(
+            outcome_to_resp(AppliedOutcome::CommitedPrepared(e.clone())),
+            LedgeResp::CommittedPrepared(e)
+        );
+        assert_eq!(
+            outcome_to_resp(AppliedOutcome::AbortedPrepared),
+            LedgeResp::AbortedPrepared
+        );
     }
 
     #[test]
