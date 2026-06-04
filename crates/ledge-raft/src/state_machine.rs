@@ -340,6 +340,17 @@ impl StateMachineStore {
                     .expect("lease tombstone");
                 LedgeResp::LeaseOk
             }
+            // 2PC ops are routed in later steps of this task; the serde-only step
+            // does not drive them through `apply_one`.
+            LedgeOp::RefPrepare { .. }
+            | LedgeOp::RefCommitPrepared { .. }
+            | LedgeOp::RefAbortPrepared { .. }
+            | LedgeOp::RefBatch { .. }
+            | LedgeOp::TxnBegin { .. }
+            | LedgeOp::TxnDecide { .. }
+            | LedgeOp::TxnEnd { .. } => {
+                unreachable!("2PC op routing not yet wired into apply_one")
+            }
         }
     }
 

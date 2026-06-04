@@ -1,9 +1,20 @@
 //! `LedgeOp` (Raft log command) and `LedgeResp` (applied result).
 
-use ledge_core::{ObjectId, RefEntry, RefName};
+use ledge_core::{ObjectId, RefEntry, RefName, TxnId};
 use ledge_ref_store::{AppliedOp, AppliedOutcome};
 use ledge_workspace::{id::WorkspaceId, lease::Lease};
 use serde::{Deserialize, Serialize};
+
+/// One ref CAS within a single-shard atomic [`LedgeOp::RefBatch`]. Wire form
+/// mirrors `RefUpdate` (String name, raw `[u8; 32]` ids) for serde-trivial
+/// replication; converted to `RefName`/`ObjectId` at apply time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchOp {
+    pub name: String,
+    pub target: [u8; 32],
+    pub expected: Option<[u8; 32]>,
+    pub hlc: u64,
+}
 
 /// A replicable Ledge mutation. The HLC is leader-assigned at propose time and
 /// carried here so every replica applies the identical timestamp. Object ids are
@@ -28,6 +39,31 @@ pub enum LedgeOp {
     LeasePut { lease: Lease },
     /// Lease tombstone by workspace id.
     LeaseTombstone { id: WorkspaceId, hlc: u64 },
+
+    /// Phase-1 2PC prepare: vote-yes + take a no-wait lock iff the CAS holds and
+    /// the ref is not already prepared; else vote-no. Carries `coord_shard` so the
+    /// participant can locate the coordinator's durable decision during recovery.
+    RefPrepare {
+        txn_id: TxnId,
+        coord_shard: u32,
+        name: String,
+        target: [u8; 32],
+        expected: Option<[u8; 32]>,
+        hlc: u64,
+    },
+    /// Phase-2 2PC commit: roll the prepared intent forward (promote staged value,
+    /// release lock). Idempotent.
+    RefCommitPrepared { txn_id: TxnId, name: String },
+    /// Phase-2 2PC abort: release the prepared lock without applying. Idempotent.
+    RefAbortPrepared { txn_id: TxnId, name: String },
+    /// Single-shard atomic multi-ref CAS (all-or-nothing in one ART-root swap).
+    RefBatch { ops: Vec<BatchOp> },
+    /// Coordinator-shard: open a transaction record in `Pending` state.
+    TxnBegin { txn_id: TxnId, participants: Vec<u32> },
+    /// Coordinator-shard COMMIT POINT: set the durable decision (commit/abort).
+    TxnDecide { txn_id: TxnId, commit: bool },
+    /// Coordinator-shard: GC the transaction record once all participants resolved.
+    TxnEnd { txn_id: TxnId },
 }
 
 /// The applied result returned through `client_write`. Mirrors `AppliedOutcome`
@@ -81,7 +117,41 @@ impl LedgeOp {
                 expected: ObjectId::from_bytes(*expected_bytes),
                 hlc: *hlc,
             })),
-            LedgeOp::LeasePut { .. } | LedgeOp::LeaseTombstone { .. } => None,
+            LedgeOp::RefPrepare {
+                txn_id,
+                coord_shard,
+                name,
+                target,
+                expected,
+                hlc,
+            } => Some(RefName::new(name).map(|n| AppliedOp::Prepare {
+                txn_id: *txn_id,
+                coord_shard: *coord_shard,
+                name: n,
+                target: ObjectId::from_bytes(*target),
+                expected: expected.map(ObjectId::from_bytes),
+                hlc: *hlc,
+            })),
+            LedgeOp::RefCommitPrepared { txn_id, name } => Some(
+                RefName::new(name).map(|n| AppliedOp::CommitPrepared {
+                    txn_id: *txn_id,
+                    name: n,
+                }),
+            ),
+            LedgeOp::RefAbortPrepared { txn_id, name } => Some(
+                RefName::new(name).map(|n| AppliedOp::AbortPrepared {
+                    txn_id: *txn_id,
+                    name: n,
+                }),
+            ),
+            // Lease ops apply via `LeaseStore`; the batch + txn-record ops apply
+            // directly in `apply_one` (no single `AppliedOp` equivalent).
+            LedgeOp::LeasePut { .. }
+            | LedgeOp::LeaseTombstone { .. }
+            | LedgeOp::RefBatch { .. }
+            | LedgeOp::TxnBegin { .. }
+            | LedgeOp::TxnDecide { .. }
+            | LedgeOp::TxnEnd { .. } => None,
         }
     }
 }
@@ -114,6 +184,60 @@ mod tests {
 
     fn cfg() -> bincode::config::Configuration {
         bincode::config::standard()
+    }
+
+    #[test]
+    fn ledge_op_2pc_variants_serde_roundtrip() {
+        let txn = TxnId::from_bytes([7u8; 16]);
+        let ops = vec![
+            LedgeOp::RefPrepare {
+                txn_id: txn,
+                coord_shard: 0,
+                name: "refs/heads/main".into(),
+                target: [1u8; 32],
+                expected: Some([2u8; 32]),
+                hlc: 10,
+            },
+            LedgeOp::RefCommitPrepared {
+                txn_id: txn,
+                name: "refs/heads/main".into(),
+            },
+            LedgeOp::RefAbortPrepared {
+                txn_id: txn,
+                name: "refs/heads/main".into(),
+            },
+            LedgeOp::RefBatch {
+                ops: vec![
+                    BatchOp {
+                        name: "refs/heads/a".into(),
+                        target: [3u8; 32],
+                        expected: None,
+                        hlc: 11,
+                    },
+                    BatchOp {
+                        name: "refs/heads/b".into(),
+                        target: [4u8; 32],
+                        expected: Some([5u8; 32]),
+                        hlc: 12,
+                    },
+                ],
+            },
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![0, 1],
+            },
+            LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+            LedgeOp::TxnEnd { txn_id: txn },
+        ];
+        for op in ops {
+            let bytes = bincode::serde::encode_to_vec(&op, cfg()).unwrap();
+            let (back, _): (LedgeOp, _) =
+                bincode::serde::decode_from_slice(&bytes, cfg()).unwrap();
+            assert_eq!(op, back);
+        }
     }
 
     #[test]
