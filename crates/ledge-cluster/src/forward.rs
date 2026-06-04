@@ -439,6 +439,75 @@ mod tests {
         assert!(matches!(err, Err(ledge_core::LedgeError::Unavailable(_))));
     }
 
+    /// `apply_local_op` applies a Prepare directly on the hosting node's shard
+    /// leader: it stamps the staged HLC, locks the ref, and votes YES when the
+    /// CAS precondition holds. A read still sees the COMMITTED value (absent),
+    /// not the staged target (spec §3.3). RED until the apply arms exist.
+    #[tokio::test]
+    async fn apply_local_op_prepare_votes_yes_and_locks() {
+        use ledge_raft::TxnId;
+        let cluster = MultiShardCluster::start(2, &[1, 2]).await;
+        let map = ShardMap::from_entries([
+            (ShardId(0), vec![Replica { node_id: 1, addr: "mem://1".into() }]),
+            (ShardId(1), vec![Replica { node_id: 2, addr: "mem://2".into() }]),
+        ])
+        .unwrap();
+        let fwd = Arc::new(InMemoryForwarder::new());
+        fwd.set_map(map.clone());
+        let store1 = cluster.cluster_ref_store_hosting(1, &map, fwd.clone());
+
+        // A name on shard 0 (local to node 1).
+        let (a, b) = cluster.two_names_on_distinct_shards();
+        let router = cluster.router();
+        let name_s0 = if router.shard_for(a.as_str()) == ShardId(0) { a } else { b };
+
+        let txn = TxnId::from_bytes([1u8; 16]);
+        // Prepare create-only (expected = None) → VOTE-YES, lock taken.
+        let vote = store1
+            .apply_local_op(
+                ShardId(0),
+                ClusterOp::Prepare {
+                    txn_id: txn,
+                    coord_shard: 0,
+                    name: name_s0.as_str().to_string(),
+                    target_bytes: *oid(0x42).as_bytes(),
+                    expected_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(vote, RefOpResponse::Vote(true)), "expected YES, got {vote:?}");
+
+        // Read sees COMMITTED (still absent — staged is invisible, spec §3.3).
+        let got = store1
+            .apply_local_op(ShardId(0), ClusterOp::Get { name: name_s0.as_str().to_string() })
+            .await
+            .unwrap();
+        assert!(matches!(got, RefOpResponse::Entry(None)), "read must NOT see staged: {got:?}");
+
+        // CommitPrepared rolls the staged value forward and releases the lock.
+        let committed = store1
+            .apply_local_op(
+                ShardId(0),
+                ClusterOp::CommitPrepared { txn_id: txn, name: name_s0.as_str().to_string() },
+            )
+            .await
+            .unwrap();
+        match committed {
+            RefOpResponse::CommittedPrepared(e) => assert_eq!(e.target, oid(0x42)),
+            other => panic!("expected CommittedPrepared, got {other:?}"),
+        }
+        // Now the committed value is visible.
+        let got2 = store1
+            .apply_local_op(ShardId(0), ClusterOp::Get { name: name_s0.as_str().to_string() })
+            .await
+            .unwrap();
+        match got2 {
+            RefOpResponse::Entry(Some(e)) => assert_eq!(e.target, oid(0x42)),
+            other => panic!("expected committed entry, got {other:?}"),
+        }
+    }
+
     /// LIVE end-to-end over a REAL localhost socket: an Axum server exposes the
     /// `/cluster/ref-op` handler logic (decode `(ShardId, ClusterOp)` → verify
     /// host via the map → `apply_local_op` → bincode `RefOpResponse`) backed by an
