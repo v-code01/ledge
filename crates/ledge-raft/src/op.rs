@@ -93,6 +93,18 @@ pub fn outcome_to_resp(outcome: AppliedOutcome) -> LedgeResp {
         AppliedOutcome::Conflict(e) => LedgeResp::Conflict(e),
         AppliedOutcome::NotFound => LedgeResp::NotFound,
         AppliedOutcome::Deleted => LedgeResp::Deleted,
+        // 2PC outcomes (VoteYes/VoteNo/CommitedPrepared/AbortedPrepared) are
+        // produced only by the `Prepare`/`CommitPrepared`/`AbortPrepared`
+        // apply_op arms. No `LedgeOp` proposes those yet (cross-shard 2PC is
+        // wired through Raft in a later Phase-4b task), so they cannot reach
+        // this single-ref response mapper. The arm exists to keep the match
+        // exhaustive; it is unreachable on the current code path.
+        AppliedOutcome::VoteYes
+        | AppliedOutcome::VoteNo
+        | AppliedOutcome::CommitedPrepared(_)
+        | AppliedOutcome::AbortedPrepared => {
+            unreachable!("2PC AppliedOutcome reached the single-ref Raft resp mapper")
+        }
     }
 }
 

@@ -24,11 +24,11 @@ use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use ledge_core::{HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result};
+use ledge_core::{HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result, TxnId};
 use tracing::{debug, instrument, warn};
 
 use crate::art::{art_delete, art_insert, art_lookup, art_prefix_iter, ArtNode};
-use crate::slot::RefSlot;
+use crate::slot::{PreparedIntent, RefSlot};
 use crate::snapshot::ArtSnapshot;
 use crate::wal::{Wal, WalEntry};
 
@@ -247,6 +247,22 @@ pub enum AppliedOp {
         expected: ObjectId,
         hlc: u64,
     },
+
+    /// Phase-1 2PC: vote-yes + take a no-wait lock iff the CAS precondition holds
+    /// and the ref is not already prepared by another txn; else vote-no (no lock).
+    Prepare {
+        txn_id: TxnId,
+        coord_shard: u32,
+        name: RefName,
+        target: ObjectId,
+        expected: Option<ObjectId>,
+        hlc: u64,
+    },
+    /// Roll a prepared intent forward: replace committed with the staged value
+    /// (version+1, staged hlc) and release the lock. Idempotent.
+    CommitPrepared { txn_id: TxnId, name: RefName },
+    /// Release a prepared intent without applying it. Idempotent.
+    AbortPrepared { txn_id: TxnId, name: RefName },
 }
 
 /// The deterministic result of applying an `AppliedOp`.
@@ -265,6 +281,15 @@ pub enum AppliedOutcome {
     NotFound,
     /// Ref was deleted.
     Deleted,
+
+    /// Prepare succeeded: lock taken, vote yes.
+    VoteYes,
+    /// Prepare refused: precondition failed or ref already locked. No lock taken.
+    VoteNo,
+    /// CommitPrepared applied (or idempotently re-applied) the staged value.
+    CommitedPrepared(RefEntry),
+    /// AbortPrepared released the lock (or was a no-op).
+    AbortedPrepared,
 }
 
 impl RefStoreImpl {
@@ -388,6 +413,279 @@ impl RefStoreImpl {
                     // CAS lost — retry.
                 }
             }
+            AppliedOp::Prepare { txn_id, coord_shard, name, target, expected, hlc } => {
+                let key = name.as_str().as_bytes().to_vec();
+                loop {
+                    let current_arc = self.root.load_full();
+                    let current_root = current_arc.as_ref();
+                    let current_slot: Option<RefSlot> = match current_root {
+                        None => None,
+                        Some(root) => art_lookup(root, &key, 0).cloned(),
+                    };
+
+                    // (b) Already locked by another txn → vote NO (no-wait).
+                    if let Some(slot) = &current_slot {
+                        if slot.locked_by_other(txn_id) {
+                            return AppliedOutcome::VoteNo;
+                        }
+                    }
+
+                    // (a) CAS precondition against the COMMITTED value. A version-0
+                    // sentinel committed (prepared-only, never created) is absent.
+                    let committed: Option<RefEntry> = current_slot
+                        .as_ref()
+                        .map(|s| s.committed.clone())
+                        .filter(|c| c.version != 0);
+                    let precondition_ok = match (&committed, expected) {
+                        (None, None) => true,                  // create absent ref
+                        (Some(_), None) => false,              // create but present
+                        (None, Some(_)) => false,              // update but absent
+                        (Some(c), Some(x)) => c.target == *x,  // update matches
+                    };
+                    if !precondition_ok {
+                        return AppliedOutcome::VoteNo;
+                    }
+
+                    // Build the new slot: keep committed (or a version-0 sentinel
+                    // for an absent ref) and attach the prepared intent. The
+                    // sentinel is NEVER observed by reads — get/list filter
+                    // version-0 — so the ref stays absent until CommitPrepared.
+                    let intent = PreparedIntent {
+                        txn_id: *txn_id,
+                        coord_shard: *coord_shard,
+                        staged_target: *target,
+                        staged_hlc: *hlc,
+                    };
+                    let new_slot = match &current_slot {
+                        Some(s) => RefSlot {
+                            committed: s.committed.clone(),
+                            prepared: Some(intent),
+                        },
+                        None => RefSlot {
+                            committed: RefEntry { target: *target, hlc: 0, version: 0 },
+                            prepared: Some(intent),
+                        },
+                    };
+
+                    let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
+                    let new_root_arc = Arc::new(Some(new_root));
+                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    if Arc::ptr_eq(&prev, &current_arc) {
+                        // Locks are NOT WAL-logged as committed state: they are
+                        // volatile until CommitPrepared writes the durable entry.
+                        // A crash before CommitPrepared = presumed abort; the lock
+                        // simply vanishes on replay (correct presumed-abort).
+                        return AppliedOutcome::VoteYes;
+                    }
+                    // CAS lost — retry.
+                }
+            }
+            AppliedOp::CommitPrepared { txn_id, name } => {
+                let key = name.as_str().as_bytes().to_vec();
+                loop {
+                    let current_arc = self.root.load_full();
+                    let current_root = current_arc.as_ref();
+                    let current_slot: Option<RefSlot> = match current_root {
+                        None => None,
+                        Some(root) => art_lookup(root, &key, 0).cloned(),
+                    };
+
+                    let Some(slot) = current_slot else {
+                        // No slot at all → already GC'd/aborted. Nothing to commit.
+                        return AppliedOutcome::AbortedPrepared;
+                    };
+
+                    match &slot.prepared {
+                        Some(p) if &p.txn_id == txn_id => {
+                            // Roll forward: committed := staged (version+1).
+                            let new_version = slot.committed.version + 1;
+                            debug_assert!(new_version >= 1, "version invariant: >= 1");
+                            let new_entry = RefEntry {
+                                target: p.staged_target,
+                                hlc: p.staged_hlc,
+                                version: new_version,
+                            };
+                            let new_slot = RefSlot::committed(new_entry.clone());
+                            let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
+                            let new_root_arc = Arc::new(Some(new_root));
+                            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                            if Arc::ptr_eq(&prev, &current_arc) {
+                                if let Err(e) = self.wal.append(&WalEntry::Update {
+                                    name: name.as_str().to_string(),
+                                    entry: new_entry.clone(),
+                                }).await {
+                                    warn!("CommitPrepared WAL append failed: {e:?}");
+                                }
+                                return AppliedOutcome::CommitedPrepared(new_entry);
+                            }
+                            // CAS lost — retry.
+                        }
+                        _ => {
+                            // Lock already cleared / different txn → idempotent:
+                            // return the current committed unchanged.
+                            return AppliedOutcome::CommitedPrepared(slot.committed.clone());
+                        }
+                    }
+                }
+            }
+            AppliedOp::AbortPrepared { txn_id, name } => {
+                let key = name.as_str().as_bytes().to_vec();
+                loop {
+                    let current_arc = self.root.load_full();
+                    let current_root = current_arc.as_ref();
+                    let current_slot: Option<RefSlot> = match current_root {
+                        None => None,
+                        Some(root) => art_lookup(root, &key, 0).cloned(),
+                    };
+
+                    let Some(slot) = current_slot else {
+                        return AppliedOutcome::AbortedPrepared; // nothing to release
+                    };
+
+                    match &slot.prepared {
+                        Some(p) if &p.txn_id == txn_id => {
+                            if slot.committed.version == 0 {
+                                // Absent-ref prepare (sentinel): aborting removes
+                                // the slot entirely so the ref stays absent.
+                                let new_root_opt = match current_root {
+                                    None => None,
+                                    Some(root) => art_delete(Arc::clone(root), &key, 0),
+                                };
+                                let new_root_arc = Arc::new(new_root_opt);
+                                let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                                if Arc::ptr_eq(&prev, &current_arc) {
+                                    return AppliedOutcome::AbortedPrepared;
+                                }
+                            } else {
+                                let new_slot = RefSlot::committed(slot.committed.clone());
+                                let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
+                                let new_root_arc = Arc::new(Some(new_root));
+                                let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                                if Arc::ptr_eq(&prev, &current_arc) {
+                                    return AppliedOutcome::AbortedPrepared;
+                                }
+                            }
+                            // CAS lost — retry.
+                        }
+                        _ => return AppliedOutcome::AbortedPrepared, // idempotent no-op
+                    }
+                }
+            }
+        }
+    }
+
+    /// Atomically apply a multi-ref CAS batch in a SINGLE `ArcSwap` root swap.
+    ///
+    /// This is the single-node + single-shard all-or-nothing primitive used by
+    /// the atomic `commit` path. Semantics:
+    /// 1. Snapshot ONE root.
+    /// 2. Evaluate EVERY CAS precondition against that snapshot (locked refs and
+    ///    failed CAS both count as conflicts).
+    /// 3. If all hold, build a new root by inserting all updated `RefSlot`s, then
+    ///    publish via ONE `compare_and_swap` + ONE WAL frame per applied ref.
+    /// 4. If ANY fails, apply NONE and return the per-ref conflicts.
+    ///
+    /// On a lost CAS (concurrent writer) the whole evaluation restarts against a
+    /// fresh snapshot — preconditions are re-checked, so atomicity holds across
+    /// retries.
+    ///
+    /// # Returns
+    /// - `Ok(applied)`: `applied[i]` is the new committed entry for `ops[i]`.
+    /// - `Err(conflicts)`: `(name, current_committed)` for each failing ref; no
+    ///   ref advanced. An update-with-`expected` on an absent ref reports a
+    ///   `version == 0` sentinel current entry.
+    ///
+    /// # Complexity
+    /// O(B·k) per attempt for B ops of key length k (B inserts on the CoW path).
+    pub async fn commit_batch(
+        &self,
+        ops: Vec<(RefName, ObjectId, Option<ObjectId>, u64)>,
+    ) -> std::result::Result<Vec<RefEntry>, Vec<(RefName, RefEntry)>> {
+        loop {
+            let current_arc = self.root.load_full();
+            let current_root = current_arc.as_ref();
+
+            // Phase 1: evaluate ALL preconditions against this snapshot.
+            let mut conflicts: Vec<(RefName, RefEntry)> = Vec::new();
+            let mut planned: Vec<(RefName, RefEntry)> = Vec::with_capacity(ops.len());
+
+            for (name, target, expected, hlc) in &ops {
+                let key = name.as_str().as_bytes();
+                let slot: Option<RefSlot> = match current_root {
+                    None => None,
+                    Some(root) => art_lookup(root, key, 0).cloned(),
+                };
+
+                // A locked ref is busy → conflict (surface its committed).
+                if let Some(s) = &slot {
+                    if s.prepared.is_some() {
+                        conflicts.push((name.clone(), s.committed.clone()));
+                        continue;
+                    }
+                }
+
+                // Treat a version-0 sentinel committed as absent.
+                let committed: Option<RefEntry> = slot
+                    .as_ref()
+                    .map(|s| s.committed.clone())
+                    .filter(|c| c.version != 0);
+
+                match (&committed, expected) {
+                    (Some(existing), None) => {
+                        conflicts.push((name.clone(), existing.clone())); // create but present
+                    }
+                    (None, Some(exp)) => {
+                        // update but absent → version-0 sentinel as the "current".
+                        conflicts.push((name.clone(), RefEntry { target: *exp, hlc: 0, version: 0 }));
+                    }
+                    (Some(existing), Some(exp)) if existing.target != *exp => {
+                        conflicts.push((name.clone(), existing.clone())); // stale CAS
+                    }
+                    _ => {
+                        // Precondition holds: plan the new committed entry.
+                        let new_version = committed.as_ref().map(|e| e.version + 1).unwrap_or(1);
+                        debug_assert!(new_version >= 1, "version invariant: >= 1");
+                        planned.push((
+                            name.clone(),
+                            RefEntry { target: *target, hlc: *hlc, version: new_version },
+                        ));
+                    }
+                }
+            }
+
+            // All-or-nothing: any conflict ⇒ apply none.
+            if !conflicts.is_empty() {
+                return Err(conflicts);
+            }
+
+            // Phase 2: build the new root by inserting every planned RefSlot.
+            let mut new_root: Option<Arc<ArtNode>> = current_root.clone();
+            for (name, entry) in &planned {
+                new_root = Some(art_insert(
+                    new_root,
+                    name.as_str().as_bytes(),
+                    RefSlot::committed(entry.clone()),
+                    0,
+                ));
+            }
+            let new_root_arc = Arc::new(new_root);
+
+            // Single atomic publish.
+            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+            if Arc::ptr_eq(&prev, &current_arc) {
+                // One WAL frame per applied ref (the batch is logically one txn;
+                // recovery replays them in order to the same committed state).
+                for (name, entry) in &planned {
+                    if let Err(e) = self.wal.append(&WalEntry::Update {
+                        name: name.as_str().to_string(),
+                        entry: entry.clone(),
+                    }).await {
+                        warn!("commit_batch WAL append failed for {name:?}: {e:?}");
+                    }
+                }
+                return Ok(planned.into_iter().map(|(_, e)| e).collect());
+            }
+            // CAS lost to a concurrent writer — restart full evaluation.
         }
     }
 }
@@ -607,7 +905,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use ledge_core::{HLC, ObjectId, RefName};
+    use ledge_core::{HLC, ObjectId, RefName, TxnId};
 
     fn make_store() -> RefStoreImpl {
         let dir = tempdir().unwrap();
@@ -622,6 +920,10 @@ mod tests {
 
     fn name(s: &str) -> RefName {
         RefName::new(s).unwrap()
+    }
+
+    fn txn(byte: u8) -> TxnId {
+        TxnId::from_bytes([byte; 16])
     }
 
     // ── 1. create then get ───────────────────────────────────────────────────
@@ -923,5 +1225,265 @@ mod tests {
         let entry = store2.get(&n).await.unwrap().expect("ref must survive a store reopen");
         assert_eq!(entry.target, t);
         assert_eq!(entry.version, 1);
+    }
+
+    // ── Prepare locks + VoteYes ───────────────────────────────────────────────
+    #[tokio::test]
+    async fn prepare_locks_and_votes_yes() {
+        let store = make_store();
+        let n = name("refs/heads/prep");
+        store.update(&n, oid(1), None).await.unwrap();
+        let outcome = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1), coord_shard: 0, name: n.clone(),
+                target: oid(2), expected: Some(oid(1)), hlc: 50,
+            })
+            .await;
+        assert_eq!(outcome, AppliedOutcome::VoteYes);
+        // Read still sees the COMMITTED value, never the staged one.
+        assert_eq!(store.get(&n).await.unwrap().unwrap().target, oid(1));
+    }
+
+    // ── Prepare on a ref already locked by another txn → VoteNo ────────────────
+    #[tokio::test]
+    async fn prepare_on_locked_ref_votes_no() {
+        let store = make_store();
+        let n = name("refs/heads/prep2");
+        store.update(&n, oid(1), None).await.unwrap();
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(1)), hlc: 50,
+        }).await;
+        // A different txn cannot prepare the same ref (no-wait): votes NO.
+        let outcome = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(2), coord_shard: 0, name: n.clone(),
+            target: oid(3), expected: Some(oid(1)), hlc: 60,
+        }).await;
+        assert_eq!(outcome, AppliedOutcome::VoteNo);
+    }
+
+    // ── Prepare with a failing CAS precondition → VoteNo (no lock taken) ───────
+    #[tokio::test]
+    async fn prepare_failed_precondition_votes_no_no_lock() {
+        let store = make_store();
+        let n = name("refs/heads/prep3");
+        store.update(&n, oid(1), None).await.unwrap();
+        // expected oid(9) != committed oid(1).
+        let outcome = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(9)), hlc: 50,
+        }).await;
+        assert_eq!(outcome, AppliedOutcome::VoteNo);
+        // No lock taken → a normal update still works.
+        store.update(&n, oid(2), Some(oid(1))).await.unwrap();
+    }
+
+    // ── CommitPrepared applies staged (version+1, staged hlc) + releases lock ──
+    #[tokio::test]
+    async fn commit_prepared_applies_staged_and_releases() {
+        let store = make_store();
+        let n = name("refs/heads/cp");
+        store.update(&n, oid(1), None).await.unwrap(); // version 1
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(1)), hlc: 777,
+        }).await;
+        let outcome = store.apply_op(&AppliedOp::CommitPrepared {
+            txn_id: txn(1), name: n.clone(),
+        }).await;
+        match outcome {
+            AppliedOutcome::CommitedPrepared(e) => {
+                assert_eq!(e.target, oid(2));
+                assert_eq!(e.version, 2, "committed staged is version+1");
+                assert_eq!(e.hlc, 777, "uses the staged_hlc deterministically");
+            }
+            other => panic!("expected CommitedPrepared, got {other:?}"),
+        }
+        // Lock released: read sees the new committed value, and update works again.
+        assert_eq!(store.get(&n).await.unwrap().unwrap().target, oid(2));
+        store.update(&n, oid(3), Some(oid(2))).await.unwrap();
+    }
+
+    // ── CommitPrepared is idempotent (already resolved) ───────────────────────
+    #[tokio::test]
+    async fn commit_prepared_idempotent_after_resolution() {
+        let store = make_store();
+        let n = name("refs/heads/cpidem");
+        store.update(&n, oid(1), None).await.unwrap();
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(1)), hlc: 777,
+        }).await;
+        let _ = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        // Re-applying CommitPrepared returns the CURRENT committed (idempotent, no double-bump).
+        let again = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        match again {
+            AppliedOutcome::CommitedPrepared(e) => {
+                assert_eq!(e.version, 2, "no second version bump on replay");
+                assert_eq!(e.target, oid(2));
+            }
+            other => panic!("expected idempotent CommitedPrepared, got {other:?}"),
+        }
+    }
+
+    // ── AbortPrepared releases; committed unchanged ───────────────────────────
+    #[tokio::test]
+    async fn abort_prepared_releases_lock_committed_unchanged() {
+        let store = make_store();
+        let n = name("refs/heads/ap");
+        store.update(&n, oid(1), None).await.unwrap();
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(1)), hlc: 777,
+        }).await;
+        let outcome = store.apply_op(&AppliedOp::AbortPrepared { txn_id: txn(1), name: n.clone() }).await;
+        assert_eq!(outcome, AppliedOutcome::AbortedPrepared);
+        // Committed is still oid(1) version 1; lock gone so update works.
+        let got = store.get(&n).await.unwrap().unwrap();
+        assert_eq!(got.target, oid(1));
+        assert_eq!(got.version, 1);
+        store.update(&n, oid(5), Some(oid(1))).await.unwrap();
+    }
+
+    // ── AbortPrepared is idempotent (no matching lock) ────────────────────────
+    #[tokio::test]
+    async fn abort_prepared_idempotent_when_unlocked() {
+        let store = make_store();
+        let n = name("refs/heads/apidem");
+        store.update(&n, oid(1), None).await.unwrap();
+        let outcome = store.apply_op(&AppliedOp::AbortPrepared { txn_id: txn(1), name: n.clone() }).await;
+        assert_eq!(outcome, AppliedOutcome::AbortedPrepared, "abort of an unheld lock is a no-op");
+    }
+
+    // ── Prepare to CREATE an absent ref (expected=None) ───────────────────────
+    #[tokio::test]
+    async fn prepare_create_absent_ref_votes_yes() {
+        let store = make_store();
+        let n = name("refs/heads/prepnew");
+        let outcome = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: None, hlc: 50,
+        }).await;
+        assert_eq!(outcome, AppliedOutcome::VoteYes);
+        // Still absent (staged-not-committed) until CommitPrepared.
+        assert!(store.get(&n).await.unwrap().is_none());
+        let cp = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        match cp {
+            AppliedOutcome::CommitedPrepared(e) => {
+                assert_eq!(e.target, oid(2));
+                assert_eq!(e.version, 1, "first commit of a created ref is version 1");
+            }
+            other => panic!("expected CommitedPrepared, got {other:?}"),
+        }
+    }
+
+    // ── Prepare to create an EXISTING ref (expected=None but present) → VoteNo ─
+    #[tokio::test]
+    async fn prepare_create_existing_votes_no() {
+        let store = make_store();
+        let n = name("refs/heads/prepdup");
+        store.update(&n, oid(1), None).await.unwrap();
+        let outcome = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: None, hlc: 50,
+        }).await;
+        assert_eq!(outcome, AppliedOutcome::VoteNo);
+    }
+
+    // ── update on a locked ref → Conflict ─────────────────────────────────────
+    #[tokio::test]
+    async fn update_on_locked_ref_conflicts() {
+        let store = make_store();
+        let n = name("refs/heads/lockedw");
+        store.update(&n, oid(1), None).await.unwrap();
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: n.clone(),
+            target: oid(2), expected: Some(oid(1)), hlc: 50,
+        }).await;
+        let res = store.update(&n, oid(9), Some(oid(1))).await;
+        assert!(matches!(res, Err(LedgeError::Conflict { .. })), "a locked ref is busy");
+        let res2 = store.delete(&n, oid(1)).await;
+        assert!(matches!(res2, Err(LedgeError::Conflict { .. })), "delete on a locked ref conflicts too");
+    }
+
+    // ── commit_batch: all preconditions hold → all applied atomically ─────────
+    #[tokio::test]
+    async fn commit_batch_all_hold_applies_all() {
+        let store = make_store();
+        let a = name("refs/heads/a");
+        let b = name("refs/heads/b");
+        store.update(&a, oid(1), None).await.unwrap(); // v1
+        store.update(&b, oid(1), None).await.unwrap(); // v1
+        let res = store.commit_batch(vec![
+            (a.clone(), oid(2), Some(oid(1)), 100),
+            (b.clone(), oid(3), Some(oid(1)), 100),
+        ]).await;
+        let applied = res.expect("all preconditions hold");
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].target, oid(2));
+        assert_eq!(applied[0].version, 2);
+        assert_eq!(applied[0].hlc, 100);
+        assert_eq!(applied[1].target, oid(3));
+        // Both visible through normal reads.
+        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(2));
+        assert_eq!(store.get(&b).await.unwrap().unwrap().target, oid(3));
+    }
+
+    // ── commit_batch: create (expected=None) in a batch ───────────────────────
+    #[tokio::test]
+    async fn commit_batch_creates_new_refs() {
+        let store = make_store();
+        let a = name("refs/heads/newa");
+        let b = name("refs/heads/newb");
+        let res = store.commit_batch(vec![
+            (a.clone(), oid(2), None, 100),
+            (b.clone(), oid(3), None, 100),
+        ]).await;
+        let applied = res.expect("creates succeed");
+        assert_eq!(applied[0].version, 1);
+        assert_eq!(applied[1].version, 1);
+        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(2));
+    }
+
+    // ── commit_batch: one precondition fails → NONE applied (atomic) ──────────
+    #[tokio::test]
+    async fn commit_batch_one_fails_applies_none() {
+        let store = make_store();
+        let a = name("refs/heads/at");
+        let b = name("refs/heads/bt");
+        store.update(&a, oid(1), None).await.unwrap();
+        store.update(&b, oid(1), None).await.unwrap();
+        // Second op has a stale expected → whole batch must be a no-op.
+        let res = store.commit_batch(vec![
+            (a.clone(), oid(2), Some(oid(1)), 100),  // would succeed
+            (b.clone(), oid(3), Some(oid(9)), 100),  // stale → conflict
+        ]).await;
+        let conflicts = res.expect_err("one stale precondition aborts the batch");
+        assert!(conflicts.iter().any(|(n, cur)| n == &b && cur.target == oid(1)),
+            "conflict reports b's current committed target");
+        // ATOMICITY: neither ref advanced.
+        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(1), "a untouched");
+        assert_eq!(store.get(&b).await.unwrap().unwrap().target, oid(1), "b untouched");
+        assert_eq!(store.get(&a).await.unwrap().unwrap().version, 1);
+    }
+
+    // ── commit_batch: a locked ref in the batch → conflict, none applied ──────
+    #[tokio::test]
+    async fn commit_batch_locked_ref_aborts() {
+        let store = make_store();
+        let a = name("refs/heads/la");
+        let b = name("refs/heads/lb");
+        store.update(&a, oid(1), None).await.unwrap();
+        store.update(&b, oid(1), None).await.unwrap();
+        let _ = store.apply_op(&AppliedOp::Prepare {
+            txn_id: txn(1), coord_shard: 0, name: b.clone(),
+            target: oid(7), expected: Some(oid(1)), hlc: 50,
+        }).await;
+        let res = store.commit_batch(vec![
+            (a.clone(), oid(2), Some(oid(1)), 100),
+            (b.clone(), oid(3), Some(oid(1)), 100), // b is locked → conflict
+        ]).await;
+        assert!(res.is_err(), "a batch touching a locked ref aborts");
+        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(1), "a not advanced");
     }
 }
