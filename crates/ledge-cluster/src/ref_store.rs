@@ -260,8 +260,10 @@ impl ClusterRefStore {
         self
     }
 
-    /// Whether THIS node hosts `shard` (it has a local handle for it).
-    fn hosts_locally(&self, shard: ShardId) -> bool {
+    /// Whether THIS node hosts `shard` (it has a local handle for it). Public so
+    /// the [`crate::txn::TxnResolver`] can gate coordinator-record finalization on
+    /// local coord-shard ownership.
+    pub fn hosts_locally(&self, shard: ShardId) -> bool {
         self.shards.contains_key(&shard)
     }
 
@@ -541,6 +543,31 @@ impl ClusterRefStore {
             )));
         }
         self.client_write_routed(coord_shard, op).await
+    }
+
+    /// Enumerate prepared 2PC locks across every LOCALLY-hosted shard, reading
+    /// each shard's leader SM under a linearizable barrier so the resolver sees
+    /// committed lock state (spec §3.4). Returns `(shard, [(name, intent)])` only
+    /// for shards that currently hold at least one lock. Backs [`TxnResolver`].
+    pub async fn prepared_locks_by_shard(
+        &self,
+    ) -> Result<Vec<(ShardId, Vec<(String, ledge_raft::PreparedIntent)>)>> {
+        let mut out = Vec::new();
+        // Snapshot the shard ids first (avoid holding a borrow across `.await`).
+        let shards: Vec<ShardId> = self.shards.keys().copied().collect();
+        for shard in shards {
+            let leader = self.leader_of(shard).await?;
+            leader
+                .raft
+                .ensure_linearizable()
+                .await
+                .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+            let locks = leader.sm.prepared_locks();
+            if !locks.is_empty() {
+                out.push((shard, locks));
+            }
+        }
+        Ok(out)
     }
 
     /// The shard-local HLC source for `shard` (for generating a txn id on the

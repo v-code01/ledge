@@ -16,13 +16,14 @@
 //! roll-forward (spec §3.4), (c) locks block writes but not reads ⇒ no dirty
 //! reads (spec §3.3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use ledge_core::{LedgeError, ObjectId, RefName, Result, TxnId};
-use ledge_raft::{BatchOutcome, LedgeOp};
+use ledge_raft::{BatchOutcome, LedgeOp, TxnDecision};
 
 pub use ledge_ref_store::{AtomicCommit, AtomicCommitResult, Mapping};
 
@@ -235,6 +236,187 @@ impl AtomicCommit for TxnCoordinator {
                 conflicts,
             })
         }
+    }
+}
+
+/// Background sweeper that resolves orphaned (coordinator-crashed) transactions
+/// by re-driving phase 2 against the durable coordinator-shard decision record
+/// (spec §3.4). For every prepared lock it finds:
+///
+/// - **`Commit` decision** ⇒ roll FORWARD: idempotently re-issue `CommitPrepared`
+///   to the participant (safe because apply is idempotent — a duplicate is a
+///   benign ack).
+/// - **`Abort` decision** ⇒ roll back: idempotently `AbortPrepared` (release).
+/// - **`Pending` / no record, past the TTL** ⇒ **PRESUMED ABORT**: `AbortPrepared`
+///   (release the no-wait lock).
+///
+/// Once every participant lock for a txn is resolved, the resolver records an
+/// explicit `Abort` decision for presumed-abort txns (so a concurrent reader of
+/// the coordinator record sees a terminal decision, not a stale `Pending`) and
+/// then GCs the record with `TxnEnd`.
+///
+/// # Presumed-abort safety invariant (the load-bearing argument)
+/// The resolver NEVER rolls a txn forward unless the coordinator shard holds a
+/// durable `TxnDecide{Commit}` record. The `TxnDecide{Commit}` log entry is the
+/// SOLE authorization to commit, and the coordinator only sends `CommitPrepared`
+/// to any participant AFTER that entry is durable (spec §3.1). Therefore a txn
+/// whose coordinator died before reaching the commit point has, by construction,
+/// never told any participant to commit — so presuming abort (releasing every
+/// lock) can never contradict a commit that already happened. Presumed abort
+/// only ever RELEASES a lock; it never installs a staged value. The decision
+/// record is the single source of truth and it is monotone (Pending → terminal),
+/// so this is sound under crash + retry.
+pub struct TxnResolver {
+    store: Arc<ClusterRefStore>,
+    /// A `Pending`/absent decision older than this is presumed-abort.
+    ttl: Duration,
+}
+
+impl TxnResolver {
+    /// Build over a node's cluster ref store with a default 30s presumed-abort
+    /// TTL.
+    pub fn new(store: Arc<ClusterRefStore>) -> Self {
+        Self {
+            store,
+            ttl: Duration::from_secs(30),
+        }
+    }
+
+    /// Override the presumed-abort TTL (tests use `Duration::ZERO` for an
+    /// immediate presumed-abort).
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Scan every locally-hosted shard's prepared locks and resolve each against
+    /// its coordinator-shard decision. Returns the count of locks resolved (rolled
+    /// forward or released) this pass. Idempotent and retry-safe: a lock already
+    /// resolved by a concurrent access or a prior pass is simply not seen again.
+    pub async fn resolve_once(&self) -> Result<usize> {
+        let mut resolved = 0usize;
+        // Track which (txn, coord_shard) pairs were presumed-abort so we can write
+        // a terminal Abort decision + GC the record after the lock sweep.
+        let mut presumed_abort: BTreeSet<(TxnId, u32)> = BTreeSet::new();
+        // Track every coord-shard-resolved txn whose record we should GC.
+        let mut to_end: BTreeSet<(TxnId, u32)> = BTreeSet::new();
+
+        for (shard, locks) in self.store.prepared_locks_by_shard().await? {
+            for (name, intent) in locks {
+                let coord_shard = ShardId(intent.coord_shard);
+                let decision = self.read_decision(coord_shard, intent.txn_id).await?;
+
+                let roll_forward = match decision {
+                    Some(TxnDecision::Commit) => true,
+                    Some(TxnDecision::Abort) => false,
+                    // No terminal decision: presumed-abort past the TTL. With a
+                    // ZERO TTL we always release; otherwise the lock's age gates
+                    // it. SAFETY: this only releases — never commits — so it can
+                    // never contradict a real commit (see the invariant above).
+                    None | Some(TxnDecision::Pending) => {
+                        if !self.lock_is_stale(&intent) {
+                            continue; // too fresh; leave for a later pass
+                        }
+                        presumed_abort.insert((intent.txn_id, intent.coord_shard));
+                        false
+                    }
+                };
+
+                let op = if roll_forward {
+                    ClusterOp::CommitPrepared {
+                        txn_id: intent.txn_id,
+                        name: name.clone(),
+                    }
+                } else {
+                    ClusterOp::AbortPrepared {
+                        txn_id: intent.txn_id,
+                        name: name.clone(),
+                    }
+                };
+                self.store.op_on_shard(shard, op).await?;
+                resolved += 1;
+                to_end.insert((intent.txn_id, intent.coord_shard));
+            }
+        }
+
+        // Phase 3: finalize each resolved txn's coordinator record. For a
+        // presumed-abort txn, stamp a terminal Abort (monotone Pending → Abort) so
+        // a concurrent reader observes a decision, not a stale Pending. Then GC the
+        // record. Both ops only run where THIS node hosts the coord shard (the 4a
+        // placement guarantee); a non-local coord shard is left for the node that
+        // hosts it (best-effort, idempotent).
+        for (txn_id, coord_shard) in to_end {
+            let coord = ShardId(coord_shard);
+            if !self.store.hosts_locally(coord) {
+                continue;
+            }
+            if presumed_abort.contains(&(txn_id, coord_shard)) {
+                self.store
+                    .apply_txn_record_op(
+                        coord,
+                        LedgeOp::TxnDecide {
+                            txn_id,
+                            commit: false,
+                        },
+                    )
+                    .await?;
+            }
+            self.store
+                .apply_txn_record_op(coord, LedgeOp::TxnEnd { txn_id })
+                .await?;
+        }
+
+        Ok(resolved)
+    }
+
+    /// Read the durable decision for `txn_id` from its coordinator shard
+    /// (local-or-forwarded, linearizable via the `TxnStatus` op).
+    async fn read_decision(
+        &self,
+        coord_shard: ShardId,
+        txn_id: TxnId,
+    ) -> Result<Option<TxnDecision>> {
+        match self
+            .store
+            .op_on_shard(
+                coord_shard,
+                ClusterOp::TxnStatus {
+                    txn_id,
+                    coord_shard: coord_shard.0,
+                },
+            )
+            .await?
+        {
+            RefOpResponse::TxnDecisionResp(d) => Ok(d),
+            other => Err(LedgeError::Unavailable(format!(
+                "unexpected txn-status resp: {other:?}"
+            ))),
+        }
+    }
+
+    /// Whether a no-/pending-decision lock is older than the presumed-abort TTL.
+    /// With a ZERO TTL this is always true (immediate presumed-abort, used by
+    /// tests). For a non-zero TTL we compare the lock's staged HLC physical-time
+    /// component against `now - ttl`: the HLC packs wall-clock milliseconds in its
+    /// high bits (`ledge_core::HLC`, layout `[63..20]=ms, [19..0]=logical`), so
+    /// `staged_hlc >> HLC_LOGICAL_BITS` is the lock's creation time in ms. A lock
+    /// younger than the TTL is left for a later pass (the in-doubt coordinator may
+    /// still be alive and about to write its decision).
+    fn lock_is_stale(&self, intent: &ledge_raft::PreparedIntent) -> bool {
+        /// Logical-counter bit width of `ledge_core::HLC` (the wall-ms field
+        /// starts above this). Kept in sync with `ledge_core::HLC`'s layout.
+        const HLC_LOGICAL_BITS: u64 = 20;
+        if self.ttl.is_zero() {
+            return true;
+        }
+        let created_ms = intent.staged_hlc >> HLC_LOGICAL_BITS;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Saturating: a clock that went backwards yields age 0 (not yet stale).
+        let age_ms = now_ms.saturating_sub(created_ms);
+        age_ms >= self.ttl.as_millis() as u64
     }
 }
 

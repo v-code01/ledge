@@ -8,7 +8,7 @@ use ledge_cluster::ref_store::StoreApplier;
 use ledge_cluster::router::ShardId;
 use ledge_cluster::shard_map::{Replica, ShardMap};
 use ledge_cluster::testkit::MultiShardCluster;
-use ledge_cluster::txn::{AtomicCommit, AtomicCommitResult, TxnCoordinator};
+use ledge_cluster::txn::{AtomicCommit, AtomicCommitResult, TxnCoordinator, TxnResolver};
 use ledge_core::{ObjectId, RefName, RefStore};
 
 fn oid(n: u8) -> ObjectId {
@@ -349,4 +349,191 @@ async fn commit_prepared_twice_is_idempotent() {
         oid(7),
         "ref committed value must be unchanged by the duplicate"
     );
+}
+
+// ── TxnResolver: coordinator-crash recovery (Task 4, spec §3.4) ─────────────
+
+/// Coordinator died AFTER the durable `TxnDecide{commit:true}` but BEFORE the
+/// CommitPrepared sweep: the lock exists with a COMMITTED decision. The resolver
+/// must roll the ref FORWARD (presumed-commit, authorized by the durable
+/// decision) and end the txn.
+#[tokio::test]
+async fn resolver_rolls_forward_after_decision_commit() {
+    use ledge_cluster::forward::{ClusterOp, RefOpResponse};
+    use ledge_raft::TxnId;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, _b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([42u8; 16]);
+
+    // Simulate the crash window: durable Begin + Decide{commit}, lock taken on
+    // `a` staging oid(7), but NO CommitPrepared sent.
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            ledge_raft::LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![a_shard.0],
+            },
+        )
+        .await
+        .unwrap();
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            ledge_raft::LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+        )
+        .await
+        .unwrap();
+    let vote = store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: a.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(vote, RefOpResponse::Vote(true)));
+    // Staged, not yet committed.
+    assert!(store1.get(&a).await.unwrap().is_none());
+
+    // Resolve: must find the lock, read COMMIT, roll forward.
+    let resolver = TxnResolver::new(store1.clone());
+    let resolved = resolver.resolve_once().await.unwrap();
+    assert!(resolved >= 1, "resolver must resolve at least the one lock");
+
+    // ATOMICITY HOLDS: `a` is now committed to the staged target.
+    assert_eq!(store1.get(&a).await.unwrap().unwrap().target, oid(7));
+    // The txn record is ended (gone) once resolved.
+    assert!(store1
+        .op_on_shard(
+            coord_shard,
+            ClusterOp::TxnStatus {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+            },
+        )
+        .await
+        .unwrap()
+        .eq(&RefOpResponse::TxnDecisionResp(None)));
+}
+
+/// Coordinator died BEFORE `TxnDecide`: a lock exists but the decision is
+/// PENDING / unresolvable. Past the TTL this is a PRESUMED ABORT — the resolver
+/// releases the lock and advances NO ref. Safe: no participant could have been
+/// told to commit, because the durable commit point was never reached.
+#[tokio::test]
+async fn resolver_presumed_aborts_with_no_decision() {
+    use ledge_cluster::forward::ClusterOp;
+    use ledge_raft::TxnId;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, _b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([99u8; 16]);
+
+    // Crash BEFORE TxnDecide: Begin only (PENDING) + a Prepare lock.
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            ledge_raft::LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![a_shard.0],
+            },
+        )
+        .await
+        .unwrap();
+    store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: a.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // ZERO TTL ⇒ the PENDING lock is immediately presumed-abort.
+    let resolver = TxnResolver::new(store1.clone()).with_ttl(std::time::Duration::ZERO);
+    let resolved = resolver.resolve_once().await.unwrap();
+    assert!(resolved >= 1);
+
+    // PRESUMED ABORT: lock released, NO ref advanced.
+    assert!(store1.get(&a).await.unwrap().is_none());
+    // And `a` is writable again (lock gone).
+    store1.update(&a, oid(1), None).await.unwrap();
+}
+
+/// Running the resolver TWICE on the same already-resolved (committed) txn is
+/// safe: the second pass is a no-op (it finds no lock to resolve) and the ref is
+/// unchanged. Proves resolver retry-safety on top of idempotent apply.
+#[tokio::test]
+async fn resolver_idempotent_re_resolve() {
+    use ledge_cluster::forward::ClusterOp;
+    use ledge_raft::TxnId;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, _b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([55u8; 16]);
+
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            ledge_raft::LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![a_shard.0],
+            },
+        )
+        .await
+        .unwrap();
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            ledge_raft::LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+        )
+        .await
+        .unwrap();
+    store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: a.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let resolver = TxnResolver::new(store1.clone());
+    let first = resolver.resolve_once().await.unwrap();
+    assert!(first >= 1, "first pass resolves the lock");
+    assert_eq!(store1.get(&a).await.unwrap().unwrap().target, oid(7));
+
+    // Second pass: no lock remains ⇒ a no-op (0 resolved), ref unchanged.
+    let second = resolver.resolve_once().await.unwrap();
+    assert_eq!(second, 0, "re-resolve is a no-op");
+    assert_eq!(store1.get(&a).await.unwrap().unwrap().target, oid(7));
 }
