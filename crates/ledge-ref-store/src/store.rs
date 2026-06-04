@@ -128,6 +128,14 @@ impl RefStoreImpl {
         })
     }
 
+    /// The shared HLC source this store stamps committed entries with. Exposed so
+    /// the single-node atomic-commit path can tick a per-op timestamp before
+    /// calling [`commit_batch`](Self::commit_batch), which takes caller-supplied
+    /// HLCs (the same contract the replicated apply path uses).
+    pub fn hlc(&self) -> &Arc<HLC> {
+        &self.hlc
+    }
+
     /// Compact the WAL by snapshotting all current refs into a single
     /// `Checkpoint` frame, truncating everything before it.
     ///
