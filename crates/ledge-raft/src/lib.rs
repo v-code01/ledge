@@ -33,6 +33,11 @@ pub use type_config::TypeConfig;
 /// can name `ledge_raft::TxnId` alongside the 2PC ops that carry it).
 pub use ledge_core::TxnId;
 
+/// The prepared 2PC lock intent (re-exported from `ledge-ref-store`) so the
+/// cluster-level resolver can name `ledge_raft::PreparedIntent` when enumerating
+/// staged locks via `ReadHandle::prepared_locks`.
+pub use ledge_ref_store::PreparedIntent;
+
 /// Raft node id type for the Ledge cluster (re-exported for downstream crates).
 pub type NodeId = u64;
 /// Address-bearing node descriptor (openraft `BasicNode`).

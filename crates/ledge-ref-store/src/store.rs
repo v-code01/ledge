@@ -696,6 +696,29 @@ impl RefStoreImpl {
             // CAS lost to a concurrent writer — restart full evaluation.
         }
     }
+
+    /// Enumerate every ref that currently holds a prepared 2PC lock, as
+    /// `(name, intent)` pairs in unspecified order. Backs the crash-recovery
+    /// resolver (spec §3.4): it scans these locks and resolves each against its
+    /// coordinator-shard decision. Lock-free single atomic load + ART scan.
+    pub fn prepared_locks(&self) -> Vec<(String, PreparedIntent)> {
+        let root_guard = self.root.load();
+        match root_guard.as_ref() {
+            None => Vec::new(),
+            Some(root) => {
+                let pairs = art_prefix_iter(root, b"", 0);
+                let mut out = Vec::new();
+                for (key_bytes, slot) in pairs {
+                    if let Some(intent) = slot.prepared {
+                        if let Ok(s) = std::str::from_utf8(&key_bytes) {
+                            out.push((s.to_string(), intent));
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

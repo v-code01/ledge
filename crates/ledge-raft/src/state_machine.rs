@@ -607,6 +607,14 @@ impl ReadHandle {
         self.txn_records.load().get(&txn_id).map(|r| r.decision)
     }
 
+    /// Enumerate every applied ref that currently holds a prepared 2PC lock, as
+    /// `(name, intent)` pairs. Backs the crash-recovery resolver (spec §3.4):
+    /// each lock is resolved against its coordinator-shard decision. Sync,
+    /// lock-free (one `ArcSwap` load + ART scan).
+    pub fn prepared_locks(&self) -> Vec<(String, ledge_ref_store::PreparedIntent)> {
+        self.stores.load().refs.prepared_locks()
+    }
+
     /// Current applied ref entry for `name`, or `None` if absent.
     pub async fn applied_ref(&self, name: &str) -> Option<RefEntry> {
         use ledge_core::RefStore;
@@ -988,6 +996,53 @@ mod tests {
                 .unwrap()
                 .target,
             ObjectId::from_bytes([2u8; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_locks_enumerates_staged_locks() {
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([7u8; 16]);
+        // Prepare an absent ref: a lock is held (vote yes), nothing committed yet.
+        let r = sm
+            .apply([entry(
+                1,
+                1,
+                LedgeOp::RefPrepare {
+                    txn_id: txn,
+                    coord_shard: 3,
+                    name: "refs/heads/locked".into(),
+                    target: [9u8; 32],
+                    expected: None,
+                    hlc: 42,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::Vote(true)]);
+
+        // The read handle enumerates the prepared lock with its intent.
+        let locks = sm.read_handle().prepared_locks();
+        assert_eq!(locks.len(), 1, "exactly one prepared lock");
+        let (name, intent) = &locks[0];
+        assert_eq!(name, "refs/heads/locked");
+        assert_eq!(intent.txn_id, txn);
+        assert_eq!(intent.coord_shard, 3);
+
+        // After CommitPrepared the lock is gone (nothing to resolve).
+        sm.apply([entry(
+            1,
+            2,
+            LedgeOp::RefCommitPrepared {
+                txn_id: txn,
+                name: "refs/heads/locked".into(),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(
+            sm.read_handle().prepared_locks().is_empty(),
+            "no locks after commit"
         );
     }
 
