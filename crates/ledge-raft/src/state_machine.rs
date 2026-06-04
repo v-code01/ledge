@@ -1298,6 +1298,125 @@ mod tests {
         assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Commit));
     }
 
+    #[tokio::test]
+    async fn txn_ops_apply_is_deterministic_across_two_state_machines() {
+        let txn = TxnId::from_bytes([4u8; 16]);
+        let seq = vec![
+            LedgeOp::RefUpdate {
+                name: "refs/heads/m".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![0, 1],
+            },
+            LedgeOp::RefPrepare {
+                txn_id: txn,
+                coord_shard: 0,
+                name: "refs/heads/m".into(),
+                target: [2u8; 32],
+                expected: Some([1u8; 32]),
+                hlc: 20,
+            },
+            LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+            LedgeOp::RefCommitPrepared {
+                txn_id: txn,
+                name: "refs/heads/m".into(),
+            },
+            LedgeOp::TxnEnd { txn_id: txn },
+        ];
+        let mut a = StateMachineStore::new_temp().await;
+        let mut b = StateMachineStore::new_temp().await;
+        let ra = a.apply(entries_for(seq.clone())).await.unwrap();
+        let rb = b.apply(entries_for(seq)).await.unwrap();
+        assert_eq!(ra, rb, "identical log prefix → identical responses");
+        let m = RefName::new("refs/heads/m").unwrap();
+        assert_eq!(a.refs_get(&m).await, b.refs_get(&m).await);
+        assert_eq!(a.txn_decision(txn), b.txn_decision(txn)); // both None after TxnEnd
+        assert_eq!(a.txn_decision(txn), None);
+        // The committed value rolled forward identically on both replicas.
+        assert_eq!(
+            a.refs_get(&m).await.unwrap().target,
+            ObjectId::from_bytes([2u8; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn ref_batch_apply_is_deterministic_across_two_state_machines() {
+        let seq = vec![
+            LedgeOp::RefUpdate {
+                name: "refs/heads/a".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+            LedgeOp::RefBatch {
+                ops: vec![
+                    BatchOp {
+                        name: "refs/heads/a".into(),
+                        target: [2u8; 32],
+                        expected: Some([1u8; 32]),
+                        hlc: 20,
+                    },
+                    BatchOp {
+                        name: "refs/heads/b".into(),
+                        target: [9u8; 32],
+                        expected: Some([8u8; 32]),
+                        hlc: 21,
+                    },
+                ],
+            },
+        ];
+        let mut a = StateMachineStore::new_temp().await;
+        let mut b = StateMachineStore::new_temp().await;
+        let ra = a.apply(entries_for(seq.clone())).await.unwrap();
+        let rb = b.apply(entries_for(seq)).await.unwrap();
+        assert_eq!(ra, rb, "atomic batch result identical across replicas");
+        let aa = RefName::new("refs/heads/a").unwrap();
+        assert_eq!(a.refs_get(&aa).await, b.refs_get(&aa).await);
+    }
+
+    #[tokio::test]
+    async fn vote_no_apply_is_deterministic_across_two_state_machines() {
+        let (t1, t2) = (TxnId::from_bytes([1u8; 16]), TxnId::from_bytes([2u8; 16]));
+        let seq = vec![
+            LedgeOp::RefUpdate {
+                name: "refs/heads/m".into(),
+                target_bytes: [1u8; 32],
+                expected_bytes: None,
+                hlc: 10,
+            },
+            LedgeOp::RefPrepare {
+                txn_id: t1,
+                coord_shard: 0,
+                name: "refs/heads/m".into(),
+                target: [2u8; 32],
+                expected: Some([1u8; 32]),
+                hlc: 20,
+            },
+            // Second prepare on the locked ref → NO on both replicas.
+            LedgeOp::RefPrepare {
+                txn_id: t2,
+                coord_shard: 0,
+                name: "refs/heads/m".into(),
+                target: [3u8; 32],
+                expected: Some([1u8; 32]),
+                hlc: 30,
+            },
+        ];
+        let mut a = StateMachineStore::new_temp().await;
+        let mut b = StateMachineStore::new_temp().await;
+        let ra = a.apply(entries_for(seq.clone())).await.unwrap();
+        let rb = b.apply(entries_for(seq)).await.unwrap();
+        assert_eq!(ra, rb);
+        assert_eq!(ra[2], LedgeResp::Vote(false));
+    }
+
     // Apply the same op sequence to two fresh state machines and assert
     // identical response vectors. APPLY DETERMINISM — the core safety property.
     #[tokio::test]
