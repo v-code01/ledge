@@ -199,8 +199,7 @@ impl WalInner {
     /// `StorageError`. This is the single durability primitive: it returns only
     /// after the bytes are on stable storage.
     fn write_frame(&mut self, rec: &WalRec) -> Result<(), StorageError<u64>> {
-        let frame =
-            encode_frame(rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
+        let frame = encode_frame(rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
         self.file
             .write_all(&frame)
             .map_err(|e| StorageIOError::write_logs(&io_err(format!("WAL write: {e}"))))?;
@@ -226,9 +225,8 @@ impl WalLogStore {
     /// # Errors
     /// Propagates OS I/O errors as `StorageError` (write-logs subject).
     pub fn open(dir: PathBuf) -> Result<Self, StorageError<u64>> {
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            StorageIOError::write_logs(&io_err(format!("create WAL dir: {e}")))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("create WAL dir: {e}"))))?;
         let path = dir.join("raft-log.wal");
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -272,9 +270,8 @@ impl WalLogStore {
             })?;
         }
         // Position the write cursor at EOF.
-        file.seek(SeekFrom::End(0)).map_err(|e| {
-            StorageIOError::write_logs(&io_err(format!("seek EOF: {e}")))
-        })?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek EOF: {e}"))))?;
 
         // Replay only from the last Snapshot onward (earlier records are folded
         // into that snapshot), mirroring the ref-store checkpoint semantics.
@@ -360,19 +357,22 @@ impl WalLogStore {
             purged_bytes,
         };
         let frame = encode_frame(&rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
-        inner.file.seek(SeekFrom::Start(0)).map_err(|e| {
-            StorageIOError::write_logs(&io_err(format!("seek 0: {e}")))
-        })?;
+        inner
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek 0: {e}"))))?;
         inner
             .file
             .write_all(&frame)
             .map_err(|e| StorageIOError::write_logs(&io_err(format!("snapshot write: {e}"))))?;
-        inner.file.set_len(frame.len() as u64).map_err(|e| {
-            StorageIOError::write_logs(&io_err(format!("snapshot set_len: {e}")))
-        })?;
-        inner.file.seek(SeekFrom::End(0)).map_err(|e| {
-            StorageIOError::write_logs(&io_err(format!("seek EOF: {e}")))
-        })?;
+        inner
+            .file
+            .set_len(frame.len() as u64)
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("snapshot set_len: {e}"))))?;
+        inner
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek EOF: {e}"))))?;
         inner
             .file
             .sync_data()
@@ -530,7 +530,9 @@ mod tests {
         for entry in entries {
             let index = entry.log_id.index;
             let entry_bytes = blob(&entry).unwrap();
-            inner.write_frame(&WalRec::Entry { index, entry_bytes }).unwrap();
+            inner
+                .write_frame(&WalRec::Entry { index, entry_bytes })
+                .unwrap();
             inner.log.insert(index, entry);
         }
     }
@@ -548,7 +550,9 @@ mod tests {
         );
         // Payload survives the blob round-trip.
         match &got[1].payload {
-            EntryPayload::Normal(LedgeOp::RefUpdate { hlc, target_bytes, .. }) => {
+            EntryPayload::Normal(LedgeOp::RefUpdate {
+                hlc, target_bytes, ..
+            }) => {
                 assert_eq!(*hlc, 2);
                 assert_eq!(target_bytes[0], 2);
             }

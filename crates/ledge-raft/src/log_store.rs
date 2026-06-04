@@ -188,7 +188,10 @@ mod tests {
 
         // Half-open range [1, 3) -> indices 1, 2.
         let got = reader.try_get_log_entries(1..3).await.unwrap();
-        assert_eq!(got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[tokio::test]
@@ -231,7 +234,10 @@ mod tests {
             .unwrap();
         let mut reader = store.clone();
         let got = reader.try_get_log_entries(0..10).await.unwrap();
-        assert_eq!(got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[tokio::test]
@@ -242,7 +248,10 @@ mod tests {
         store.purge(upto).await.unwrap();
         let mut reader = store.clone();
         let got = reader.try_get_log_entries(0..10).await.unwrap();
-        assert_eq!(got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
 
         let st = store.get_log_state().await.unwrap();
         assert_eq!(st.last_purged_log_id, Some(upto));

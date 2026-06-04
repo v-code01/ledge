@@ -459,17 +459,22 @@ impl StateMachineStore {
                 // Convert wire BatchOps to the store's batch-input tuples. Atomicity
                 // (all-or-nothing in one ART-root swap) is the ref store's job; we
                 // forward and map the result back to per-op outcomes in input order.
-                let inputs: Vec<(RefName, ledge_core::ObjectId, Option<ledge_core::ObjectId>, u64)> =
-                    ops.iter()
-                        .map(|b| {
-                            (
-                                RefName::new(&b.name).expect("committed batch ref name is valid"),
-                                ledge_core::ObjectId::from_bytes(b.target),
-                                b.expected.map(ledge_core::ObjectId::from_bytes),
-                                b.hlc,
-                            )
-                        })
-                        .collect();
+                let inputs: Vec<(
+                    RefName,
+                    ledge_core::ObjectId,
+                    Option<ledge_core::ObjectId>,
+                    u64,
+                )> = ops
+                    .iter()
+                    .map(|b| {
+                        (
+                            RefName::new(&b.name).expect("committed batch ref name is valid"),
+                            ledge_core::ObjectId::from_bytes(b.target),
+                            b.expected.map(ledge_core::ObjectId::from_bytes),
+                            b.hlc,
+                        )
+                    })
+                    .collect();
                 let refs = self.refs_arc();
                 let outcomes = match refs.commit_batch(inputs).await {
                     // All applied: results are in input order, each a new committed entry.
@@ -775,7 +780,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.snapshot_idx += 1;
         let snapshot_id = match self.last_applied_log {
-            Some(log_id) => format!("{}-{}-{}", log_id.leader_id, log_id.index, self.snapshot_idx),
+            Some(log_id) => format!(
+                "{}-{}-{}",
+                log_id.leader_id, log_id.index, self.snapshot_idx
+            ),
             None => format!("--{}", self.snapshot_idx),
         };
         LedgeSnapshotBuilder {
@@ -813,7 +821,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             &meta.snapshot_id,
             snapshot.get_ref(),
         )
-        .map_err(|e| StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e)))?;
+        .map_err(|e| {
+            StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e))
+        })?;
         self.persist_meta()
             .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         Ok(())
@@ -845,7 +855,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         let bytes = self.dump().await;
         self.snapshot_idx += 1;
         let snapshot_id = match self.last_applied_log {
-            Some(log_id) => format!("{}-{}-{}", log_id.leader_id, log_id.index, self.snapshot_idx),
+            Some(log_id) => format!(
+                "{}-{}-{}",
+                log_id.leader_id, log_id.index, self.snapshot_idx
+            ),
             None => format!("--{}", self.snapshot_idx),
         };
         let meta = SnapshotMeta {
@@ -1220,7 +1233,10 @@ mod tests {
             .unwrap();
         assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Pending))]);
         assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Pending));
-        assert_eq!(sm.read_handle().txn_decision(txn), Some(TxnDecision::Pending));
+        assert_eq!(
+            sm.read_handle().txn_decision(txn),
+            Some(TxnDecision::Pending)
+        );
 
         let r = sm
             .apply([entry(
@@ -1296,6 +1312,60 @@ mod tests {
             .unwrap();
         assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Commit))]);
         assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Commit));
+    }
+
+    #[tokio::test]
+    async fn txn_records_survive_snapshot_build_then_install() {
+        let mut src = StateMachineStore::new_temp().await;
+        let committed = TxnId::from_bytes([1u8; 16]);
+        let pending = TxnId::from_bytes([2u8; 16]);
+        src.apply([entry(
+            1,
+            1,
+            LedgeOp::TxnBegin {
+                txn_id: committed,
+                participants: vec![0, 1],
+            },
+        )])
+        .await
+        .unwrap();
+        src.apply([entry(
+            1,
+            2,
+            LedgeOp::TxnDecide {
+                txn_id: committed,
+                commit: true,
+            },
+        )])
+        .await
+        .unwrap();
+        src.apply([entry(
+            1,
+            3,
+            LedgeOp::TxnBegin {
+                txn_id: pending,
+                participants: vec![2],
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(src.txn_decision(committed), Some(TxnDecision::Commit));
+        assert_eq!(src.txn_decision(pending), Some(TxnDecision::Pending));
+
+        let mut builder = src.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let mut dst = StateMachineStore::new_temp().await;
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dst.txn_decision(committed),
+            Some(TxnDecision::Commit),
+            "durable COMMIT decision survives snapshot+install (roll-forward depends on this)"
+        );
+        assert_eq!(dst.txn_decision(pending), Some(TxnDecision::Pending));
+        assert_eq!(dst.txn_decision(TxnId::from_bytes([9u8; 16])), None);
     }
 
     #[tokio::test]
@@ -1471,7 +1541,9 @@ mod tests {
         let snap = builder.build_snapshot().await.unwrap();
 
         let mut dst = StateMachineStore::new_temp().await;
-        dst.install_snapshot(&snap.meta, snap.snapshot).await.unwrap();
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
 
         let main = RefName::new("refs/heads/main").unwrap();
         assert_eq!(
@@ -1523,19 +1595,33 @@ mod tests {
 
         let v = RefName::new("refs/heads/v").unwrap();
         let src_entry = src.refs_get(&v).await.unwrap();
-        assert_eq!(src_entry.version, 3, "precondition: source reached version 3");
+        assert_eq!(
+            src_entry.version, 3,
+            "precondition: source reached version 3"
+        );
 
         let mut builder = src.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
 
         let mut dst = StateMachineStore::new_temp().await;
-        dst.install_snapshot(&snap.meta, snap.snapshot).await.unwrap();
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
 
         let dst_entry = dst.refs_get(&v).await.unwrap();
-        assert_eq!(dst_entry.version, 3, "snapshot install must preserve version (not reset to 1)");
+        assert_eq!(
+            dst_entry.version, 3,
+            "snapshot install must preserve version (not reset to 1)"
+        );
         assert_eq!(dst_entry.hlc, 30, "snapshot install preserves hlc");
-        assert_eq!(dst_entry.target, ledge_core::ObjectId::from_bytes([3u8; 32]));
-        assert_eq!(dst_entry, src_entry, "full RefEntry reproduced byte-for-byte");
+        assert_eq!(
+            dst_entry.target,
+            ledge_core::ObjectId::from_bytes([3u8; 32])
+        );
+        assert_eq!(
+            dst_entry, src_entry,
+            "full RefEntry reproduced byte-for-byte"
+        );
 
         // And a subsequent CAS update on the restored node lands at version 4 —
         // exactly as a log-replay node would, proving no divergence.
@@ -1551,7 +1637,9 @@ mod tests {
         );
         let resp = dst.apply([next]).await.unwrap();
         match &resp[0] {
-            LedgeResp::RefUpdated(e) => assert_eq!(e.version, 4, "CAS after install continues version"),
+            LedgeResp::RefUpdated(e) => {
+                assert_eq!(e.version, 4, "CAS after install continues version")
+            }
             other => panic!("expected RefUpdated, got {other:?}"),
         }
     }
@@ -1581,7 +1669,10 @@ mod tests {
             assert_eq!(last_before.unwrap().index, 3, "three entries applied");
             // Read the applied ref through the SHARED handle (no Raft round-trip).
             let read = sm.read_handle();
-            let main = read.applied_ref("refs/heads/main").await.expect("ref present");
+            let main = read
+                .applied_ref("refs/heads/main")
+                .await
+                .expect("ref present");
             assert_eq!(main.target, ledge_core::ObjectId::from_bytes([2u8; 32]));
             assert_eq!(main.hlc, 200);
         } // drop ⇒ all files closed/flushed.

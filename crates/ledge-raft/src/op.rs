@@ -59,7 +59,10 @@ pub enum LedgeOp {
     /// Single-shard atomic multi-ref CAS (all-or-nothing in one ART-root swap).
     RefBatch { ops: Vec<BatchOp> },
     /// Coordinator-shard: open a transaction record in `Pending` state.
-    TxnBegin { txn_id: TxnId, participants: Vec<u32> },
+    TxnBegin {
+        txn_id: TxnId,
+        participants: Vec<u32>,
+    },
     /// Coordinator-shard COMMIT POINT: set the durable decision (commit/abort).
     TxnDecide { txn_id: TxnId, commit: bool },
     /// Coordinator-shard: GC the transaction record once all participants resolved.
@@ -164,18 +167,18 @@ impl LedgeOp {
                 expected: expected.map(ObjectId::from_bytes),
                 hlc: *hlc,
             })),
-            LedgeOp::RefCommitPrepared { txn_id, name } => Some(
-                RefName::new(name).map(|n| AppliedOp::CommitPrepared {
+            LedgeOp::RefCommitPrepared { txn_id, name } => {
+                Some(RefName::new(name).map(|n| AppliedOp::CommitPrepared {
                     txn_id: *txn_id,
                     name: n,
-                }),
-            ),
-            LedgeOp::RefAbortPrepared { txn_id, name } => Some(
-                RefName::new(name).map(|n| AppliedOp::AbortPrepared {
+                }))
+            }
+            LedgeOp::RefAbortPrepared { txn_id, name } => {
+                Some(RefName::new(name).map(|n| AppliedOp::AbortPrepared {
                     txn_id: *txn_id,
                     name: n,
-                }),
-            ),
+                }))
+            }
             // Lease ops apply via `LeaseStore`; the batch + txn-record ops apply
             // directly in `apply_one` (no single `AppliedOp` equivalent).
             LedgeOp::LeasePut { .. }
@@ -298,8 +301,14 @@ mod tests {
             hlc: 1,
             version: 1,
         };
-        assert_eq!(outcome_to_resp(AppliedOutcome::VoteYes), LedgeResp::Vote(true));
-        assert_eq!(outcome_to_resp(AppliedOutcome::VoteNo), LedgeResp::Vote(false));
+        assert_eq!(
+            outcome_to_resp(AppliedOutcome::VoteYes),
+            LedgeResp::Vote(true)
+        );
+        assert_eq!(
+            outcome_to_resp(AppliedOutcome::VoteNo),
+            LedgeResp::Vote(false)
+        );
         assert_eq!(
             outcome_to_resp(AppliedOutcome::CommitedPrepared(e.clone())),
             LedgeResp::CommittedPrepared(e)
@@ -387,8 +396,7 @@ mod tests {
         ];
         for op in ops {
             let bytes = bincode::serde::encode_to_vec(&op, cfg()).unwrap();
-            let (back, _): (LedgeOp, _) =
-                bincode::serde::decode_from_slice(&bytes, cfg()).unwrap();
+            let (back, _): (LedgeOp, _) = bincode::serde::decode_from_slice(&bytes, cfg()).unwrap();
             assert_eq!(op, back);
         }
     }
