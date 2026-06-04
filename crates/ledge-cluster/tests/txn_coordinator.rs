@@ -215,3 +215,138 @@ async fn two_concurrent_cross_shard_txns_sharing_a_ref_exactly_one_commits() {
         .await
         .unwrap();
 }
+
+// ── Idempotent apply (the resolver's foundation, Task 4) ────────────────────
+
+/// Driving `CommitPrepared` through `op_on_shard` when the prepared lock has
+/// already vanished (the slot was removed by a prior AbortPrepared / GC) must be
+/// a BENIGN idempotent ack — NOT an `infra` error. This is the precondition for
+/// safe resolver retries: a resolver that re-issues CommitPrepared after the ref
+/// was already resolved must not blow up.
+#[tokio::test]
+async fn commit_prepared_on_vanished_lock_is_benign() {
+    use ledge_cluster::forward::{ClusterOp, RefOpResponse};
+    use ledge_raft::TxnId;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, _b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([11u8; 16]);
+
+    // Prepare an ABSENT ref (creates a version-0 sentinel slot + lock), then
+    // AbortPrepared: an absent-ref abort REMOVES the slot entirely, so a
+    // subsequent CommitPrepared finds no slot ⇒ store returns AbortedPrepared.
+    let vote = store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: a.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(vote, RefOpResponse::Vote(true)));
+
+    store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::AbortPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // CommitPrepared on the now-vanished lock: must be a benign success, NOT err.
+    let resp = store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::CommitPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
+        )
+        .await
+        .expect("CommitPrepared on a vanished lock must be a benign idempotent ack");
+    assert!(
+        matches!(
+            resp,
+            RefOpResponse::AbortedPrepared | RefOpResponse::CommittedPrepared(_)
+        ),
+        "expected benign ack, got {resp:?}"
+    );
+}
+
+/// Applying `CommitPrepared` TWICE on the same (txn, ref) is idempotent: the
+/// second apply is a benign success returning the already-committed entry, and
+/// the ref's committed value is unchanged.
+#[tokio::test]
+async fn commit_prepared_twice_is_idempotent() {
+    use ledge_cluster::forward::{ClusterOp, RefOpResponse};
+    use ledge_raft::TxnId;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, _b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([12u8; 16]);
+
+    // Prepare `a` staging oid(7).
+    store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: a.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // First CommitPrepared rolls forward to oid(7).
+    let first = store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::CommitPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first, RefOpResponse::CommittedPrepared(ref e) if e.target == oid(7)));
+    assert_eq!(store1.get(&a).await.unwrap().unwrap().target, oid(7));
+
+    // Second CommitPrepared: lock already gone ⇒ benign success, ref unchanged.
+    let second = store1
+        .op_on_shard(
+            a_shard,
+            ClusterOp::CommitPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
+        )
+        .await
+        .expect("a duplicate CommitPrepared must be a benign success, not an error");
+    assert!(
+        matches!(
+            second,
+            RefOpResponse::CommittedPrepared(_) | RefOpResponse::AbortedPrepared
+        ),
+        "expected benign idempotent ack, got {second:?}"
+    );
+    assert_eq!(
+        store1.get(&a).await.unwrap().unwrap().target,
+        oid(7),
+        "ref committed value must be unchanged by the duplicate"
+    );
+}

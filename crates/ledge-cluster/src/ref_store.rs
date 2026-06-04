@@ -698,6 +698,16 @@ impl ClusterRefStore {
                     // The SM rolls the staged value forward and returns the new
                     // committed entry (or the idempotent current committed).
                     LedgeResp::CommittedPrepared(e) => Ok(RefOpResponse::CommittedPrepared(e)),
+                    // BENIGN IDEMPOTENT ACK (resolver foundation, spec §3.4): the
+                    // SM returns `AbortedPrepared` from a CommitPrepared apply when
+                    // this txn's prepared lock has already vanished — the slot was
+                    // removed by a prior AbortPrepared / GC, or the ref was already
+                    // resolved by an earlier apply. That is NOT an error: a
+                    // duplicate / already-resolved CommitPrepared is a no-op. We
+                    // surface it as `AbortedPrepared` so resolver/coordinator
+                    // retries are safe (idempotent re-resolve). Callers that want
+                    // the rolled-forward entry already got it on the first apply.
+                    LedgeResp::AbortedPrepared => Ok(RefOpResponse::AbortedPrepared),
                     other => {
                         Err(infra(format!("unexpected resp for commit-prepared: {other:?}")))
                     }
@@ -706,8 +716,10 @@ impl ClusterRefStore {
             ClusterOp::AbortPrepared { txn_id, name } => {
                 let lop = LedgeOp::RefAbortPrepared { txn_id, name };
                 match self.client_write_routed(shard, lop).await? {
-                    // AbortPrepared just releases the lock (idempotent no-op if
-                    // already cleared); the committed value is untouched.
+                    // AbortPrepared just releases the lock; a vanished/already-
+                    // cleared lock is the idempotent no-op (the SM's store-level
+                    // apply always returns `AbortedPrepared`, whether it released a
+                    // lock or found none). This makes presumed-abort retries safe.
                     LedgeResp::AbortedPrepared => Ok(RefOpResponse::AbortedPrepared),
                     other => Err(infra(format!("unexpected resp for abort-prepared: {other:?}"))),
                 }
