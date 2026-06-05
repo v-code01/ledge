@@ -22,10 +22,13 @@ fn ctx() -> (RpcCtx, TempDir) {
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
     let leases = Arc::new(ledge_workspace::LeaseStore::open(p.clone(), hlc.clone()).unwrap());
+    let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+        Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
     let workspaces = Arc::new(ledge_workspace::WorkspaceManager::new(
         refs.clone(),
         leases.clone(),
         hlc.clone(),
+        coordinator,
     ));
     let gc = Arc::new(ledge_workspace::Gc::new(
         refs.clone(),

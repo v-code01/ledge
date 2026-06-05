@@ -430,10 +430,16 @@ async fn workspace_manager_over_cluster_ref_store() {
     let dir = TempDir::new().unwrap();
     let hlc = Arc::new(HLC::new());
 
-    // Ref store = the cluster (Arc<dyn RefStore>); lease store = node-local WAL.
-    let refs: Arc<dyn RefStore> = Arc::new(h.cluster_ref_store(1));
+    // Ref store = the cluster; lease store = node-local WAL. Keep the concrete
+    // `Arc<ClusterRefStore>` so the atomic-commit seam (TxnCoordinator) can be
+    // built over the SAME store the manager reads/writes; up-cast a clone for the
+    // `dyn RefStore` the manager and the test's direct ref ops use.
+    let cluster_refs = Arc::new(h.cluster_ref_store(1));
+    let refs: Arc<dyn RefStore> = cluster_refs.clone();
     let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
-    let mgr = WorkspaceManager::new(Arc::clone(&refs), leases, hlc);
+    let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+        Arc::new(ledge_cluster::TxnCoordinator::new(cluster_refs));
+    let mgr = WorkspaceManager::new(Arc::clone(&refs), leases, hlc, coordinator);
 
     // Seed two durable source refs that route to DISTINCT shards, so the forked
     // workspace's refs (re-rooted under refs/workspaces/<hex>/...) land on one

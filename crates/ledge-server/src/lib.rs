@@ -41,7 +41,20 @@ pub fn build_workspace_stack(
     refs: Arc<RefStoreImpl>,
     hlc: Arc<HLC>,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
-    build_workspace_stack_dyn(data_dir, objects, refs as Arc<dyn RefStore>, hlc)
+    // Single-node atomic-commit seam: one ArcSwap root swap over the SAME concrete
+    // `RefStoreImpl` the manager already reads/writes. Built here, before the
+    // up-cast to `dyn RefStore`, because `LocalAtomicCommit` needs the concrete
+    // store; the manager then sees an all-or-nothing commit, byte-identical to the
+    // pre-Phase-4b behavior for the single-ref happy path.
+    let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+        Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
+    build_workspace_stack_dyn(
+        data_dir,
+        objects,
+        refs as Arc<dyn RefStore>,
+        hlc,
+        coordinator,
+    )
 }
 
 /// Cluster path: assemble the workspace control-plane trio over an arbitrary
@@ -55,9 +68,15 @@ pub fn build_workspace_stack_dyn(
     objects_disk: Arc<DiskObjectStore>,
     refs: Arc<dyn RefStore>,
     hlc: Arc<HLC>,
+    coordinator: Arc<dyn ledge_ref_store::AtomicCommit>,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     let leases = Arc::new(LeaseStore::open(data_dir, hlc.clone())?);
-    let manager = Arc::new(WorkspaceManager::new(refs.clone(), leases.clone(), hlc));
+    let manager = Arc::new(WorkspaceManager::new(
+        refs.clone(),
+        leases.clone(),
+        hlc,
+        coordinator,
+    ));
     let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk));
     Ok((manager, leases, gc))
 }

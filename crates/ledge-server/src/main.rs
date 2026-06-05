@@ -16,6 +16,10 @@ type StorageSeams = (
     Option<Arc<ledge_server::routes::ClusterHandles>>,
     Option<Arc<ledge_cluster::ClusterRefStore>>,
     Option<ledge_cluster::ShardMap>,
+    // The atomic-commit seam the workspace manager promotes through: single-node
+    // = `LocalAtomicCommit` (one ArcSwap swap); clustered = `TxnCoordinator`
+    // (single-shard RefBatch fast path + multi-shard 2PC).
+    Arc<dyn ledge_ref_store::AtomicCommit>,
 );
 
 #[derive(Parser, Debug)]
@@ -70,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     // clustered (cfg.cluster.enabled): the dyn seams are the ClusterRefStore /
     // ReplicatedObjectStore over per-shard Raft, plus the per-shard handles for
     // the /raft + /cluster routes and the metrics poller.
-    let (objects_dyn, refs_dyn, raft_shards, cluster_refs, shard_map): StorageSeams =
+    let (objects_dyn, refs_dyn, raft_shards, cluster_refs, shard_map, coordinator): StorageSeams =
         if cfg.cluster.enabled {
             // Build the authoritative shard map from config (identical on every
             // node). This SUPERSEDES the flat num_shards/peers fields; routing,
@@ -133,21 +137,32 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
 
+            // Clustered atomic-commit coordinator over the SAME ClusterRefStore:
+            // cross-shard promotions go through 2PC, single-shard through one
+            // RefBatch. Built here (in `ledge-server`) so `ledge-workspace` never
+            // depends on `ledge-cluster` (which would close a crate cycle).
+            let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+                Arc::new(ledge_cluster::TxnCoordinator::new(stack.cluster_refs.clone()));
             (
                 stack.objects,
                 stack.refs,
                 Some(stack.shards),
                 Some(stack.cluster_refs),
                 Some(stack.map),
+                coordinator,
             )
         } else {
             let refs = Arc::new(RefStoreImpl::open(data_dir.clone(), hlc.clone())?);
+            // Single-node atomic-commit seam over the concrete RefStoreImpl.
+            let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+                Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
             (
                 objects.clone() as Arc<dyn ledge_core::ObjectStore>,
                 refs as Arc<dyn ledge_core::RefStore>,
                 None,
                 None,
                 None,
+                coordinator,
             )
         };
 
@@ -156,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         objects.clone(),
         refs_dyn.clone(),
         hlc.clone(),
+        coordinator,
     )?;
 
     // ── Lease WAL compaction: collapse the append log to a checkpoint when it
