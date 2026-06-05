@@ -1,1 +1,7 @@
 /target
+
+# TLC model-checker run artifacts (traces, state dirs, error traces)
+formal/states/
+formal/*_TTrace_*.tla
+formal/*_TTrace_*.bin
+formal/MC_*.out
