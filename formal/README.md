@@ -1,13 +1,15 @@
 # Ledge — Model-Checked TLA+ Specifications
 
 A runnable, **model-checked** TLA+ formalization of the Ledge ref store's
-concurrency, the Phase 2a garbage-collector safety guard, and the Phase 3
-sharding layer (routing totality + apply determinism). These are not merely
-*published* specs — `make check` runs TLC and reports **zero invariant
-violations** on the configured finite instances, and each headline invariant
-has been validated against a deliberately-broken model (a "negative control")
-to prove it is not vacuously true — four are documented below
-(`NoLostUpdate`, `SnapshotIsolation`, `GCSafety`, `RoutingTotality`).
+concurrency, the Phase 2a garbage-collector safety guard, the Phase 3
+sharding layer (routing totality + apply determinism), and the Phase 4b
+cross-shard atomic-commit protocol (2PC over a durable decision record).
+These are not merely *published* specs — `make check` runs TLC and reports
+**zero invariant violations** on the configured finite instances, and each
+headline invariant has been validated against a deliberately-broken model (a
+"negative control") to prove it is not vacuously true — five are documented
+below (`NoLostUpdate`, `SnapshotIsolation`, `GCSafety`, `RoutingTotality`,
+`Atomicity`/`NoDirtyRead`).
 
 ```
 formal/
@@ -18,7 +20,10 @@ formal/
 ├── Sharding.tla          # Phase 3 routing totality + apply determinism
 ├── Sharding.cfg          # TLC config (clean instance)
 ├── Sharding_neg.cfg      # negative-control config (BadRouting = TRUE; must fail)
-├── Makefile              # `make check` runs TLC on all modules; `make neg` runs the negative control
+├── CrossShardTxn.tla     # Phase 4b cross-shard 2PC (atomicity/no-dirty-read/durability/no-deadlock)
+├── CrossShardTxn.cfg     # TLC config (clean instance)
+├── CrossShardTxn_neg.cfg # negative-control config (BadCoord = TRUE; must fail)
+├── Makefile              # `make check` runs TLC on all modules; `make neg`/`make neg-txn` run the negative controls
 └── README.md             # this file
 ```
 
@@ -28,6 +33,8 @@ formal/
 make check        # default target: TLC on all modules, fail on any violation
 make sany         # syntax-check all modules
 make neg          # run the Sharding negative control; PASS iff TLC reports a violation
+make neg-txn      # run the CrossShardTxn negative control; PASS iff TLC reports a violation
+make neg-all      # run both negative controls
 make clean        # remove TLC scratch state / trace files
 ```
 
@@ -282,6 +289,78 @@ The depth of the complete state graph search is 9.
 
 ---
 
+## Module `CrossShardTxn.tla`
+
+Models the **Phase 4b cross-shard atomic-commit protocol**: two-phase commit
+over a replicated, durable per-transaction decision record, under
+crash/restart interleavings. It abstracts the actual
+`TxnCoordinator::commit_atomic` algorithm in
+`crates/ledge-cluster/src/txn.rs` plus the `TxnResolver` recovery path, at
+protocol altitude.
+
+**How the model maps to `txn.rs`:**
+
+| `txn.rs` step | Model action |
+|---|---|
+| `TxnBegin` durable PENDING record | initial `decision = "none"`, `phase = "begin"` |
+| `RefPrepare` → `Vote(true)` (precondition holds, ref unlocked) | `PrepareYes(t, r)` — takes the no-wait lock, votes yes |
+| `RefPrepare` → `Vote(false)` (ref locked by another txn, or stale `expected`) | `PrepareNo(t, r)` — votes no **without waiting / without locking** |
+| Prepare loop finishes collecting votes | `EndPrepare(t)` → `phase = "prepared"` |
+| `TxnDecide{commit:true}` — **the commit point** | `DecideCommit(t)` (enabled iff `AllYes(t)`) → durable `decision = "commit"` |
+| `TxnDecide{commit:false}` | `DecideAbort(t)` (enabled iff `AnyNo(t)`) → durable `decision = "abort"` |
+| `RefCommitPrepared` (apply staged, release lock) | `CommitParticipant(t, r)` (needs only the durable `commit` decision) |
+| `RefAbortPrepared` (release lock) | `AbortParticipant(t, r)` (needs only the durable `abort` decision) |
+| `TxnEnd` GCs the record | `Finish(t)` → `phase = "done"` |
+| coordinator node dies at any step | `Crash(t)` → `coordUp[t] = FALSE` (freezes the live coordinator's own actions) |
+| `TxnResolver`: no/PENDING decision past TTL ⇒ **presumed abort** (release) | `PresumedAbortRef(t, r)` + `PresumedDecide(t)` (stamps a terminal monotone Abort) |
+| `TxnResolver`: durable Commit ⇒ roll **forward** | `CommitParticipant` fires off the durable record even with `~coordUp` |
+
+The `RefPrepare` **CAS precondition** is abstracted by `CommittedByOther(t, r)`:
+once another txn has committed a shared ref, the committed target has moved, so
+a later txn's captured `expected` is stale and its prepare votes NO — exactly
+why at most one of two concurrent committers of a shared ref succeeds. The
+resolver/Phase-2 actions deliberately do **not** require `coordUp`, so they
+model roll-forward/presumed-abort *after* a coordinator crash, driven solely by
+the durable decision record.
+
+**Instance** (`CrossShardTxn.cfg`): `Txns = {t1, t2}`, `Refs = {rA, rS, rB}`,
+`BadCoord = FALSE`, `Writes <- WritesDef` (`t1 ↦ {rA, rS}`, `t2 ↦ {rS, rB}`) —
+two cross-shard transactions **contending on the shared ref `rS`**, so exactly
+one can lock it and the other votes NO (no-wait) and aborts cleanly. The state
+graph is small and the exhaustive check (including all crash + presumed-abort +
+roll-forward interleavings) is sub-second. The protocol terminates, so
+`CHECK_DEADLOCK FALSE` is set (a terminal "all txns done" state is correct
+completion, not a stuck deadlock — true deadlock-freedom is the `NoDeadlock`
+invariant).
+
+### Invariants
+
+| Invariant | One-line meaning |
+|---|---|
+| `TypeOK` | Every variable is well-typed (`decision`/`phase`/`coordUp`/`voted`/`lockedBy`/`applied`). |
+| `Atomicity` | **No txn is partially applied**: for each txn, never a state where one ref it writes is `committed` while another ref of the *same* txn is `aborted`. The all-or-nothing guarantee `commit_atomic` returns. Falsifiable; see negative control. |
+| `NoDirtyRead` | A ref is `committed` for a txn **only if** that txn's durable decision is `commit` — a staged value becomes visible strictly *after* the commit point, never on a prepared-but-undecided ref. Readers observe committed state only. Falsifiable; see negative control. |
+| `NoDeadlock` | The no-wait lock discipline makes a cyclic wait impossible: whenever a txn *waits* on a ref locked by another (`WaitingOn`), the no-wait escape `PrepareNo` is **always** `ENABLED` — so the wait is never a block and no wait-for cycle can form. |
+| `NoDoubleCommitOfRef` | A ref is never `committed` by two distinct txns — the no-wait lock + CAS precondition let at most one of two concurrent committers of a shared ref win. |
+| `DecisionStable` | **DecisionDurability (safety):** a committed ref ⇒ the txn's decision is (and stays) `commit`; an aborted ref ⇒ the decision is not `commit`. A crash+resolve never flips a durable Commit to Abort or vice-versa (every `Decide`/`PresumedDecide` guards on `decision = "none"`, so no non-`none` decision is ever mutated). |
+| `DecisionDurability` (PROPERTY) | **Liveness:** once durably committed, every ref a txn writes *eventually* reaches `committed` (roll-forward completes under any crash interleaving); dually a durably-aborted txn's refs all reach `aborted`. Holds because Phase-2 actions need only the durable record (not a live coordinator) and are weakly fair. |
+
+### TLC output (clean run, `make check`)
+
+```
+Model checking completed. No error has been found.
+8391 states generated, 3315 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 16.
+```
+
+- States generated: **8,391**
+- Distinct states: **3,315**
+- Search depth: **16**
+- Invariant violations: **0** (six invariants + the `DecisionDurability` temporal property, 4 branches)
+- Wall time: **sub-second**
+
+---
+
 ## Negative controls (proving the invariants have teeth)
 
 TLA+ has no unit tests — the invariants *are* the tests, and TLC is the runner.
@@ -290,14 +369,15 @@ expected counterexample, proving the invariant actually constrains the model
 (is not vacuously true). This is the formal-methods equivalent of "watch the
 test fail first."
 
-Four negative controls are documented below, one per headline invariant:
+Five negative controls are documented below, one per headline invariant:
 `NoLostUpdate` (RefStore), `SnapshotIsolation` (RefStore), `GCSafety`
-(GcReachability), and `RoutingTotality` (Sharding). The RefStore/GC ones are
-built as throwaway copies under `/tmp` and are **not** committed; the Sharding
-one ships as a committed config (`Sharding_neg.cfg`, `BadRouting = TRUE`) and a
-`make neg` target, because a `CONSTANT` toggle makes it a clean, repeatable,
-zero-edit control. The `.tla` modules in this directory are all the clean
-ones.
+(GcReachability), `RoutingTotality` (Sharding), and `Atomicity`/`NoDirtyRead`
+(CrossShardTxn). The RefStore/GC ones are built as throwaway copies under
+`/tmp` and are **not** committed; the Sharding and CrossShardTxn ones ship as
+committed configs (`Sharding_neg.cfg`, `BadRouting = TRUE`; `CrossShardTxn_neg.cfg`,
+`BadCoord = TRUE`) with `make neg` / `make neg-txn` targets, because a `CONSTANT`
+toggle makes each a clean, repeatable, zero-edit control. The `.tla` modules in
+this directory are all the clean ones.
 
 ### RefStore — headline invariant `NoLostUpdate`
 
@@ -466,6 +546,67 @@ non-zero exit, so it is part of the suite's definition of "green."
 > the determinism invariants are non-vacuous — they genuinely depend on apply
 > being a pure function of `(state, op)`. The probe was removed after
 > confirmation; the committed module is the clean one.
+
+### CrossShardTxn — headline invariants `Atomicity` / `NoDirtyRead`
+
+Like the Sharding control, this ships as a committed `CONSTANT` toggle — a
+single repeatable command, no source edit. `CrossShardTxn.tla` exposes a
+`BadCoord` boolean: when `TRUE`, it enables `BadCommit(t, r)`, a **faulty
+coordinator** that rolls a ref *forward* (commit-prepared) with **no durable
+Commit decision**:
+
+```tla
+BadCommit(t, r) ==
+    /\ BadCoord
+    /\ lockedBy[r] = t
+    /\ applied[r][t] = "none"
+    /\ applied' = [applied EXCEPT ![r][t] = "committed"]   \* NO decision check!
+    ...
+```
+
+This is exactly the violation the real protocol forbids by ordering the durable
+`TxnDecide` **before** any `CommitPrepared`, and by the resolver never rolling
+forward without a durable Commit. `CrossShardTxn_neg.cfg` sets `BadCoord =
+TRUE`; everything else matches the clean instance, checking only the safety
+invariants `Atomicity` and `NoDirtyRead`.
+
+**Run it:**
+
+```sh
+make neg-txn
+# or directly:
+java -cp ~/.tla/tla2tools.jar tlc2.TLC -config CrossShardTxn_neg.cfg CrossShardTxn.tla
+```
+
+**Counterexample TLC produces** (TLC exits non-zero, `EXIT=12`; `make neg-txn`
+PASSES on that non-zero exit). `NoDirtyRead` fires first on the shortest trace
+— a ref committed with the decision still `none`:
+
+```
+Error: Invariant NoDirtyRead is violated.
+State 1: <Initial predicate>
+State 2: <PrepareYes("t1","rA")>   \* t1 locks rA, votes yes
+State 3: <BadCommit("t1","rA")>    \* rA -> "committed" while decision = "none"
+  \* applied[rA][t1] = "committed" but decision[t1] = "none" -> NoDirtyRead FALSE
+```
+
+`Atomicity` is **also** reachable under `BadCoord` (checking it in isolation
+yields a genuine split trace), proving the headline atomicity invariant has
+teeth too — t1 commits one ref while a sibling aborts:
+
+```
+Error: Invariant Atomicity is violated.
+State 2: <PrepareYes("t1","rA")>     \* t1 locks rA
+State 3: <Crash("t1")>               \* coordinator dies, no decision
+State 4: <PresumedAbortRef("t1","rS")>  \* rS presumed-aborted (released)
+State 5: <BadCommit("t1","rA")>      \* rA forced to "committed"
+  \* t1 has rA committed AND rS aborted -> a partial-applied SPLIT -> Atomicity FALSE
+```
+
+With `BadCoord = FALSE` (the default `CrossShardTxn.cfg`) every commit follows a
+durable `TxnDecide{commit}`, no split is reachable, and both invariants hold.
+The `make neg-txn` target asserts the non-zero exit, so it is part of the
+suite's definition of "green."
 
 ---
 
