@@ -21,7 +21,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ledge_core::{LedgeError, RefEntry, RefName, RefStore, Result, HLC};
+use ledge_core::{LedgeError, ObjectId, RefEntry, RefName, RefStore, Result, HLC};
+use ledge_ref_store::{AtomicCommit, AtomicCommitResult};
 
 use crate::id::WorkspaceId;
 use crate::lease::{Lease, LeaseStore};
@@ -36,6 +37,12 @@ pub struct WorkspaceManager {
     refs: Arc<dyn RefStore>,
     leases: Arc<LeaseStore>,
     hlc: Arc<HLC>,
+    /// All-or-nothing durable-ref promotion seam. Single-node injects
+    /// `ledge_ref_store::LocalAtomicCommit` (one ArcSwap root swap over the same
+    /// `RefStoreImpl`); clustered injects `ledge_cluster::TxnCoordinator` (single-
+    /// shard `RefBatch` fast path + multi-shard 2PC). Plugged in at assembly, so
+    /// this crate never depends on `ledge-cluster` (which would close a cycle).
+    coordinator: Arc<dyn AtomicCommit>,
 }
 
 /// A point-in-time view of a workspace: its id, governing lease, and the set of
@@ -89,9 +96,20 @@ fn client_ref(id: &WorkspaceId, stored: &str) -> String {
 }
 
 impl WorkspaceManager {
-    /// Construct a manager over a ref store, lease store, and shared clock.
-    pub fn new(refs: Arc<dyn RefStore>, leases: Arc<LeaseStore>, hlc: Arc<HLC>) -> Self {
-        Self { refs, leases, hlc }
+    /// Construct a manager over a ref store, lease store, shared clock, and the
+    /// atomic-commit seam used to promote workspace refs to durable refs.
+    pub fn new(
+        refs: Arc<dyn RefStore>,
+        leases: Arc<LeaseStore>,
+        hlc: Arc<HLC>,
+        coordinator: Arc<dyn AtomicCommit>,
+    ) -> Self {
+        Self {
+            refs,
+            leases,
+            hlc,
+            coordinator,
+        }
     }
 
     /// The storage prefix for a workspace's refs.
@@ -165,21 +183,29 @@ impl WorkspaceManager {
         Ok(lease)
     }
 
-    /// Promote workspace refs to durable targets via CAS. For each
-    /// `(ws_ref, durable_ref)` mapping:
+    /// Promote workspace refs to durable targets **atomically** (all-or-nothing).
+    /// For each `(ws_ref, durable_ref)` mapping:
     ///   - read the workspace ref entry; skip the mapping if it is absent
     ///     (nothing to promote — not an error, mirrors git's silent no-op);
-    ///   - read the current durable entry:
-    ///       * absent  => `update(durable, target, None)`            (create)
-    ///       * present => `update(durable, target, Some(cur.target))` (CAS)
-    ///   - `Ok`                => [`CommitOutcome::Ok`]
-    ///   - `Err(Conflict{..})` => [`CommitOutcome::Conflict`] (the durable ref
-    ///     moved under us — surface, do not overwrite)
-    ///   - any other error propagates.
+    ///   - read the current durable entry to form the CAS precondition:
+    ///       * absent  => `expected = None`            (create-only)
+    ///       * present => `expected = Some(cur.target)` (CAS)
+    /// then hand the ENTIRE promotion set to the injected [`AtomicCommit`] seam in
+    /// ONE call. Either every durable ref advances together ([`AtomicCommitResult::
+    /// Committed`] ⇒ every mapping is [`CommitOutcome::Ok`]) or NONE does
+    /// ([`AtomicCommitResult::Aborted`] ⇒ the conflicting refs surface as
+    /// [`CommitOutcome::Conflict`] and no durable ref moved). This is the change
+    /// from the old sequential per-ref loop, which could leave a partial commit
+    /// (first ref advanced, later ref failed); the seam makes the batch atomic
+    /// single-node (one `ArcSwap` swap) and cross-shard (2PC).
     ///
-    /// Does NOT release the workspace.
+    /// The `expected` snapshot is read here at build time; the coordinator
+    /// re-validates each precondition atomically at apply/prepare time, so a
+    /// concurrent durable mutation between the read and the apply still aborts the
+    /// whole batch (no lost update). Does NOT release the workspace.
     ///
-    /// Complexity: O(m) for m mappings (2 reads + 1 write each, worst case).
+    /// Complexity: O(m) ref reads to build the set + one atomic commit for m
+    /// mappings.
     #[tracing::instrument(skip(self, mappings), fields(id = %id, mappings = mappings.len()))]
     pub async fn commit(
         &self,
@@ -201,36 +227,56 @@ impl WorkspaceManager {
             }
         }
 
-        let mut outcomes = Vec::with_capacity(mappings.len());
-
+        // Build the (durable, target, expected) promotion set. A workspace ref
+        // that is absent is silently skipped (mirrors git's no-op).
+        let mut promotions: Vec<(RefName, ObjectId, Option<ObjectId>)> =
+            Vec::with_capacity(mappings.len());
         for (ws_ref, durable_ref) in mappings {
             let ws_entry = match self.refs.get(ws_ref).await? {
                 Some(e) => e,
                 None => continue, // nothing to promote from this workspace ref
             };
-
             let current = self.refs.get(durable_ref).await?;
             let expected = current.as_ref().map(|c| c.target);
+            promotions.push((durable_ref.clone(), ws_entry.target, expected));
+        }
 
-            match self
-                .refs
-                .update(durable_ref, ws_entry.target, expected)
-                .await
-            {
-                Ok(entry) => outcomes.push(CommitOutcome::Ok {
-                    target: durable_ref.as_str().to_string(),
+        if promotions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ATOMIC all-or-nothing promotion through the injected seam.
+        let result = self.coordinator.commit_atomic(promotions).await?;
+        let outcomes = match result {
+            // Every durable ref advanced together.
+            AtomicCommitResult::Committed(committed) => committed
+                .into_iter()
+                .map(|(name, entry)| CommitOutcome::Ok {
+                    target: name.as_str().to_string(),
                     entry,
-                }),
-                Err(LedgeError::Conflict { current }) => {
-                    outcomes.push(CommitOutcome::Conflict {
-                        target: durable_ref.as_str().to_string(),
+                })
+                .collect(),
+            // No durable ref advanced. Surface each conflicting ref carrying its
+            // LIVE durable entry (re-read for the state the caller must reconcile
+            // against). A create-only conflict means the durable ref now EXISTS
+            // (that is why the create lost), so the re-read returns `Some`; the
+            // absent fallback is defensive only.
+            AtomicCommitResult::Aborted { conflicts, .. } => {
+                let mut out = Vec::with_capacity(conflicts.len());
+                for name in conflicts {
+                    let current = self.refs.get(&name).await?.unwrap_or(RefEntry {
+                        target: ObjectId::from_bytes([0; 32]),
+                        version: 0,
+                        hlc: 0,
+                    });
+                    out.push(CommitOutcome::Conflict {
+                        target: name.as_str().to_string(),
                         current,
                     });
                 }
-                Err(other) => return Err(other),
+                out
             }
-        }
-
+        };
         Ok(outcomes)
     }
 
@@ -320,7 +366,12 @@ mod tests {
         let leases = Arc::new(
             LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("lease store"),
         );
-        let mgr = WorkspaceManager::new(refs, leases, hlc);
+        // Single-node atomic commit over the same concrete ref store: behavior is
+        // byte-identical to the old sequential loop for the happy path, but now
+        // genuinely all-or-nothing across every ref in one batch.
+        let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+            Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
+        let mgr = WorkspaceManager::new(refs, leases, hlc, coordinator);
         (mgr, dir)
     }
 
@@ -478,6 +529,109 @@ mod tests {
         // Commit does NOT release the workspace: its refs and lease persist.
         assert!(mgr.refs.get(&ws).await.unwrap().is_some());
         assert!(mgr.leases.get(view.id).await.unwrap().is_some());
+    }
+
+    /// A test-only [`AtomicCommit`] decorator that races a concurrent durable
+    /// mutation in BEFORE delegating, so exactly one mapping's CAS precondition
+    /// (the one `commit` read a moment earlier) is now stale at apply time. This
+    /// deterministically reproduces the "durable moved under us between read and
+    /// apply" window WITHOUT a flaky timing race, and proves the batch is
+    /// all-or-nothing: the stale ref aborts the WHOLE batch, so the other ref
+    /// (which would otherwise have committed under the old sequential loop) does
+    /// NOT advance.
+    struct RacingCommit {
+        inner: Arc<dyn AtomicCommit>,
+        /// The store the race mutates (the same one `commit` reads + the seam
+        /// writes), so the mutation is observed by the inner commit's preconditions.
+        store: Arc<RefStoreImpl>,
+        /// The durable ref to bump (to a value that invalidates `commit`'s snapshot).
+        victim: RefName,
+        /// What the victim currently is (the value `commit` will read), so we can
+        /// CAS it forward to a different value that makes the snapshot stale.
+        from: ObjectId,
+        to: ObjectId,
+    }
+
+    #[async_trait::async_trait]
+    impl AtomicCommit for RacingCommit {
+        async fn commit_atomic(
+            &self,
+            mappings: Vec<(RefName, ObjectId, Option<ObjectId>)>,
+        ) -> Result<AtomicCommitResult> {
+            // Race: move the victim durable forward so the `expected` snapshot the
+            // manager just read for it is now stale. The inner atomic commit will
+            // re-evaluate ALL preconditions against THIS post-race root.
+            self.store
+                .update(&self.victim, self.to, Some(self.from))
+                .await
+                .unwrap();
+            self.inner.commit_atomic(mappings).await
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_two_durable_refs_is_atomic_on_conflict() {
+        // Build a manager whose coordinator races a durable mutation in before the
+        // atomic apply, so one mapping's precondition is stale at apply time.
+        let dir = TempDir::new().expect("tempdir");
+        let hlc = Arc::new(HLC::new());
+        let refs =
+            Arc::new(RefStoreImpl::open(dir.path().join("refs"), hlc.clone()).expect("ref store"));
+        let leases =
+            Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("leases"));
+
+        // Sources + their forked workspace refs.
+        let s1 = r("refs/heads/one");
+        let s2 = r("refs/heads/two");
+        refs.update(&s1, oid(1), None).await.unwrap();
+        refs.update(&s2, oid(2), None).await.unwrap();
+
+        // Durable d1 pre-exists at oid(5); d2 is absent. The race will move d1 to
+        // oid(9) AFTER `commit` reads its expected (oid(5)), so d1's CAS aborts.
+        let d1 = r("refs/heads/dst1");
+        let d2 = r("refs/heads/dst2");
+        refs.update(&d1, oid(5), None).await.unwrap();
+
+        let inner: Arc<dyn AtomicCommit> = Arc::new(ledge_ref_store::LocalAtomicCommit::new(
+            refs.clone(),
+        ));
+        let coordinator: Arc<dyn AtomicCommit> = Arc::new(RacingCommit {
+            inner,
+            store: refs.clone(),
+            victim: d1.clone(),
+            from: oid(5),
+            to: oid(9),
+        });
+        let mgr = WorkspaceManager::new(refs.clone(), leases, hlc, coordinator);
+
+        let view = mgr
+            .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        let ws1 = workspace_ref(&view.id, &s1).unwrap();
+        let ws2 = workspace_ref(&view.id, &s2).unwrap();
+
+        // commit reads d1=oid(5) (expected Some(5)) and d2 absent (expected None).
+        // The racing coordinator then bumps d1→oid(9), so d1's CAS is stale ⇒ the
+        // WHOLE batch aborts. Under the OLD sequential loop ws2→d2 would have
+        // committed first; the atomic seam guarantees it does NOT.
+        let outcomes = mgr
+            .commit(view.id, &[(ws1, d1.clone()), (ws2, d2.clone())])
+            .await
+            .unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, CommitOutcome::Conflict { target, .. } if target == d1.as_str())),
+            "d1 must be reported as the conflict, got {outcomes:?}"
+        );
+        // Atomicity: d1 stays at the raced value oid(9) (never advanced to oid(1));
+        // d2 was NEVER created (the abort rolled back the whole batch).
+        assert_eq!(mgr.refs.get(&d1).await.unwrap().unwrap().target, oid(9));
+        assert!(
+            mgr.refs.get(&d2).await.unwrap().is_none(),
+            "d2 must NOT be created (atomic abort)"
+        );
     }
 
     #[tokio::test]
