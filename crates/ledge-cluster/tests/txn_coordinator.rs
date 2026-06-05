@@ -537,3 +537,79 @@ async fn resolver_idempotent_re_resolve() {
     assert_eq!(second, 0, "re-resolve is a no-op");
     assert_eq!(store1.get(&a).await.unwrap().unwrap().target, oid(7));
 }
+
+/// End-to-end: a real [`WorkspaceManager`] over a [`ClusterRefStore`] +
+/// [`TxnCoordinator`] promotes TWO workspace refs whose durable targets live on
+/// DISTINCT shards in ONE `commit` — forcing the cross-shard 2PC path through the
+/// workspace API — and BOTH durable refs advance atomically. This proves the
+/// Task-5 seam (workspace commit → `dyn AtomicCommit`) is wired correctly for the
+/// clustered build and that cross-shard workspace commits are all-or-nothing.
+#[tokio::test]
+async fn workspace_commit_cross_shard_is_atomic() {
+    use ledge_core::HLC;
+    use ledge_workspace::lease::LeaseStore;
+    use ledge_workspace::manager::{CommitOutcome, WorkspaceManager};
+    use std::time::Duration;
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+
+    // Two durable sources that route to DISTINCT shards (forces 2PC at commit).
+    let (s1, s2) = cluster.two_names_on_distinct_shards();
+    assert_ne!(
+        cluster.router().shard_for(s1.as_str()),
+        cluster.router().shard_for(s2.as_str())
+    );
+    store1.update(&s1, oid(1), None).await.unwrap();
+    store1.update(&s2, oid(2), None).await.unwrap();
+
+    // Workspace manager over the SAME cluster store; coordinator = TxnCoordinator.
+    let dir = tempfile::TempDir::new().unwrap();
+    let hlc = Arc::new(HLC::new());
+    let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
+    let coordinator: Arc<dyn AtomicCommit> = Arc::new(TxnCoordinator::new(store1.clone()));
+    let refs_dyn: Arc<dyn RefStore> = store1.clone();
+    let mgr = WorkspaceManager::new(refs_dyn, leases, hlc, coordinator);
+
+    // Fork both sources; the manager re-roots each under refs/workspaces/<id>/.
+    let view = mgr
+        .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    // The forked workspace ref names follow the manager's rebase rule:
+    // refs/X → refs/workspaces/<id>/X. Derive them so we can advance each forward.
+    let ws_name = |src: &RefName| -> RefName {
+        let suffix = src.as_str().strip_prefix("refs/").unwrap();
+        RefName::new(&format!(
+            "refs/workspaces/{}/{}",
+            view.id.to_hex(),
+            suffix
+        ))
+        .unwrap()
+    };
+    let ws1 = ws_name(&s1);
+    let ws2 = ws_name(&s2);
+
+    // Move the workspace refs forward (the fork copied the source targets) so the
+    // commit promotes NEW targets onto the durable sources.
+    store1.update(&ws1, oid(11), Some(oid(1))).await.unwrap();
+    store1.update(&ws2, oid(22), Some(oid(2))).await.unwrap();
+
+    // Commit ws1→s1 and ws2→s2 in one call. s1/s2 are on distinct shards ⇒ the
+    // coordinator runs cross-shard 2PC; both must commit atomically.
+    let outcomes = mgr
+        .commit(view.id, &[(ws1, s1.clone()), (ws2, s2.clone())])
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 2, "both mappings promoted");
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, CommitOutcome::Ok { .. })),
+        "every mapping must be Ok, got {outcomes:?}"
+    );
+
+    // BOTH durable sources advanced atomically across the two shards.
+    assert_eq!(store1.get(&s1).await.unwrap().unwrap().target, oid(11));
+    assert_eq!(store1.get(&s2).await.unwrap().unwrap().target, oid(22));
+}
