@@ -35,3 +35,7 @@ futures = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros", "rt-multi-thread"] }
+# Thread-local DebuggingRecorder for deterministic metric-counter assertions in
+# the txn-coordinator integration suite (already in the lock graph transitively
+# via metrics-exporter-prometheus; pinned to match).
+metrics-util = "0.19"
