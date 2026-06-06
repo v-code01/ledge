@@ -4,5 +4,7 @@
 //! `AppState` carries.
 
 pub mod principal;
+pub mod store;
 
 pub use principal::{Principal, PrincipalKind, Scopes};
+pub use store::{ApiKeyRecord, AuthStore};
