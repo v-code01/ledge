@@ -50,6 +50,11 @@ pub struct GcStats {
     pub reachable: usize,
     pub reclaimed: usize,
     pub bytes_freed: u64,
+    /// Candidates retained THIS pass solely because they are younger than the
+    /// grace window (distributed GC only; the single-node `Gc` has no grace
+    /// fence and always leaves this `0`). Observability so operators can see the
+    /// grace window's effect (spec §4.1).
+    pub skipped_grace: usize,
 }
 
 /// Wall-clock milliseconds since the Unix epoch, used for lease-liveness checks.
@@ -145,6 +150,9 @@ impl Gc {
             reachable: reachable_count,
             reclaimed,
             bytes_freed,
+            // The single-node Gc has no grace fence: every unreachable candidate
+            // is swept immediately, so none is ever retained by grace.
+            skipped_grace: 0,
         };
 
         // Structured pass summary (spec §9): roots, candidates, reachable,
@@ -290,6 +298,16 @@ mod tests {
             hlc: 0,
             generation: 0,
         }
+    }
+
+    // 0 ───────────────────────────────────────────────────────────────────────
+    #[test]
+    fn gc_stats_has_skipped_grace_default_zero() {
+        let s = GcStats::default();
+        assert_eq!(s.skipped_grace, 0, "skipped_grace defaults to 0");
+        // The single-node Gc never sets it, so a clone preserves the default.
+        let back = s.clone();
+        assert_eq!(back.skipped_grace, 0);
     }
 
     // 1 ───────────────────────────────────────────────────────────────────────

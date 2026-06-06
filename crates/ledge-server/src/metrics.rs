@@ -314,6 +314,7 @@ mod tests {
             reachable: 7,
             reclaimed: 3,
             bytes_freed: 4096,
+            skipped_grace: 0,
         };
         record_gc_run(&stats, std::time::Duration::from_millis(8));
     }
