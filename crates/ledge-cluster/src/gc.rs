@@ -28,6 +28,21 @@ use ledge_workspace::GcStats;
 
 use crate::ref_store::ClusterRefStore;
 
+/// Prometheus metric names emitted by `ClusterGc::run` at the true site.
+///
+/// Re-declared identically in `ledge-server::metrics` so both crates agree on the
+/// series (the `forward.rs::REF_OP_FORWARDED_TOTAL` pattern). Emitting here means
+/// a metric is recorded whether the pass is triggered via `/admin/gc` or a
+/// `/cluster/gc` fan-out leg; the route layer therefore does NOT also call
+/// `metrics::record_gc_run` for the cluster path (that would double-count
+/// `GC_RUNS_TOTAL`).
+pub const GC_RUNS_TOTAL: &str = "ledge_gc_runs_total";
+pub const GC_OBJECTS_RECLAIMED_TOTAL: &str = "ledge_gc_objects_reclaimed_total";
+pub const GC_BYTES_FREED_TOTAL: &str = "ledge_gc_bytes_freed_total";
+pub const GC_DURATION: &str = "ledge_gc_duration_seconds";
+pub const GC_GRACE_RETAINED: &str = "ledge_gc_grace_retained";
+pub const GC_ROOTS: &str = "ledge_gc_roots";
+
 /// Node-local distributed-GC driver. Holds shared handles only; no per-pass state.
 pub struct ClusterGc {
     /// Hosted-shard committed refs + prepared 2PC locks (the cross-shard roots).
@@ -117,6 +132,11 @@ impl ClusterGc {
             }
         }
 
+        // ── Emit root-count gauges (last-pass, labeled by source — spec §7) ──
+        metrics::gauge!(GC_ROOTS, "kind" => "committed").set(committed_roots as f64);
+        metrics::gauge!(GC_ROOTS, "kind" => "prepared").set(prepared_roots as f64);
+        metrics::gauge!(GC_ROOTS, "kind" => "lease").set(lease_roots as f64);
+
         // ── 4. Mark ──────────────────────────────────────────────────────────
         let reachable: HashSet<ObjectId> = graph::reachable_from(&self.objects, roots).await?;
         let reachable_count = reachable.len();
@@ -187,6 +207,13 @@ impl ClusterGc {
             duration_ms = start.elapsed().as_millis(),
             "cluster gc pass complete"
         );
+
+        // ── Emit pass counters/histogram/gauge at the true site (spec §7) ────
+        metrics::counter!(GC_RUNS_TOTAL).increment(1);
+        metrics::counter!(GC_OBJECTS_RECLAIMED_TOTAL).increment(stats.reclaimed as u64);
+        metrics::counter!(GC_BYTES_FREED_TOTAL).increment(stats.bytes_freed);
+        metrics::histogram!(GC_DURATION).record(start.elapsed().as_secs_f64());
+        metrics::gauge!(GC_GRACE_RETAINED).set(stats.skipped_grace as f64);
 
         Ok(stats)
     }

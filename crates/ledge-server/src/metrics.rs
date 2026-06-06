@@ -21,6 +21,8 @@ pub const GC_RUNS_TOTAL: &str = "ledge_gc_runs_total";
 pub const GC_OBJECTS_RECLAIMED_TOTAL: &str = "ledge_gc_objects_reclaimed_total";
 pub const GC_BYTES_FREED_TOTAL: &str = "ledge_gc_bytes_freed_total";
 pub const GC_DURATION: &str = "ledge_gc_duration_seconds";
+pub const GC_GRACE_RETAINED: &str = "ledge_gc_grace_retained";
+pub const GC_ROOTS: &str = "ledge_gc_roots";
 pub const SNAPSHOTS_TOTAL: &str = "ledge_snapshots_total";
 pub const SNAPSHOT_FILES_TOTAL: &str = "ledge_snapshot_files_total";
 pub const SNAPSHOT_BYTES_TOTAL: &str = "ledge_snapshot_bytes_total";
@@ -94,12 +96,26 @@ pub fn record_workspace_commit(n: u64) { metrics::counter!(WORKSPACE_COMMITS_TOT
 pub fn record_workspace_release() { metrics::counter!(WORKSPACE_RELEASES_TOTAL).increment(1); }
 pub fn record_lease_expired(n: u64) { metrics::counter!(LEASES_EXPIRED_TOTAL).increment(n); }
 
-/// Record one GC pass: bump the run counter, reclaimed/bytes counters, duration histogram.
+/// Record one GC pass: bump the run counter, reclaimed/bytes counters, the
+/// duration histogram, AND the last-pass grace-retained gauge (0 for single-node).
+///
+/// Used by the single-node `Gc::run` path (`admin_gc`); the cluster path emits the
+/// same series at its true site in [`ledge_cluster::gc::ClusterGc::run`] (which
+/// re-declares these identical names), so the route does NOT call this for the
+/// cluster branch — calling it there would double-count `GC_RUNS_TOTAL`.
 pub fn record_gc_run(stats: &ledge_workspace::GcStats, d: std::time::Duration) {
     metrics::counter!(GC_RUNS_TOTAL).increment(1);
     metrics::counter!(GC_OBJECTS_RECLAIMED_TOTAL).increment(stats.reclaimed as u64);
     metrics::counter!(GC_BYTES_FREED_TOTAL).increment(stats.bytes_freed);
     metrics::histogram!(GC_DURATION).record(d.as_secs_f64());
+    metrics::gauge!(GC_GRACE_RETAINED).set(stats.skipped_grace as f64);
+}
+
+/// Set the last-pass root-count gauge for one root source (`kind` ∈
+/// `committed`/`prepared`/`lease`). Emitted by `ClusterGc::run` (spec §7); the
+/// single-node `Gc` has no cross-shard/prepared root split and does not call it.
+pub fn set_gc_roots(kind: &'static str, n: u64) {
+    metrics::gauge!(GC_ROOTS, "kind" => kind).set(n as f64);
 }
 
 /// Record one CoW snapshot: bump the run counter, files/bytes/reflinked/copied
@@ -273,6 +289,16 @@ mod tests {
     }
 
     #[test]
+    fn gc_metric_names_match_spec() {
+        assert_eq!(GC_RUNS_TOTAL, "ledge_gc_runs_total");
+        assert_eq!(GC_OBJECTS_RECLAIMED_TOTAL, "ledge_gc_objects_reclaimed_total");
+        assert_eq!(GC_BYTES_FREED_TOTAL, "ledge_gc_bytes_freed_total");
+        assert_eq!(GC_DURATION, "ledge_gc_duration_seconds");
+        assert_eq!(GC_GRACE_RETAINED, "ledge_gc_grace_retained");
+        assert_eq!(GC_ROOTS, "ledge_gc_roots");
+    }
+
+    #[test]
     fn snapshot_metric_constants_correct() {
         assert_eq!(SNAPSHOTS_TOTAL, "ledge_snapshots_total");
         assert_eq!(SNAPSHOT_DURATION, "ledge_snapshot_duration_seconds");
@@ -317,5 +343,8 @@ mod tests {
             skipped_grace: 0,
         };
         record_gc_run(&stats, std::time::Duration::from_millis(8));
+        set_gc_roots("committed", 4);
+        set_gc_roots("prepared", 1);
+        set_gc_roots("lease", 2);
     }
 }

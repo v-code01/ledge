@@ -371,7 +371,8 @@ pub async fn admin_gc(State(state): State<AppState>) -> Response {
             .unwrap_or(0);
         return match cgc.run(now).await {
             Ok(stats) => {
-                metrics::record_gc_run(&stats, start.elapsed());
+                // `ClusterGc::run` emits the `ledge_gc_*` series at its true site;
+                // recording here too would double-count `GC_RUNS_TOTAL`.
                 (StatusCode::OK, Json(stats)).into_response()
             }
             Err(e) => {

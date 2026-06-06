@@ -400,9 +400,10 @@ async fn run_local_gc(state: &AppState) -> std::result::Result<GcStats, String> 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let start = std::time::Instant::now();
+    // No route-level `record_gc_run` here: `ClusterGc::run` emits the `ledge_gc_*`
+    // series (incl. `GC_RUNS_TOTAL`) at its true site. Recording here too would
+    // double-count the run counter for the cluster path.
     let stats = gc.run(now).await.map_err(|e| e.to_string())?;
-    crate::metrics::record_gc_run(&stats, start.elapsed());
     Ok(stats)
 }
 
