@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod auth;
 pub mod cluster_routes;
 pub mod config;
 pub mod metrics;
@@ -7,6 +8,7 @@ pub mod routes;
 pub mod rpc_routes;
 pub mod workspace_routes;
 
+pub use auth::{Principal, Scopes};
 pub use routes::AppState;
 
 use std::sync::Arc;
