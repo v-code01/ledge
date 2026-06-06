@@ -127,6 +127,7 @@ mod tests {
             raft_shards: None,
             cluster_refs: None,
             shard_map: None,
+            cluster_gc: None,
         };
         (state, dir, objects)
     }

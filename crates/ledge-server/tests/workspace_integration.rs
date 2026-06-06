@@ -43,6 +43,7 @@ async fn start_server() -> (String, TempDir) {
         raft_shards: None,
         cluster_refs: None,
         shard_map: None,
+        cluster_gc: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

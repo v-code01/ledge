@@ -58,6 +58,11 @@ pub struct AppState {
     /// consistent with the other cluster routes. It is the SAME `Arc` underlying
     /// `refs` in cluster mode (one store, two views).
     pub cluster_refs: Option<Arc<ledge_cluster::ClusterRefStore>>,
+    /// The node-local distributed-GC driver, when `cluster.enabled`. `POST
+    /// /admin/gc` runs THIS via `ClusterGc::run` in cluster mode; `POST
+    /// /cluster/gc` fans out and aggregates. `None` single-node ⇒ `/admin/gc`
+    /// falls back to the single-node `gc`, and `/cluster/gc` 503s.
+    pub cluster_gc: Option<Arc<ledge_cluster::gc::ClusterGc>>,
     /// The authoritative shard map, when `cluster.enabled`. Lets `/cluster/ref-op`
     /// answer "you misrouted — shard S lives on these members" and lets
     /// `/cluster/status` report declared placement (members) for EVERY shard, not

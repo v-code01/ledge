@@ -70,6 +70,7 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
         raft_shards,
         cluster_refs: None,
         shard_map: None,
+        cluster_gc: None,
     }
 }
 
@@ -294,6 +295,15 @@ fn cluster_state(
         }
     }
     let handles = Arc::new(hosted);
+    // The node-local distributed-GC driver: same handles `main.rs` wires into the
+    // cluster `AppState`, so `/admin/gc` and `/cluster/gc?local=true` exercise the
+    // real `ClusterGc::run` here. Grace 0 ⇒ the fence never retains in the test.
+    let cluster_gc = Arc::new(ledge_cluster::gc::ClusterGc::new(
+        cluster_refs.clone(),
+        leases.clone(),
+        objects.clone(),
+        std::time::Duration::from_secs(0),
+    ));
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),
@@ -306,6 +316,7 @@ fn cluster_state(
         raft_shards: Some(handles),
         cluster_refs: Some(cluster_refs),
         shard_map: Some(map.clone()),
+        cluster_gc: Some(cluster_gc),
     }
 }
 
@@ -430,6 +441,115 @@ async fn cluster_ref_op_503_when_single_node() {
                 .method("POST")
                 .uri("/cluster/ref-op")
                 .body(Body::from(vec![0u8; 4]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn admin_gc_cluster_path_runs_cluster_gc() {
+    // Cluster-mode AppState (`cluster_gc` is `Some`): `/admin/gc` must run the
+    // node-local `ClusterGc::run` and return its `GcStats` JSON (200). On a fresh
+    // store the sweep finds nothing to reclaim, so it is a clean, valid pass.
+    let map = two_shard_map();
+    let cluster = MultiShardCluster::start_placed(&map).await;
+    let dir = TempDir::new().unwrap();
+    let app = build_app(cluster_state(&dir, &cluster, 1, &map));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/gc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let stats: ledge_workspace::GcStats = serde_json::from_slice(&out).unwrap();
+    assert_eq!(stats.reclaimed, 0, "fresh store: nothing to reclaim");
+}
+
+#[tokio::test]
+async fn cluster_gc_local_leg_returns_gcstats() {
+    // `/cluster/gc?local=true` runs ONLY this node's pass (no fan-out) and returns
+    // a bare `GcStats` JSON — the shape the coordinator leg aggregates per node.
+    let map = two_shard_map();
+    let cluster = MultiShardCluster::start_placed(&map).await;
+    let dir = TempDir::new().unwrap();
+    let app = build_app(cluster_state(&dir, &cluster, 1, &map));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/gc?local=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let _stats: ledge_workspace::GcStats = serde_json::from_slice(&out).unwrap();
+}
+
+#[tokio::test]
+async fn cluster_gc_coordinator_reports_downed_peers_as_error_entries() {
+    // Coordinator leg (no `?local`): node 1 hosts shard 0; the map's peers (nodes
+    // 2,3 at unreachable `http://nN` addrs) are fanned out to and fail. The sweep
+    // must STILL return 200 ClusterGcStats — a downed peer is an Error entry, not
+    // a whole-sweep failure — with node 1's own pass recorded as an Ok entry.
+    let map = two_shard_map();
+    let cluster = MultiShardCluster::start_placed(&map).await;
+    let dir = TempDir::new().unwrap();
+    let app = build_app(cluster_state(&dir, &cluster, 1, &map));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/gc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let agg: ledge_server::cluster_routes::ClusterGcStats =
+        serde_json::from_slice(&out).unwrap();
+    // Node 1's own pass is an Ok entry; nodes 2 and 3 are unreachable Error entries.
+    let mine = agg.per_node.iter().find(|(n, _)| *n == 1).expect("self entry present");
+    assert!(
+        matches!(mine.1, ledge_server::cluster_routes::NodeGcOutcome::Ok(_)),
+        "this node's own pass succeeds"
+    );
+    let downed = agg
+        .per_node
+        .iter()
+        .filter(|(n, o)| {
+            *n != 1 && matches!(o, ledge_server::cluster_routes::NodeGcOutcome::Error(_))
+        })
+        .count();
+    assert_eq!(downed, 2, "both unreachable peers are Error entries, not a failure");
+}
+
+#[tokio::test]
+async fn cluster_gc_503_when_single_node() {
+    // Single-node AppState (`cluster_gc` None) → `/cluster/gc` is inert (503).
+    let dir = TempDir::new().unwrap();
+    let app = build_app(state_with_shards(&dir, None));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/gc")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await

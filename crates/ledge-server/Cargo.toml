@@ -26,7 +26,7 @@ ledge-rpc          = { path = "../ledge-rpc" }
 ledge-cluster      = { path = "../ledge-cluster" }
 ledge-raft         = { path = "../ledge-raft" }
 openraft.workspace          = true
-reqwest.workspace           = true
+reqwest                     = { workspace = true, features = ["json"] }
 bincode.workspace           = true
 axum.workspace              = true
 tower.workspace             = true

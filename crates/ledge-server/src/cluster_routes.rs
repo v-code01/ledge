@@ -29,6 +29,7 @@ use tracing::warn;
 use ledge_cluster::net_http::{handle_rpc, RpcKind};
 use ledge_cluster::{ClusterOp, ShardId};
 use ledge_raft::{Node, NodeId};
+use ledge_workspace::GcStats;
 
 use crate::routes::{AppState, ClusterHandles};
 
@@ -343,6 +344,132 @@ pub async fn cluster_status(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(ClusterStatus { shards: out })).into_response()
 }
 
+/// Per-node outcome of a `/cluster/gc` fan-out leg: a node's `GcStats`, or an
+/// error string when that node was unreachable / its pass failed. A downed node
+/// is an `Error` entry — it does NOT fail the whole sweep (each node's pass is
+/// independent and safe in isolation, spec §4.6).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", content = "value", rename_all = "lowercase")]
+pub enum NodeGcOutcome {
+    Ok(GcStats),
+    Error(String),
+}
+
+/// `POST /cluster/gc` response: every node's outcome + the summed totals.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterGcStats {
+    /// `(node_id, outcome)` for every node in the shard map.
+    pub per_node: Vec<(u64, NodeGcOutcome)>,
+    /// Sum over the `Ok` nodes (error nodes contribute nothing).
+    pub totals: GcStats,
+}
+
+impl ClusterGcStats {
+    /// Build from per-node outcomes, summing the `Ok` ones into `totals`.
+    pub fn from_entries(per_node: Vec<(u64, NodeGcOutcome)>) -> Self {
+        let mut totals = GcStats::default();
+        for (_node, outcome) in &per_node {
+            if let NodeGcOutcome::Ok(s) = outcome {
+                totals.scanned += s.scanned;
+                totals.reachable += s.reachable;
+                totals.reclaimed += s.reclaimed;
+                totals.bytes_freed += s.bytes_freed;
+                totals.skipped_grace += s.skipped_grace;
+            }
+        }
+        Self { per_node, totals }
+    }
+}
+
+/// Query flag: a `?local=true` leg runs ONLY this node's local pass and returns
+/// its `GcStats` (no further fan-out), avoiding infinite re-fan.
+#[derive(Debug, Deserialize, Default)]
+pub struct GcQuery {
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// Run THIS node's local `ClusterGc::run` with a wall-clock `now` (seconds).
+/// Returns the pass `GcStats`, or an error string mapped by the caller.
+async fn run_local_gc(state: &AppState) -> std::result::Result<GcStats, String> {
+    let gc = state
+        .cluster_gc
+        .as_ref()
+        .ok_or_else(|| "not clustered".to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let start = std::time::Instant::now();
+    let stats = gc.run(now).await.map_err(|e| e.to_string())?;
+    crate::metrics::record_gc_run(&stats, start.elapsed());
+    Ok(stats)
+}
+
+/// `POST /cluster/gc` — trigger distributed GC. Without `?local=true` this is the
+/// coordinator leg: run THIS node's pass, then fan `POST /cluster/gc?local=true`
+/// out to every OTHER node in the map and aggregate. With `?local=true` it runs
+/// only the local pass and returns its `GcStats` JSON (no further fan-out).
+///
+/// - `503` if not clustered.
+/// - `200` `GcStats` JSON for a `?local=true` leg.
+/// - `200` `ClusterGcStats` JSON for the coordinator leg (a downed peer is an
+///   error entry, never a whole-sweep failure).
+pub async fn cluster_gc(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<GcQuery>,
+) -> Response {
+    let map = match (&state.cluster_gc, &state.shard_map) {
+        (Some(_), Some(m)) => m.clone(),
+        _ => return not_clustered(),
+    };
+
+    // `?local=true` leg: just this node's pass.
+    if q.local {
+        return match run_local_gc(&state).await {
+            Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+            Err(e) => {
+                warn!(error = %e, "local cluster gc failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+            }
+        };
+    }
+
+    // Coordinator leg: this node's pass first.
+    let me = state.cluster_refs.as_ref().map(|r| r.node_id()).unwrap_or(0);
+    let mut per_node: Vec<(u64, NodeGcOutcome)> = Vec::new();
+    match run_local_gc(&state).await {
+        Ok(stats) => per_node.push((me, NodeGcOutcome::Ok(stats))),
+        Err(e) => per_node.push((me, NodeGcOutcome::Error(e))),
+    }
+
+    // Fan `?local=true` out to every OTHER node, deduped by addr. A downed peer
+    // becomes an `Error` entry — it never aborts the sweep (each node's pass is
+    // independent and safe in isolation).
+    let client = reqwest::Client::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for s in 0..map.num_shards() {
+        for rep in map.members(ShardId(s)) {
+            if rep.node_id == me || !seen.insert(rep.addr.clone()) {
+                continue;
+            }
+            let url = format!("{}/cluster/gc?local=true", rep.addr.trim_end_matches('/'));
+            let outcome = match client.post(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.json::<GcStats>().await {
+                    Ok(stats) => NodeGcOutcome::Ok(stats),
+                    Err(e) => NodeGcOutcome::Error(format!("decode {}: {e}", rep.addr)),
+                },
+                Ok(resp) => NodeGcOutcome::Error(format!("{} status {}", rep.addr, resp.status())),
+                Err(e) => NodeGcOutcome::Error(format!("{} unreachable: {e}", rep.addr)),
+            };
+            per_node.push((rep.node_id, outcome));
+        }
+    }
+
+    per_node.sort_by_key(|(n, _)| *n);
+    (StatusCode::OK, Json(ClusterGcStats::from_entries(per_node))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +571,25 @@ mod tests {
         let (decoded, _): ((ShardId, ClusterOp), usize) =
             bincode::serde::decode_from_slice(&tuple_bytes, cfg).unwrap();
         assert_eq!(decoded.0, ShardId(1));
+    }
+
+    #[test]
+    fn cluster_gc_stats_aggregates_totals() {
+        use ledge_workspace::GcStats;
+        let a = GcStats { scanned: 5, reachable: 3, reclaimed: 2, bytes_freed: 100, skipped_grace: 1 };
+        let b = GcStats { scanned: 4, reachable: 4, reclaimed: 0, bytes_freed: 0, skipped_grace: 0 };
+        let agg = ClusterGcStats::from_entries(vec![
+            (1, NodeGcOutcome::Ok(a.clone())),
+            (2, NodeGcOutcome::Ok(b.clone())),
+            (3, NodeGcOutcome::Error("unreachable".into())),
+        ]);
+        assert_eq!(agg.totals.reclaimed, 2, "totals sum only the Ok nodes");
+        assert_eq!(agg.totals.bytes_freed, 100);
+        assert_eq!(agg.totals.skipped_grace, 1);
+        assert_eq!(agg.per_node.len(), 3, "a downed node is an entry, not a failure");
+        let j = serde_json::to_string(&agg).unwrap();
+        let back: ClusterGcStats = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.totals.reclaimed, 2);
     }
 
     #[test]

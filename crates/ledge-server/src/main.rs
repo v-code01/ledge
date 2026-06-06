@@ -234,6 +234,23 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Distributed-GC driver (cluster only): the node-local `ClusterGc` that
+    //    `/admin/gc` runs in cluster mode and `/cluster/gc` fans out. It needs the
+    //    concrete cluster ref store (hosted-shard roots + prepared 2PC locks), the
+    //    node-local leases, and the node-local disk store as its sweep target.
+    //    `leases` is built by `build_workspace_stack_dyn` (above), which is why
+    //    this is assembled here rather than inside `build_cluster_stack`. Grace
+    //    defaults to 1h (spec §4.4) to fence the object-resurrection race. `None`
+    //    single-node ⇒ `/admin/gc` keeps the byte-identical single-node `Gc::run`.
+    let cluster_gc = cluster_refs.as_ref().map(|refs| {
+        Arc::new(ledge_cluster::gc::ClusterGc::new(
+            refs.clone(),
+            leases.clone(),
+            objects.clone(),
+            std::time::Duration::from_secs(3600),
+        ))
+    });
+
     let app = build_app(AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
         // concrete local stores up-cast in single-node mode (byte-identical to
@@ -251,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
         raft_shards,
         cluster_refs,
         shard_map,
+        cluster_gc,
     });
     let addr: SocketAddr = cfg
         .server

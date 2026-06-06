@@ -287,6 +287,10 @@ pub fn build_app(state: AppState) -> Router {
             "/cluster/ref-op",
             axum::routing::post(cluster_routes::cluster_ref_op),
         )
+        .route(
+            "/cluster/gc",
+            axum::routing::post(cluster_routes::cluster_gc),
+        )
         // ── Object replication (spec §2.5) — content-addressed peer endpoints.
         // Active in both modes: in single-node they harmlessly serve the local
         // node's objects; in cluster mode they are the HttpObjectPeer transport

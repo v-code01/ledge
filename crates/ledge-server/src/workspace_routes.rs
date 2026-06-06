@@ -357,9 +357,29 @@ pub async fn delete_workspace(State(state): State<AppState>, Path(id): Path<Stri
     }
 }
 
-/// POST /admin/gc
+/// POST /admin/gc — run garbage collection on THIS node.
+///
+/// Cluster mode (`AppState.cluster_gc` is `Some`): run the node-local
+/// `ClusterGc::run` (cross-shard roots + grace fence). Single-node (`None`): the
+/// existing single-node `Gc::run` (byte-identical behavior).
 pub async fn admin_gc(State(state): State<AppState>) -> Response {
     let start = std::time::Instant::now();
+    if let Some(cgc) = &state.cluster_gc {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return match cgc.run(now).await {
+            Ok(stats) => {
+                metrics::record_gc_run(&stats, start.elapsed());
+                (StatusCode::OK, Json(stats)).into_response()
+            }
+            Err(e) => {
+                warn!(error = %e, "cluster gc failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
     match state.gc.run().await {
         Ok(stats) => {
             metrics::record_gc_run(&stats, start.elapsed());
@@ -492,6 +512,7 @@ mod route_tests {
             raft_shards: None,
             cluster_refs: None,
             shard_map: None,
+            cluster_gc: None,
         }
     }
 
