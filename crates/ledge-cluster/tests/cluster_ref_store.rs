@@ -320,6 +320,82 @@ async fn cluster_update_replicates_to_all_replicas_of_shard() {
 // ---------------------------------------------------------------------------
 // Stale-mode read: local SM, no linearizability barrier (D2 toggle).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phase 4c Task 1 — committed_targets_by_shard: leader-linearized committed
+// ref targets for every LOCALLY-hosted shard; non-hosted shards excluded.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_targets_by_shard_returns_hosted_shard_targets() {
+    use ledge_cluster::router::ShardId;
+    use ledge_cluster::shard_map::{Replica, ShardMap};
+    use ledge_cluster::testkit::MultiShardCluster;
+    use ledge_core::{ObjectId, RefStore};
+
+    fn oid(n: u8) -> ObjectId {
+        let mut b = [0u8; 32];
+        b[31] = n;
+        ObjectId::from_bytes(b)
+    }
+
+    // 2 shards × 3 nodes; node 1 hosts BOTH shards, node 2 hosts ONLY shard 0.
+    let cluster = MultiShardCluster::start(2, &[1, 2, 3]).await;
+    let map = ShardMap::from_entries([
+        (
+            ShardId(0),
+            vec![
+                Replica { node_id: 1, addr: "mem://1".into() },
+                Replica { node_id: 2, addr: "mem://2".into() },
+                Replica { node_id: 3, addr: "mem://3".into() },
+            ],
+        ),
+        (
+            ShardId(1),
+            vec![
+                Replica { node_id: 1, addr: "mem://1".into() },
+                Replica { node_id: 3, addr: "mem://3".into() },
+                // node 2 is intentionally NOT a member of shard 1
+            ],
+        ),
+    ])
+    .unwrap();
+    let fwd = std::sync::Arc::new(ledge_cluster::forward::InMemoryForwarder::new());
+    fwd.set_map(map.clone());
+
+    // node 1 hosts both shards.
+    let store1 = cluster.cluster_ref_store_hosting(1, &map, fwd.clone());
+    fwd.register(
+        1,
+        std::sync::Arc::new(ledge_cluster::ref_store::StoreApplier(store1.clone())),
+    );
+    // node 2 hosts only shard 0.
+    let store2 = cluster.cluster_ref_store_hosting(2, &map, fwd.clone());
+    fwd.register(
+        2,
+        std::sync::Arc::new(ledge_cluster::ref_store::StoreApplier(store2.clone())),
+    );
+
+    // Pick two names on DISTINCT shards so we commit one ref per shard.
+    let (a, b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let b_shard = cluster.router().shard_for(b.as_str());
+    // Commit a ref on each shard through node 1 (which hosts both).
+    store1.update(&a, oid(10), None).await.unwrap();
+    store1.update(&b, oid(20), None).await.unwrap();
+
+    // node 1 hosts BOTH shards → sees BOTH committed targets.
+    let by_shard1 = store1.committed_targets_by_shard().await.unwrap();
+    let all1: std::collections::HashSet<ObjectId> =
+        by_shard1.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+    assert!(all1.contains(&oid(10)), "shard-{a_shard:?} target present");
+    assert!(all1.contains(&oid(20)), "shard-{b_shard:?} target present");
+
+    // node 2 hosts ONLY shard 0 → it sees ONLY shard 0's target, never shard 1's.
+    let shards2: std::collections::HashSet<ShardId> =
+        store2.committed_targets_by_shard().await.unwrap().into_iter().map(|(s, _)| s).collect();
+    assert!(shards2.contains(&ShardId(0)));
+    assert!(!shards2.contains(&ShardId(1)), "node 2 must not report a non-hosted shard");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_stale_get_reads_local_replica() {
     let h = MultiShardCluster::start(2, &[1, 2, 3]).await;

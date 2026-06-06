@@ -570,6 +570,45 @@ impl ClusterRefStore {
         Ok(out)
     }
 
+    /// For each LOCALLY-HOSTED shard, the leader-linearized committed ref
+    /// targets (every `RefEntry.target`). The committed-ref analogue of
+    /// [`Self::prepared_locks_by_shard`], backing the distributed-GC mark roots
+    /// (Phase 4c spec §4.2 source 1).
+    ///
+    /// Mirrors `prepared_locks_by_shard` exactly: iterate `self.shards.keys()`
+    /// (the locally-hosted handle map), resolve each shard's leader, run
+    /// `ensure_linearizable()` so a lagging replica's stale ref set is never used
+    /// (which could omit a freshly-committed ref and wrongly free its target),
+    /// then read the leader's full applied ref map. Returns one `(shard, targets)`
+    /// entry per hosted shard (empty `targets` for a shard with no refs), so the
+    /// GC caller can flatten all targets across hosted shards into one root set.
+    ///
+    /// # Errors
+    /// `LedgeError::Unavailable` if any hosted shard has no leader yet or the
+    /// linearizability barrier fails (retryable — the data is intact).
+    pub async fn committed_targets_by_shard(&self) -> Result<Vec<(ShardId, Vec<ObjectId>)>> {
+        let mut out = Vec::new();
+        // Snapshot the shard ids first (avoid holding a borrow across `.await`).
+        let shards: Vec<ShardId> = self.shards.keys().copied().collect();
+        for shard in shards {
+            let leader = self.leader_of(shard).await?;
+            leader
+                .raft
+                .ensure_linearizable()
+                .await
+                .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+            let targets: Vec<ObjectId> = leader
+                .sm
+                .applied_ref_map()
+                .await
+                .into_iter()
+                .map(|(_name, entry)| entry.target)
+                .collect();
+            out.push((shard, targets));
+        }
+        Ok(out)
+    }
+
     /// The shard-local HLC source for `shard` (for generating a txn id on the
     /// coordinator shard). Errors if the shard is not locally hosted.
     pub fn hlc_for(&self, shard: ShardId) -> Result<&Arc<HLC>> {
