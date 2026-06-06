@@ -374,8 +374,10 @@ async fn committed_targets_by_shard_returns_hosted_shard_targets() {
         std::sync::Arc::new(ledge_cluster::ref_store::StoreApplier(store2.clone())),
     );
 
-    // Pick two names on DISTINCT shards so we commit one ref per shard.
-    let (a, b) = cluster.two_names_on_distinct_shards();
+    // Pick two DURABLE names on DISTINCT shards so we commit one ref per shard.
+    // committed_targets_by_shard returns durable roots only (workspace refs are
+    // lease-gated, deliberately excluded), so the fixtures must be durable refs.
+    let (a, b) = cluster.two_durable_names_on_distinct_shards();
     let a_shard = cluster.router().shard_for(a.as_str());
     let b_shard = cluster.router().shard_for(b.as_str());
     // Commit a ref on each shard through node 1 (which hosts both).

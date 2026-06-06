@@ -486,6 +486,29 @@ impl MultiShardCluster {
         panic!("could not find two names on distinct shards");
     }
 
+    /// Two DURABLE (`refs/heads/`) ref names the router places on DISTINCT shards
+    /// (brute-force search). Unlike [`Self::two_names_on_distinct_shards`] (which
+    /// yields `refs/workspaces/` names), these are unconditional GC roots — used
+    /// to test `committed_targets_by_shard`, which deliberately excludes workspace
+    /// refs (those are lease-gated). Panics if `num_shards < 2`.
+    pub fn two_durable_names_on_distinct_shards(
+        &self,
+    ) -> (ledge_core::RefName, ledge_core::RefName) {
+        assert!(self.num_shards >= 2, "need >= 2 shards");
+        let router = self.router();
+        let mut first: Option<(ledge_core::RefName, ShardId)> = None;
+        for i in 0..10_000u32 {
+            let name = ledge_core::RefName::new(&format!("refs/heads/b{i}")).unwrap();
+            let s = router.shard_for(name.as_str());
+            match &first {
+                None => first = Some((name, s)),
+                Some((f, fs)) if *fs != s => return (f.clone(), name),
+                _ => {}
+            }
+        }
+        panic!("could not find two durable names on distinct shards");
+    }
+
     /// `count` ref names spread across BOTH shards (at least one per shard).
     /// Panics if `num_shards != 2` or it cannot satisfy the spread.
     pub fn names_spanning_both_shards(&self, count: usize) -> Vec<ledge_core::RefName> {

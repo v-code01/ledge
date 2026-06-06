@@ -570,18 +570,30 @@ impl ClusterRefStore {
         Ok(out)
     }
 
-    /// For each LOCALLY-HOSTED shard, the leader-linearized committed ref
-    /// targets (every `RefEntry.target`). The committed-ref analogue of
+    /// For each LOCALLY-HOSTED shard, the leader-linearized committed targets of
+    /// the **durable** refs (every `RefEntry.target` whose ref name is NOT under
+    /// `refs/workspaces/`). The committed-ref analogue of
     /// [`Self::prepared_locks_by_shard`], backing the distributed-GC mark roots
     /// (Phase 4c spec §4.2 source 1).
     ///
-    /// Mirrors `prepared_locks_by_shard` exactly: iterate `self.shards.keys()`
-    /// (the locally-hosted handle map), resolve each shard's leader, run
-    /// `ensure_linearizable()` so a lagging replica's stale ref set is never used
-    /// (which could omit a freshly-committed ref and wrongly free its target),
-    /// then read the leader's full applied ref map. Returns one `(shard, targets)`
-    /// entry per hosted shard (empty `targets` for a shard with no refs), so the
-    /// GC caller can flatten all targets across hosted shards into one root set.
+    /// `refs/workspaces/<id>/*` refs are DELIBERATELY EXCLUDED here: workspace
+    /// refs are roots only while their lease is live, so the GC adds them via the
+    /// separate lease-gated path (spec §4.2 source 3), exactly mirroring the
+    /// single-node `Gc::run` (which roots `refs/heads/` + `refs/tags/`
+    /// unconditionally and workspace refs only for `leases.live(now)`). If
+    /// workspace refs were treated as unconditional committed roots, an
+    /// expired/released workspace's objects would never be reclaimed — defeating
+    /// ephemeral-workspace GC. Over-keeping is safe, but never reclaiming is a
+    /// real functional gap, so the exclusion is load-bearing for lease semantics.
+    ///
+    /// Mirrors `prepared_locks_by_shard` on the safety-critical path: iterate
+    /// `self.shards.keys()` (the locally-hosted handle map), resolve each shard's
+    /// leader, run `ensure_linearizable()` so a lagging replica's stale ref set is
+    /// never used (which could omit a freshly-committed ref and wrongly free its
+    /// target), then read the leader's full applied ref map. Returns one
+    /// `(shard, targets)` entry per hosted shard (empty `targets` for a shard with
+    /// no durable refs), so the GC caller flattens all targets across hosted
+    /// shards into one root set.
     ///
     /// # Errors
     /// `LedgeError::Unavailable` if any hosted shard has no leader yet or the
@@ -602,6 +614,8 @@ impl ClusterRefStore {
                 .applied_ref_map()
                 .await
                 .into_iter()
+                // Exclude workspace refs — they are lease-gated roots (see above).
+                .filter(|(name, _entry)| !name.as_str().starts_with("refs/workspaces/"))
                 .map(|(_name, entry)| entry.target)
                 .collect();
             out.push((shard, targets));
