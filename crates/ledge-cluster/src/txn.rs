@@ -31,6 +31,18 @@ use crate::forward::{ClusterOp, RefOpResponse};
 use crate::ref_store::ClusterRefStore;
 use crate::router::ShardId;
 
+/// Prometheus series names emitted by the coordinator/resolver at the true site
+/// (spec §7). Re-declared identically in `ledge-server::metrics` so both crates
+/// agree on the series (mirrors `forward::REF_OP_FORWARDED_TOTAL`). The
+/// counters/histogram below are emitted only on the multi-shard 2PC path; the
+/// single-shard fast path and single-node deploys never touch these series.
+pub const TXN_STARTED_TOTAL: &str = "ledge_txn_started_total";
+pub const TXN_COMMITTED_TOTAL: &str = "ledge_txn_committed_total";
+pub const TXN_ABORTED_TOTAL: &str = "ledge_txn_aborted_total";
+pub const TXN_RECOVERED_TOTAL: &str = "ledge_txn_recovered_total";
+pub const TXN_PREPARE_VOTES_TOTAL: &str = "ledge_txn_prepare_votes_total";
+pub const TXN_DURATION: &str = "ledge_txn_duration_seconds";
+
 /// Multi-shard atomic-commit coordinator over a node's [`ClusterRefStore`]. It
 /// drives prepare/commit/abort through `op_on_shard` (local-or-forwarded) and
 /// the txn record through `apply_txn_record_op` on the coordinator shard.
@@ -110,6 +122,10 @@ impl TxnCoordinator {
 
 #[async_trait]
 impl AtomicCommit for TxnCoordinator {
+    #[tracing::instrument(
+        skip(self, mappings),
+        fields(mappings = mappings.len(), txn_id, participants, decision)
+    )]
     async fn commit_atomic(&self, mappings: Vec<Mapping>) -> Result<AtomicCommitResult> {
         if mappings.is_empty() {
             return Ok(AtomicCommitResult::Committed(Vec::new()));
@@ -117,18 +133,24 @@ impl AtomicCommit for TxnCoordinator {
         let by_shard = self.group_by_shard(&mappings);
 
         // --- Single-shard fast path (spec §3.5): one RefBatch, atomic by one log
-        // entry. No txn record, no 2PC. ---
+        // entry. No txn record, no 2PC. The `ledge_txn_*` series are deliberately
+        // NOT emitted here — they count multi-shard 2PC transactions only. ---
         if by_shard.len() == 1 {
             let (&shard, refs) = by_shard.iter().next().unwrap();
             return self.commit_single_shard(shard, refs).await;
         }
 
-        // --- Multi-shard 2PC (spec §3.1/§5). ---
+        // --- Multi-shard 2PC (spec §3.1/§5). This is the only path that emits the
+        // `ledge_txn_*` transaction metrics (spec §7). ---
+        metrics::counter!(TXN_STARTED_TOTAL).increment(1);
+        let started = std::time::Instant::now();
         let participants: Vec<ShardId> = by_shard.keys().copied().collect();
         // Deterministic coordinator shard = min participant id (every node hosts a
         // contiguous shard range under 4a placement, so it hosts min(shards)).
         let coord_shard = *participants.iter().min().unwrap();
         let txn_id = TxnId::generate(self.store.hlc_for(coord_shard)?);
+        tracing::Span::current().record("txn_id", tracing::field::display(txn_id));
+        tracing::Span::current().record("participants", participants.len());
 
         // 1. TxnBegin on the coordinator shard (durable PENDING record).
         let participant_ids: Vec<u32> = participants.iter().map(|s| s.0).collect();
@@ -162,8 +184,11 @@ impl AtomicCommit for TxnCoordinator {
                     )
                     .await?;
                 match resp {
-                    RefOpResponse::Vote(true) => {}
+                    RefOpResponse::Vote(true) => {
+                        metrics::counter!(TXN_PREPARE_VOTES_TOTAL, "vote" => "yes").increment(1);
+                    }
                     RefOpResponse::Vote(false) => {
+                        metrics::counter!(TXN_PREPARE_VOTES_TOTAL, "vote" => "no").increment(1);
                         all_yes = false;
                         conflicts.push(name.clone());
                         break 'outer;
@@ -227,6 +252,16 @@ impl AtomicCommit for TxnCoordinator {
         self.store
             .apply_txn_record_op(coord_shard, LedgeOp::TxnEnd { txn_id })
             .await?;
+
+        if all_yes {
+            metrics::counter!(TXN_COMMITTED_TOTAL).increment(1);
+            tracing::Span::current().record("decision", "commit");
+        } else {
+            metrics::counter!(TXN_ABORTED_TOTAL, "reason" => "prepare_no").increment(1);
+            tracing::Span::current().record("decision", "abort");
+        }
+        // Wall time of the whole multi-shard 2PC (begin → end), spec §7.
+        metrics::histogram!(TXN_DURATION).record(started.elapsed().as_secs_f64());
 
         if all_yes {
             Ok(AtomicCommitResult::Committed(committed))
@@ -335,6 +370,9 @@ impl TxnResolver {
                 };
                 self.store.op_on_shard(shard, op).await?;
                 resolved += 1;
+                // One prepared lock resolved by crash recovery (rolled forward on
+                // a Commit decision or released on presumed-abort), spec §7.
+                metrics::counter!(TXN_RECOVERED_TOTAL).increment(1);
                 to_end.insert((intent.txn_id, intent.coord_shard));
             }
         }

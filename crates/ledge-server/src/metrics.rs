@@ -51,6 +51,21 @@ pub const REF_OP_APPLIED_TOTAL: &str = "ledge_ref_op_applied_total";
 /// which uses this identical name so both crates agree on the series.
 pub const REF_OP_FORWARDED_TOTAL: &str = "ledge_ref_op_forwarded_total";
 
+// ── Cross-shard 2PC transaction metrics (Phase 4b, spec §7). Like the forward
+//    counter above, the `_TOTAL`/`_DURATION` series are EMITTED at their true
+//    site in `ledge-cluster`'s `TxnCoordinator`/`TxnResolver` (which re-declare
+//    these identical names — see `ledge_cluster::txn`), so both crates agree on
+//    the series. The names + record helpers are also declared here for
+//    documentation parity and for any server-side emission. Single-node never
+//    runs the coordinator, so single-node `/metrics` is unchanged. ────────────
+pub const TXN_STARTED_TOTAL: &str = "ledge_txn_started_total";
+pub const TXN_COMMITTED_TOTAL: &str = "ledge_txn_committed_total";
+pub const TXN_ABORTED_TOTAL: &str = "ledge_txn_aborted_total";
+pub const TXN_RECOVERED_TOTAL: &str = "ledge_txn_recovered_total";
+pub const TXN_PREPARE_VOTES_TOTAL: &str = "ledge_txn_prepare_votes_total";
+pub const PREPARED_LOCKS: &str = "ledge_prepared_locks";
+pub const TXN_DURATION: &str = "ledge_txn_duration_seconds";
+
 pub fn install_recorder() -> ledge_core::Result<()> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
@@ -150,9 +165,59 @@ pub fn record_ref_op_applied(shard: u32) {
     metrics::counter!(REF_OP_APPLIED_TOTAL, "shard" => shard.to_string()).increment(1);
 }
 
+// ── 2PC transaction-lifecycle record helpers (spec §7). Documentation-parity
+//    wrappers over the same series the coordinator/resolver emit at the true
+//    site; kept here so the names round-trip and `/metrics` consumers can find a
+//    single helper module. ─────────────────────────────────────────────────────
+
+/// Counter: a multi-shard 2PC transaction entered the prepare phase.
+pub fn record_txn_started() { metrics::counter!(TXN_STARTED_TOTAL).increment(1); }
+/// Counter: a transaction reached a durable `TxnDecide{commit}` (the commit point).
+pub fn record_txn_committed() { metrics::counter!(TXN_COMMITTED_TOTAL).increment(1); }
+/// Counter: a transaction aborted. `reason` is the abort cause (e.g. `prepare_no`).
+pub fn record_txn_aborted(reason: &'static str) {
+    metrics::counter!(TXN_ABORTED_TOTAL, "reason" => reason).increment(1);
+}
+/// Counter: a prepared lock was resolved by the crash-recovery `TxnResolver`
+/// (rolled forward after a Commit decision or released on presumed-abort).
+pub fn record_txn_recovered() { metrics::counter!(TXN_RECOVERED_TOTAL).increment(1); }
+/// Counter: one prepare vote; `vote` is `"yes"` or `"no"`.
+pub fn record_txn_prepare_vote(vote: &'static str) {
+    metrics::counter!(TXN_PREPARE_VOTES_TOTAL, "vote" => vote).increment(1);
+}
+/// Histogram: wall time of a multi-shard 2PC transaction, in seconds.
+pub fn record_txn_duration(d: std::time::Duration) {
+    metrics::histogram!(TXN_DURATION).record(d.as_secs_f64());
+}
+/// Gauge: number of currently-held prepared locks (in-doubt 2PC participants).
+pub fn set_prepared_locks(n: u64) { metrics::gauge!(PREPARED_LOCKS).set(n as f64); }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txn_metric_names_match_spec() {
+        assert_eq!(TXN_STARTED_TOTAL, "ledge_txn_started_total");
+        assert_eq!(TXN_COMMITTED_TOTAL, "ledge_txn_committed_total");
+        assert_eq!(TXN_ABORTED_TOTAL, "ledge_txn_aborted_total");
+        assert_eq!(TXN_RECOVERED_TOTAL, "ledge_txn_recovered_total");
+        assert_eq!(TXN_PREPARE_VOTES_TOTAL, "ledge_txn_prepare_votes_total");
+        assert_eq!(PREPARED_LOCKS, "ledge_prepared_locks");
+        assert_eq!(TXN_DURATION, "ledge_txn_duration_seconds");
+    }
+
+    #[test]
+    fn txn_record_helpers_no_panic_without_recorder() {
+        record_txn_started();
+        record_txn_committed();
+        record_txn_aborted("prepare_no");
+        record_txn_recovered();
+        record_txn_prepare_vote("yes");
+        record_txn_prepare_vote("no");
+        record_txn_duration(std::time::Duration::from_millis(3));
+        set_prepared_locks(2);
+    }
 
     #[test]
     fn raft_metric_name_constants_correct() {
