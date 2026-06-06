@@ -4,7 +4,8 @@
 #   make sany    - syntax-check all modules
 #   make neg     - run the Sharding negative control; PASS iff TLC reports a violation
 #   make neg-txn - run the CrossShardTxn negative control; PASS iff TLC reports a violation
-#   make neg-all - run both negative controls
+#   make neg-gc  - run the DistributedGc negative control; PASS iff TLC reports a violation
+#   make neg-all - run all negative controls
 #   make clean   - remove TLC scratch state and metadata directories
 #
 # Override the toolchain paths if needed:
@@ -17,9 +18,9 @@ TLA  ?= $(HOME)/.tla/tla2tools.jar
 TLC  = $(JAVA) -XX:+UseParallelGC -cp $(TLA) tlc2.TLC
 SANY = $(JAVA) -cp $(TLA) tla2sany.SANY
 
-MODULES = RefStore GcReachability Sharding CrossShardTxn
+MODULES = RefStore GcReachability Sharding CrossShardTxn DistributedGc
 
-.PHONY: check sany neg neg-txn neg-all clean
+.PHONY: check sany neg neg-txn neg-gc neg-all clean
 
 check:
 	@for m in $(MODULES); do \
@@ -59,8 +60,21 @@ neg-txn:
 		echo "=== Negative control fired as expected (NoDirtyRead/Atomicity violated) ==="; \
 	fi
 
-# Run both negative controls; PASSES iff each fires its expected violation.
-neg-all: neg neg-txn
+# Negative control for the distributed-GC spec: BadGc = TRUE drops preparedRoots
+# from the frozen root set, making a staged-but-uncommitted object sweepable. This
+# MUST violate NoLiveObjectDeleted (and/or PreparedPinned). PASSES iff TLC exits
+# non-zero.
+neg-gc:
+	@echo "=== TLC negative control: DistributedGc (BadGc = TRUE) ==="
+	@if $(TLC) -config DistributedGc_neg.cfg DistributedGc.tla; then \
+		echo "NEGATIVE CONTROL FAILED: TLC found no violation but one was expected"; \
+		exit 1; \
+	else \
+		echo "=== Negative control fired as expected (NoLiveObjectDeleted/PreparedPinned violated) ==="; \
+	fi
+
+# Run all negative controls; PASSES iff each fires its expected violation.
+neg-all: neg neg-txn neg-gc
 
 clean:
 	rm -rf states *_TTrace_*.tla *_TTrace_*.bin
