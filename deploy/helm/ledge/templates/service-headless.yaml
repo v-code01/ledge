@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ledge.headless" . }}
+  labels:
+    {{- include "ledge.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "ledge.selectorLabels" . | nindent 4 }}
+  ports:
+    # The client port carries git/REST/RPC + /healthz + /metrics AND peer /raft
+    # (no separate metrics or raft listener). Peer DNS (ledge-N.headless) resolves
+    # here for Raft. Under mTLS the peer port is also published.
+    - name: client
+      port: {{ .Values.service.port }}
+      targetPort: client
+    {{- if and .Values.tls.enabled .Values.tls.mtls }}
+    - name: peer
+      port: {{ .Values.tls.peerPort }}
+      targetPort: peer
+    {{- end }}

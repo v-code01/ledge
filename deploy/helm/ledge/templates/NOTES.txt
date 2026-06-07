@@ -1,0 +1,21 @@
+Ledge {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+Pods: {{ include "ledge.fullname" . }}-0 .. {{ include "ledge.fullname" . }}-{{ sub (int .Values.replicaCount) 1 }}
+Client service: {{ include "ledge.fullname" . }}:{{ .Values.service.port }} (type {{ .Values.service.type }})
+{{- if .Values.cluster.enabled }}
+Cluster: ENABLED — single shard, {{ .Values.replicaCount }} replicas (replication factor {{ .Values.replicaCount }}).
+         Each pod derives its Raft node_id from its StatefulSet ordinal.
+{{- else }}
+Cluster: disabled (single node). Set cluster.enabled=true and replicaCount=3 for a 3-node Raft set.
+{{- end }}
+
+Port-forward the client API:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ledge.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl -fsS http://localhost:{{ .Values.service.port }}/healthz
+
+/metrics and /healthz are served on the client port (no separate metrics listener).
+{{- if not .Values.auth.enabled }}
+
+WARNING: auth is DISABLED. For production set auth.enabled=true + a strong
+auth.clusterSecret, and tls.enabled=true. See deploy/README.md.
+{{- end }}

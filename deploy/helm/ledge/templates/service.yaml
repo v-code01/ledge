@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ledge.fullname" . }}
+  labels:
+    {{- include "ledge.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ledge.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.service.port }}
+      targetPort: client
+      protocol: TCP

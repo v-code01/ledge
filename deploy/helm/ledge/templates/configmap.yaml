@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ledge.fullname" . }}-config
+  labels:
+    {{- include "ledge.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    [server]
+    addr = "0.0.0.0:{{ .Values.service.port }}"
+    data_dir = "/var/lib/ledge"
+
+    [metrics]
+    enabled = {{ .Values.metrics.enabled }}
+    addr = "0.0.0.0:{{ .Values.metrics.port }}"
+
+    [auth]
+    enabled = {{ .Values.auth.enabled }}
+
+    [tls]
+    enabled = {{ .Values.tls.enabled }}
+    {{- if .Values.tls.enabled }}
+    cert_path = "/etc/ledge/tls/tls.crt"
+    key_path = "/etc/ledge/tls/tls.key"
+    {{- if .Values.tls.mtls }}
+    ca_path = "/etc/ledge/tls/ca.crt"
+    mtls = true
+    peer_addr = "0.0.0.0:{{ .Values.tls.peerPort }}"
+    client_cert_path = "/etc/ledge/tls/client.crt"
+    client_key_path = "/etc/ledge/tls/client.key"
+    {{- end }}
+    {{- end }}
+
+    [cluster]
+    enabled = {{ .Values.cluster.enabled }}
+    {{- if .Values.cluster.enabled }}
+    num_shards = 1
+
+    # Single shard, all {{ .Values.replicaCount }} replicas as members
+    # (replication factor = replicaCount). Each pod's node_id is derived from its
+    # StatefulSet ordinal by the entrypoint (LEDGE_DERIVE_NODE_ID_FROM_HOSTNAME).
+    # Peers reach /raft on the CLIENT port (the server has no separate raft
+    # listener); under mTLS they use the tls.peer_addr port over https.
+    [[cluster.shards]]
+    id = 0
+    members = [
+    {{- $full := include "ledge.fullname" . }}
+    {{- $headless := include "ledge.headless" . }}
+    {{- $ns := .Release.Namespace }}
+    {{- $scheme := ternary "https" "http" (and .Values.tls.enabled .Values.tls.mtls) }}
+    {{- $port := ternary (int .Values.tls.peerPort) (int .Values.service.port) (and .Values.tls.enabled .Values.tls.mtls) }}
+    {{- $n := int .Values.replicaCount }}
+    {{- range $i := until $n }}
+      { id = {{ add $i 1 }}, addr = "{{ $scheme }}://{{ $full }}-{{ $i }}.{{ $headless }}.{{ $ns }}.svc.cluster.local:{{ $port }}" },
+    {{- end }}
+    ]
+    {{- end }}

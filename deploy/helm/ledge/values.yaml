@@ -1,0 +1,78 @@
+# Default values for the ledge chart.
+
+image:
+  repository: ledge
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of StatefulSet replicas. When cluster.enabled, this is the number of
+# Raft members of the single shard (replication factor = replicaCount). Use an
+# odd number (3, 5) for a healthy quorum.
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+persistence:
+  size: 10Gi
+  # storageClassName: ""   # unset ⇒ the cluster default StorageClass.
+  storageClassName: ""
+
+service:
+  type: ClusterIP
+  port: 3000
+
+metrics:
+  enabled: true
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    # interval: 30s
+    # labels: {}
+
+# Cluster (sharded Raft). When enabled, the chart renders a single-shard map over
+# all replicaCount pods and the entrypoint derives each pod's node_id from its
+# StatefulSet ordinal. Multi-shard placement is a documented follow-on.
+cluster:
+  enabled: false
+
+# Authentication (Phase 4d-1). For a clustered + authenticated deployment, set a
+# strong clusterSecret. If existingSecret is set, the chart references it instead
+# of creating one (keys: cluster-secret, bootstrap-admin-token).
+auth:
+  enabled: false
+  clusterSecret: ""
+  bootstrapAdminToken: ""
+  existingSecret: ""
+
+# TLS / mTLS (Phase 4d-4). When enabled, provide PEM material (or an existingSecret
+# with keys tls.crt, tls.key, ca.crt, client.crt, client.key). peerPort is the
+# mTLS peer listener (required when mtls=true).
+tls:
+  enabled: false
+  mtls: false
+  peerPort: 4443
+  cert: ""
+  key: ""
+  ca: ""
+  clientCert: ""
+  clientKey: ""
+  existingSecret: ""
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

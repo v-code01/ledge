@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ledge.fullname" . }}
+  labels:
+    {{- include "ledge.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ledge.headless" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ledge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ledge.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: ledge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["start", "--config", "/etc/ledge/config.toml"]
+          env:
+            {{- if .Values.cluster.enabled }}
+            - name: LEDGE_DERIVE_NODE_ID_FROM_HOSTNAME
+              value: "true"
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            - name: LEDGE__AUTH__CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ledge.secretName" . }}
+                  key: cluster-secret
+            {{- if .Values.auth.bootstrapAdminToken }}
+            - name: LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ledge.secretName" . }}
+                  key: bootstrap-admin-token
+            {{- end }}
+            {{- end }}
+          ports:
+            # The client port carries git/REST/RPC + /healthz + /metrics AND
+            # /raft + /cluster (no separate raft listener). Under mTLS a second
+            # listener serves the peer port.
+            - name: client
+              containerPort: {{ .Values.service.port }}
+            {{- if and .Values.tls.enabled .Values.tls.mtls }}
+            - name: peer
+              containerPort: {{ .Values.tls.peerPort }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: client
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: client
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ledge
+            - name: config
+              mountPath: /etc/ledge
+              readOnly: true
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/ledge/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ledge.fullname" . }}-config
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "ledge.secretName" . }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}

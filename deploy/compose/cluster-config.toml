@@ -1,0 +1,24 @@
+# Shared cluster config, identical on every node — ONLY LEDGE__CLUSTER__NODE_ID
+# differs per service (supplied via env in docker-compose.cluster.yml). One shard
+# with all three nodes as members (replication factor = 3). Peer addrs use compose
+# service DNS (ledge-1/2/3) on the CLIENT port (3000): the server serves /raft on
+# the client port (config.cluster.raft_bind is currently NOT a separate listener),
+# so peers must reach each other there. Under mTLS, peers would instead use the
+# tls.peer_addr port over https.
+
+[server]
+addr = "0.0.0.0:3000"
+data_dir = "/var/lib/ledge"
+
+[cluster]
+enabled = true
+num_shards = 1
+raft_bind = "0.0.0.0:4001"  # parsed but currently unwired; /raft is on the client port
+
+[[cluster.shards]]
+id = 0
+members = [
+  { id = 1, addr = "http://ledge-1:3000" },
+  { id = 2, addr = "http://ledge-2:3000" },
+  { id = 3, addr = "http://ledge-3:3000" },
+]

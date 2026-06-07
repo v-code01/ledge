@@ -1,0 +1,32 @@
+# Single-node Ledge (dev / eval). Auth + TLS are OFF here for a frictionless
+# local bring-up; the production security checklist (deploy/README.md) says to
+# enable them for any real deployment.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up -d
+#   curl -fsS http://localhost:3000/healthz
+services:
+  ledge:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ledge:latest
+    command: ["start"]
+    ports:
+      # client port: git wire / REST / RPC / admin + /healthz + /metrics. The
+      # server serves /metrics on THIS port (no separate metrics listener).
+      - "3000:3000"
+    volumes:
+      - ledge-data:/var/lib/ledge
+    environment:
+      LEDGE__SERVER__ADDR: "0.0.0.0:3000"
+      LEDGE__SERVER__DATA_DIR: "/var/lib/ledge"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ledge-data:

@@ -1,0 +1,16 @@
+# Repo yamllint profile for deploy artifacts. Relaxes line-length (deploy YAML has
+# long image refs / env values) and the document-start "---" convention (compose
+# and Helm templates conventionally omit it). Helm templates contain Go template
+# directives that are not valid standalone YAML — lint values.yaml/Chart.yaml, not
+# templates/*.tpl-bearing files.
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  truthy:
+    check-keys: false

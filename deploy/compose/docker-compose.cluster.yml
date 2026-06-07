@@ -1,0 +1,73 @@
+# Local 3-node Ledge cluster (one shard, replication factor 3) over the real HTTP
+# Raft network. Each node shares cluster-config.toml (the shard map) and differs
+# only by LEDGE__CLUSTER__NODE_ID. Auth is ON so the INTERNAL peer RPCs
+# (/raft, /cluster, /objects) authenticate via the shared cluster_secret.
+#
+#   docker compose -f deploy/compose/docker-compose.cluster.yml up -d
+#   # leader election + replication over compose DNS; ledge-1 is the client entry.
+#   curl -fsS http://localhost:3000/healthz
+#
+# NOTE: the dev cluster_secret below is for local use only — set a strong secret
+# (and enable TLS/mTLS) for any real deployment (see deploy/README.md).
+x-ledge-common: &ledge-common
+  image: ledge:latest
+  command: ["start", "--config", "/etc/ledge/config.toml"]
+  volumes:
+    - type: bind
+      source: ./cluster-config.toml
+      target: /etc/ledge/config.toml
+      read_only: true
+  environment: &ledge-env
+    LEDGE__AUTH__ENABLED: "true"
+    LEDGE__AUTH__CLUSTER_SECRET: "dev-cluster-secret-change-me"
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+    interval: 15s
+    timeout: 3s
+    retries: 5
+    start_period: 15s
+
+services:
+  ledge-1:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "1"
+    ports:
+      - "3000:3000"   # client entry point (+ /healthz + /metrics)
+    volumes:
+      - ledge-1-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+  ledge-2:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "2"
+    volumes:
+      - ledge-2-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+  ledge-3:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "3"
+    volumes:
+      - ledge-3-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+volumes:
+  ledge-1-data:
+  ledge-2-data:
+  ledge-3-data:

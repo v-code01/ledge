@@ -1,0 +1,14 @@
+apiVersion: v2
+name: ledge
+description: Ledge — agent-native Git storage (sharded Raft, content-addressed objects, TLS/mTLS).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/vanshverma/ledge
+sources:
+  - https://github.com/vanshverma/ledge
+keywords:
+  - git
+  - storage
+  - raft
+  - agent

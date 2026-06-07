@@ -1,0 +1,10 @@
+# Keep the build context small + fast. NOTE: sdk/ is intentionally NOT ignored —
+# crates/ledge-rpc/build.rs codegens from sdk/schema/ledge.capnp at build time.
+target/
+.git/
+docs/
+formal/
+.github/
+**/*.md
+# NOTE: deploy/ is NOT ignored — the Dockerfile COPYs deploy/docker/entrypoint.sh.
+# It is small (yaml + sh), so the context cost is negligible.
