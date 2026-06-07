@@ -138,7 +138,7 @@ async fn cross_shard_liveness_keeps_objects_from_either_shard() {
     store1.update(&a, c0, None).await.unwrap(); // shard A ref → first graph
     store1.update(&b, c1, None).await.unwrap(); // shard B ref → second graph
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     let stats = gc.run(4_000_000_000).await.unwrap();
 
     // BOTH graphs survive; only the orphan is reclaimed. If GC marked only ONE
@@ -187,7 +187,7 @@ async fn prepared_intent_pins_staged_object() {
 
     // GC while prepared-but-not-committed: the staged object is rooted by the
     // prepared intent → NOT deleted.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     gc.run(4_000_000_000).await.unwrap();
     assert!(objects.exists(staged).await.unwrap(), "prepared staged target must be pinned");
 
@@ -200,7 +200,7 @@ async fn prepared_intent_pins_staged_object() {
         .await
         .unwrap();
     assert_eq!(store1.get(&a).await.unwrap().unwrap().target, staged);
-    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     gc2.run(4_000_000_001).await.unwrap();
     assert!(objects.exists(staged).await.unwrap(), "committed target still present");
 }
@@ -239,7 +239,7 @@ async fn abort_then_reclaim_releases_staged_object() {
 
     // Now no committed ref AND no prepared lock references `staged`. A grace-0
     // pass reclaims it.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     let stats = gc.run(4_000_000_000).await.unwrap();
     assert!(!objects.exists(staged).await.unwrap(), "aborted staged target is reclaimed");
     assert_eq!(stats.reclaimed, 1);
@@ -259,7 +259,7 @@ async fn grace_fence_keeps_fresh_sweeps_old() {
         .as_secs();
     let one_hour = Duration::from_secs(3600);
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), one_hour);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), one_hour, Arc::new(ledge_workspace::UsageMap::default()));
     let kept = gc.run(real_now).await.unwrap();
     assert_eq!(kept.reclaimed, 0, "a fresh orphan is within grace and kept");
     assert_eq!(kept.skipped_grace, 1, "retained solely by grace");
@@ -290,7 +290,7 @@ async fn freeze_guard_excludes_post_freeze_writes() {
 
     // And an end-to-end pass that began before the write leaves it intact: run a
     // grace-0 GC, THEN write — the just-written object survives.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     gc.run(4_000_000_000).await.unwrap();
     let late = write_blob(&objects, b"written after a completed pass").await;
     assert!(objects.exists(late).await.unwrap(), "post-pass write survives");
@@ -306,7 +306,7 @@ async fn crash_idempotent_rerun_equals_single_pass() {
     let (a, _b) = cluster.two_durable_names_on_distinct_shards();
     store1.update(&a, c, None).await.unwrap();
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     let first = gc.run(4_000_000_000).await.unwrap();
     assert_eq!(first.reclaimed, 1, "the orphan is reclaimed once");
 
@@ -332,7 +332,7 @@ async fn live_lease_workspace_roots_kept_expired_reclaimed() {
     // Live lease: GC at now_secs whose ms is < expiry keeps the trio.
     let now_secs = 1_000_000u64;
     leases.put(lease(id, now_secs * 1000 + 1_000_000)).await.unwrap();
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     let kept = gc.run(now_secs).await.unwrap();
     assert_eq!(kept.reclaimed, 0, "live-lease workspace refs root the trio");
     for id in [b, t, c] {
@@ -341,7 +341,7 @@ async fn live_lease_workspace_roots_kept_expired_reclaimed() {
 
     // Expire the lease (expiry ≤ now_ms) → its refs are not roots → trio reclaimed.
     leases.put(lease(id, now_secs * 1000 - 1)).await.unwrap();
-    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
     let swept = gc2.run(now_secs).await.unwrap();
     assert_eq!(swept.reclaimed, 3, "expired lease contributes no roots");
 }

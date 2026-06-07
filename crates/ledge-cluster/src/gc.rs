@@ -21,10 +21,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ledge_core::{ObjectId, RefStore, Result};
+use ledge_core::{tenant_of_ref, ObjectId, RefStore, Result};
 use ledge_object_store::{graph, DiskObjectStore};
 use ledge_workspace::lease::LeaseStore;
-use ledge_workspace::GcStats;
+use ledge_workspace::{GcStats, TenantUsage, UsageMap};
 
 use crate::ref_store::ClusterRefStore;
 
@@ -53,6 +53,10 @@ pub struct ClusterGc {
     objects: Arc<DiskObjectStore>,
     /// Resurrection-race fence: a candidate younger than this is never swept.
     grace: Duration,
+    /// The shared per-tenant usage snapshot this node's pass refreshes (Phase
+    /// 4d-3, R Q4/Q11). Measured from this node's hosted-shard durable refs;
+    /// per-node (honest — spec §6). `ArcSwap::store`d at the end of `run`.
+    usage: Arc<UsageMap>,
 }
 
 impl ClusterGc {
@@ -62,12 +66,14 @@ impl ClusterGc {
         leases: Arc<LeaseStore>,
         objects: Arc<DiskObjectStore>,
         grace: Duration,
+        usage: Arc<UsageMap>,
     ) -> Self {
         Self {
             cluster_refs,
             leases,
             objects,
             grace,
+            usage,
         }
     }
 
@@ -215,6 +221,36 @@ impl ClusterGc {
         metrics::histogram!(GC_DURATION).record(start.elapsed().as_secs_f64());
         metrics::gauge!(GC_GRACE_RETAINED).set(stats.skipped_grace as f64);
 
+        // ── Per-tenant usage measurement (Phase 4d-3, R Q8/Q11). The committed
+        // roots above are TARGETS only (no names), so we re-enumerate this node's
+        // durable refs by NAME via `list("refs/")` to classify them by tenant
+        // (tenant_of_ref). Per-node (honest — spec §6): a node measures the durable
+        // refs in its local/hosted view. Reclamation is UNCHANGED (R Q10).
+        let mut groups: std::collections::HashMap<String, Vec<ObjectId>> =
+            std::collections::HashMap::new();
+        for (name, entry) in self.cluster_refs.list("refs/").await? {
+            if name.as_str().starts_with("refs/workspaces/") {
+                continue;
+            }
+            let tenant = tenant_of_ref(name.as_str()).to_string();
+            groups.entry(tenant).or_default().push(entry.target);
+        }
+        let mut usage: std::collections::HashMap<String, TenantUsage> =
+            std::collections::HashMap::with_capacity(groups.len());
+        for (tenant, tenant_roots) in groups {
+            let reachable = graph::reachable_from(&self.objects, tenant_roots).await?;
+            let mut bytes = 0u64;
+            let objects = reachable.len() as u64;
+            for id in &reachable {
+                let path = self.objects.object_path(id);
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    bytes += meta.len();
+                }
+            }
+            usage.insert(tenant, TenantUsage { bytes, objects });
+        }
+        self.usage.store(Arc::new(usage));
+
         Ok(stats)
     }
 }
@@ -231,6 +267,7 @@ mod tests {
     use ledge_core::{ObjectStore, HLC};
     use ledge_object_store::DiskObjectStore;
     use ledge_workspace::lease::LeaseStore;
+    use ledge_workspace::{TenantUsage, UsageMap};
 
     use crate::router::ShardId;
     use crate::shard_map::{Replica, ShardMap};
@@ -293,7 +330,14 @@ mod tests {
         let orphan = write_blob(&objects, b"orphan").await;
 
         // Grace = 0 so the just-written orphan is immediately sweepable.
-        let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO);
+        let usage = Arc::new(UsageMap::default());
+        let gc = ClusterGc::new(
+            store1.clone(),
+            leases.clone(),
+            objects.clone(),
+            Duration::ZERO,
+            usage.clone(),
+        );
         // now far in the future so mtime age >= grace(0) trivially.
         let stats = gc.run(4_000_000_000).await.unwrap();
 
@@ -301,5 +345,34 @@ mod tests {
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.skipped_grace, 0);
         assert!(!objects.exists(orphan).await.unwrap(), "orphan gone after sweep");
+    }
+
+    #[tokio::test]
+    async fn cluster_gc_measures_per_tenant_usage() {
+        let (_dir, _cluster, store1, objects, leases, _hlc) = gc_harness().await;
+        let usage = Arc::new(UsageMap::default());
+        // Seed an acme durable ref pointing at a blob through the cluster store.
+        let blob = write_blob(&objects, b"acme cluster payload").await;
+        store1
+            .update(
+                &ledge_core::RefName::new("refs/tenants/acme/heads/main").unwrap(),
+                blob,
+                None,
+            )
+            .await
+            .unwrap();
+        let gc = ClusterGc::new(
+            store1.clone(),
+            leases.clone(),
+            objects.clone(),
+            Duration::ZERO,
+            usage.clone(),
+        );
+        gc.run(4_000_000_000).await.unwrap();
+        let snap = usage.load();
+        let acme = snap.get("acme").copied().expect("acme measured");
+        assert_eq!(acme.objects, 1, "a single blob root");
+        assert!(acme.bytes > 0);
+        let _ = TenantUsage::default();
     }
 }

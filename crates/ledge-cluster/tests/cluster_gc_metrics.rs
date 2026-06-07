@@ -141,6 +141,7 @@ async fn cluster_gc_run_emits_gc_series() {
         leases.clone(),
         objects.clone(),
         Duration::from_secs(3600),
+        Arc::new(ledge_workspace::UsageMap::default()),
     );
 
     let recorder = DebuggingRecorder::new();

@@ -305,6 +305,7 @@ fn cluster_state(
         leases.clone(),
         objects.clone(),
         std::time::Duration::from_secs(0),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
     ));
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
