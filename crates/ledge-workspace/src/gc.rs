@@ -14,11 +14,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ledge_core::{ObjectId, RefStore, Result};
+use ledge_core::{tenant_of_ref, ObjectId, RefStore, Result};
 use ledge_object_store::{graph, DiskObjectStore};
 
 use crate::lease::LeaseStore;
-use crate::quota::UsageMap;
+use crate::quota::{TenantUsage, UsageMap};
 
 /// Mark-and-sweep GC engine. Holds shared handles only; no per-pass state.
 ///
@@ -39,11 +39,9 @@ pub struct Gc {
     refs: Arc<dyn RefStore>,
     leases: Arc<LeaseStore>,
     objects: Arc<DiskObjectStore>,
-    /// The shared per-tenant usage snapshot the GC pass measures into (Phase
-    /// 4d-3, R Q4/Q14). The SAME `Arc` the manager's commit gate and `QuotaCtx`
-    /// hold. Not yet written by `run` (the measurement pass lands in Task 5);
-    /// carried now so the assembly wires one shared store across every party.
-    #[allow(dead_code)]
+    /// The shared per-tenant usage snapshot this pass refreshes (Phase 4d-3,
+    /// R Q4). `ArcSwap::store`d at the end of `run`; read by the manager's commit
+    /// gate. The SAME `Arc` the server + manager hold.
     usage: Arc<UsageMap>,
 }
 
@@ -162,6 +160,38 @@ impl Gc {
             reclaimed += 1;
         }
 
+        // ── Per-tenant usage measurement (Phase 4d-3, side-product of the mark).
+        // Group the DURABLE roots (the non-workspace refs already enumerated above)
+        // by owning tenant (tenant_of_ref), then compute each tenant's reachable
+        // set INDEPENDENTLY: an object reachable from two tenants counts in BOTH
+        // (dedup-correct, you-pay-for-your-reachable-set — spec §3.4/§6, R Q8).
+        // This NEVER changes which objects were reclaimed above (R Q10); it only
+        // refreshes the shared UsageMap the commit soft-gate reads.
+        let mut groups: std::collections::HashMap<String, Vec<ObjectId>> =
+            std::collections::HashMap::new();
+        for (name, entry) in self.refs.list("refs/").await? {
+            if name.as_str().starts_with("refs/workspaces/") {
+                continue; // workspace refs are ephemeral, not durable usage
+            }
+            let tenant = tenant_of_ref(name.as_str()).to_string();
+            groups.entry(tenant).or_default().push(entry.target);
+        }
+        let mut usage: std::collections::HashMap<String, TenantUsage> =
+            std::collections::HashMap::with_capacity(groups.len());
+        for (tenant, tenant_roots) in groups {
+            let reachable = graph::reachable_from(&self.objects, tenant_roots).await?;
+            let mut bytes = 0u64;
+            let objects = reachable.len() as u64;
+            for id in &reachable {
+                let path = self.objects.object_path(id);
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    bytes += meta.len();
+                }
+            }
+            usage.insert(tenant, TenantUsage { bytes, objects });
+        }
+        self.usage.store(Arc::new(usage));
+
         let stats = GcStats {
             scanned,
             reachable: reachable_count,
@@ -198,6 +228,7 @@ mod tests {
 
     use crate::id::WorkspaceId;
     use crate::lease::{Lease, LeaseStore};
+    use crate::quota::{TenantUsage, UsageMap};
     use ledge_core::{ObjectId, ObjectStore, RefName, RefStore, HLC};
     use ledge_object_store::DiskObjectStore;
     use ledge_ref_store::RefStoreImpl;
@@ -212,6 +243,7 @@ mod tests {
         refs: Arc<RefStoreImpl>,
         leases: Arc<LeaseStore>,
         objects: Arc<DiskObjectStore>,
+        usage: Arc<UsageMap>,
         gc: Gc,
     }
 
@@ -222,18 +254,15 @@ mod tests {
         let refs = Arc::new(RefStoreImpl::open(root.clone(), hlc.clone()).unwrap());
         let leases = Arc::new(LeaseStore::open(root.clone(), hlc.clone()).unwrap());
         let objects = Arc::new(DiskObjectStore::new(root.clone()).unwrap());
-        let gc = Gc::new(
-            refs.clone(),
-            leases.clone(),
-            objects.clone(),
-            Arc::new(crate::quota::UsageMap::default()),
-        );
+        let usage = Arc::new(UsageMap::default());
+        let gc = Gc::new(refs.clone(), leases.clone(), objects.clone(), usage.clone());
         Harness {
             _dir: dir,
             hlc,
             refs,
             leases,
             objects,
+            usage,
             gc,
         }
     }
@@ -568,5 +597,61 @@ mod tests {
             !h.objects.exists(ws_obj).await.unwrap(),
             "released workspace's exclusive object must be reclaimed"
         );
+    }
+
+    // 10 ──────────────────────────────────────────────────────────────────────
+    /// Phase 4d-3: a GC pass measures per-tenant durable usage. Two tenants each
+    /// root a distinct commit→tree→blob graph (3 objects, ~known bytes); plus a
+    /// shared blob reachable from BOTH tenants' refs counts in EACH (dedup-correct,
+    /// overlap-counts-per-tenant — the total is NOT the sum, R Q8).
+    #[tokio::test]
+    async fn gc_measures_per_tenant_usage_with_overlap() {
+        let h = setup();
+        // acme's durable graph (commit→tree→blob = 3 objects).
+        let (a_blob, a_tree, a_commit) = build_graph(&h.objects).await;
+        set_ref(&h.refs, "refs/tenants/acme/heads/main", a_commit).await;
+        // globex's durable graph (a DIFFERENT 3-object graph).
+        let g_blob = write_blob(&h.objects, b"globex unique blob").await;
+        let g_tree = write_tree(&h.objects, "g.txt", g_blob).await;
+        let g_commit = write_commit(&h.objects, g_tree).await;
+        set_ref(&h.refs, "refs/tenants/globex/heads/main", g_commit).await;
+
+        // A blob reachable from BOTH tenants: give each a SECOND ref pointing at a
+        // shared blob (a blob is a leaf, so the ref roots exactly it). The shared
+        // blob counts in acme's AND globex's reachable sets.
+        let shared = write_blob(&h.objects, b"shared dedup blob").await;
+        set_ref(&h.refs, "refs/tenants/acme/heads/shared", shared).await;
+        set_ref(&h.refs, "refs/tenants/globex/heads/shared", shared).await;
+
+        h.gc.run().await.unwrap();
+
+        let snap = h.usage.load();
+        let acme = snap.get("acme").copied().expect("acme measured");
+        let globex = snap.get("globex").copied().expect("globex measured");
+        // Each tenant: its own 3-object graph + the shared blob = 4 objects.
+        assert_eq!(acme.objects, 4, "acme: commit+tree+blob+shared");
+        assert_eq!(globex.objects, 4, "globex: commit+tree+blob+shared");
+        assert!(acme.bytes > 0 && globex.bytes > 0, "bytes are summed from file sizes");
+        // Overlap-counts-per-tenant: the shared blob is in BOTH counts, so the
+        // sum of per-tenant objects (8) exceeds the physical distinct object count
+        // (3 + 3 + 1 = 7). This is the documented dedup-crosses-tenants semantics.
+        assert_eq!(acme.objects + globex.objects, 8);
+        // Root tenant has NO durable refs here ⇒ absent or zero.
+        assert_eq!(snap.get("root").copied().unwrap_or_default(), TenantUsage::default());
+        let _ = (a_blob, a_tree, g_blob, g_tree); // silence unused (ids are wired via refs)
+    }
+
+    // 11 ──────────────────────────────────────────────────────────────────────
+    /// Root-tenant durable refs (refs/heads/*) are measured under "root".
+    #[tokio::test]
+    async fn gc_measures_root_tenant_usage() {
+        let h = setup();
+        let (_b, _t, commit) = build_graph(&h.objects).await;
+        set_ref(&h.refs, "refs/heads/main", commit).await;
+        h.gc.run().await.unwrap();
+        let snap = h.usage.load();
+        let root = snap.get("root").copied().expect("root measured");
+        assert_eq!(root.objects, 3, "root: commit+tree+blob");
+        assert!(root.bytes > 0);
     }
 }
