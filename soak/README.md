@@ -46,6 +46,42 @@ Latest captured run: [`results/2026-06-07.txt`](results/2026-06-07.txt) — **15
   a documented follow-on; the harness reports the delta rather than claiming
   leak-free.
 
+## `reconfig.sh` — live shard-membership reconfiguration (Phase 4g)
+
+`reconfig.sh` stands up a real **4-node** cluster (`docker-compose.reconfig.yml`;
+node 4 is pre-provisioned for shard 0 but NOT an initial voter) and exercises live
+replica add/remove via `POST /cluster/{shard}/reconfigure`:
+
+```sh
+bash soak/reconfig.sh   # ~2-3 min; captured run: results/reconfig-2026-06-07.txt (10 PASS / 0 FAIL)
+```
+
+| Step | Action | Invariant proven |
+|------|--------|------------------|
+| 0 | init shard 0 = {1,2,3} | leader elected, baseline voters = {1,2,3} |
+| 1 GROW | reconfigure → {1,2,3,4} | node 4 becomes a **voter** AND **catches up from the Raft log** (`last_applied` converges) — live add, data-complete |
+| 2 SHRINK | reconfigure → {1,2,3} | node 4 dropped; committed log does **not** regress; cluster still serves — live remove |
+
+Reconfigure is driven by openraft `add_learner` (blocking catch-up) → `change_membership(ReplaceAllVoters)`.
+**`num_shards` is unchanged** — only replica sets move, so no key is rehashed.
+
+Notes (honest):
+- **Reconfigure must be POSTed to the shard LEADER** (openraft membership change is
+  leader-only; a follower returns 503). The harness reads the leader from
+  `/cluster/status` and targets it.
+- The harness does **grow + shrink** (deterministic — node 4 is never the leader).
+  *Replacing a different node* is the same mechanism; removing the **current leader**
+  triggers an openraft leadership transfer (handled by openraft, avoided here only
+  to keep the test deterministic).
+- **Keyspace resharding (changing `num_shards`) is NOT done** — the routing is
+  modulo (`hash % num_shards`), so a count change rehashes everything; that needs a
+  consistent-hash routing redesign (documented deferral, spec §6). 4g changes
+  *placement*, not *shard count*.
+- New voters obtain existing objects via on-demand anti-entropy pull; the route also
+  rebuilds this node's object push-peer set (bearer-authed). TLS clusters re-derive
+  full TLS object peers on restart (the route's rebuilt peers carry the bearer but
+  not the per-node TLS client config — a v1 limitation).
+
 ## Honest limitations (the single-host ceiling)
 
 - **One physical host.** Real processes, real container network, real clean

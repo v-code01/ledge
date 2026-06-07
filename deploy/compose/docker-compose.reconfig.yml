@@ -1,0 +1,60 @@
+# Phase 4g reconfiguration harness cluster: 4 nodes pre-provisioned for shard 0,
+# but initialized with only {1,2,3}. ledge-4 sits with an empty Raft group until
+# admitted via POST /cluster/0/reconfigure. Auth on; the bootstrap token gives the
+# harness a client credential. Dev only — see deploy/README.md.
+x-ledge-common: &ledge-common
+  image: ledge:latest
+  command: ["start", "--config", "/etc/ledge/config.toml"]
+  environment: &ledge-env
+    LEDGE__AUTH__ENABLED: "true"
+    LEDGE__AUTH__CLUSTER_SECRET: "dev-cluster-secret-change-me"
+    LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_9b7ee379e0250464_6ixCz0hl7icRM_WuUtzu-uHAVsDqF9teIkUTyR69VZQ"
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+    interval: 15s
+    timeout: 3s
+    retries: 5
+    start_period: 15s
+
+services:
+  ledge-1:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "1"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ledge-1-data:/var/lib/ledge
+      - ./reconfig-config.toml:/etc/ledge/config.toml:ro
+  ledge-2:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "2"
+    volumes:
+      - ledge-2-data:/var/lib/ledge
+      - ./reconfig-config.toml:/etc/ledge/config.toml:ro
+  ledge-3:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "3"
+    volumes:
+      - ledge-3-data:/var/lib/ledge
+      - ./reconfig-config.toml:/etc/ledge/config.toml:ro
+  ledge-4:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "4"
+    volumes:
+      - ledge-4-data:/var/lib/ledge
+      - ./reconfig-config.toml:/etc/ledge/config.toml:ro
+
+volumes:
+  ledge-1-data:
+  ledge-2-data:
+  ledge-3-data:
+  ledge-4-data:

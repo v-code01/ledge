@@ -125,6 +125,40 @@ Kubernetes, the per-pod PVC holds this.
       namespace, exempt from tenancy + quotas).
 - [ ] Rotate certs by rolling restart (no hot reload yet).
 
+## Live cluster reconfiguration (Phase 4g)
+
+Change a shard's replica set on a running cluster — grow the replication factor,
+decommission a node, or replace a dead one — with no downtime, via
+`POST /cluster/{shard}/reconfigure` (send it to the shard **leader**; it carries
+the `cluster_secret` bearer like other `/cluster/*` routes). `num_shards` is
+unchanged (no key reshuffle); openraft handles the joint-consensus voter change
+and streams the Raft log+snapshot to any newly-added node.
+
+```sh
+# add node 4 to shard 0 (grow / stage a replacement) — POST to the current leader:
+curl -X POST http://<leader>:3000/cluster/0/reconfigure \
+  -H "Authorization: Bearer <cluster_secret>" -H "content-type: application/json" \
+  -d '{"members":{"1":"http://node-1:3000","2":"http://node-2:3000","3":"http://node-3:3000","4":"http://node-4:3000"}}'
+# watch convergence: voters + last_applied per shard
+curl -fsS http://<leader>:3000/cluster/status -H "Authorization: Bearer <cluster_secret>"
+```
+
+**Replace a dead node (node 3 → node 5):**
+1. Start node 5 with the target shard listed in its `[[cluster.shards]]` config (so
+   it boots an empty Raft group ready to receive the snapshot — pre-provisioning).
+2. POST `/cluster/0/reconfigure` to the leader with the new member set (node 5 in,
+   node 3 out). openraft adds node 5 as a learner (catches up), then promotes it and
+   drops node 3 in one transition.
+3. Persist the new member set into every node's `[[cluster.shards]]` config for the
+   next boot (the runtime change lives in openraft's log meanwhile; it is not written
+   back to your config file automatically).
+
+Caveats: removing the **current leader** triggers a leadership transfer (open­raft
+handles it; prefer reconfiguring from a node that stays a voter). Changing the
+**number of shards** (keyspace split/merge) is NOT supported — that needs a routing
+redesign (see the design spec). Reconfigure-rebuilt object peers carry the bearer
+but not per-node TLS config; a rolling restart re-derives full TLS peers.
+
 ## Honest limitations
 
 - **systemd unit is authored but not machine-verified here** (built on macOS, no

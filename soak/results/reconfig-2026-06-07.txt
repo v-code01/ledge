@@ -1,0 +1,30 @@
+
+=== bring up 4-node cluster (node 4 pre-provisioned, not yet a voter) ===
+  PASS 4 nodes healthy
+
+=== 0. init shard 0 with voters {1,2,3} ===
+  PASS leader elected
+     leader=ledge-1; voters(leader)=1,2,3
+  PASS baseline voters = {1,2,3}
+
+=== 1. GROW → {1,2,3,4} (live add node 4) ===
+     POST reconfigure to leader ledge-1 (leader last_applied=1)
+     reconfigure HTTP {"added":[4],"removed":[],"shard":0,"voters":[1,2,3,4]}200
+  PASS reconfigure(grow) accepted (200)
+  PASS node 4 is now a VOTER (live add)
+  PASS node 4 caught up from Raft log (last_applied>=1)
+     voters now: 1,2,3,4
+
+=== 2. SHRINK → {1,2,3} (live remove node 4) ===
+     POST reconfigure to leader ledge-1
+     reconfigure HTTP {"added":[],"removed":[4],"shard":0,"voters":[1,2,3]}200
+  PASS reconfigure(shrink) accepted (200)
+  PASS node 4 removed; voters = {1,2,3}
+  PASS committed log did not regress across shrink (last_applied 4 -> 6)
+  PASS cluster still serving (leader present) after shrink
+
+=== summary ===
+  PASS=10  FAIL=0
+
+=== teardown ===
+HARNESS_EXIT=0

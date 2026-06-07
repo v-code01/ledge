@@ -1,0 +1,23 @@
+# Shared config for the Phase 4g reconfiguration harness. Shard 0 lists all FOUR
+# nodes as members so each (incl. ledge-4) builds an empty Raft group at boot —
+# but the cluster is initialized with only {1,2,3}; ledge-4 is pre-provisioned and
+# admitted later via POST /cluster/0/reconfigure (the §3.3 pre-provision model).
+# Only LEDGE__CLUSTER__NODE_ID differs per service (set in the compose file).
+
+[server]
+addr = "0.0.0.0:3000"
+data_dir = "/var/lib/ledge"
+
+[cluster]
+enabled = true
+num_shards = 1
+raft_bind = "0.0.0.0:4001"  # parsed but unwired; /raft is on the client port
+
+[[cluster.shards]]
+id = 0
+members = [
+  { id = 1, addr = "http://ledge-1:3000" },
+  { id = 2, addr = "http://ledge-2:3000" },
+  { id = 3, addr = "http://ledge-3:3000" },
+  { id = 4, addr = "http://ledge-4:3000" },
+]
