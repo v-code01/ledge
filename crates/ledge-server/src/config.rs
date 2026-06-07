@@ -12,6 +12,8 @@ pub struct LedgeConfig {
     pub cluster: ClusterConfig,
     pub auth: AuthConfig,
     pub quotas: QuotaConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -141,6 +143,31 @@ pub struct QuotaConfig {
     pub burst: Option<u32>,
 }
 
+/// TLS / mTLS (Phase 4d-4) configuration. Disabled by default: a default-loaded
+/// config serves plaintext and is byte-identical to Phase 4d-3. `enabled` adds
+/// server-TLS on the client listener; `mtls` adds a mutual-TLS peer listener.
+#[derive(Debug, serde::Deserialize, Clone, Default)]
+pub struct TlsConfig {
+    /// When false (default), no TLS: the server binds plaintext (back-compat).
+    pub enabled: bool,
+    /// Server leaf+chain PEM (required when `enabled`).
+    #[serde(default)] pub cert_path: Option<String>,
+    /// Server private key PEM (required when `enabled`).
+    #[serde(default)] pub key_path: Option<String>,
+    /// CA bundle PEM: verifies peer server certs (outbound) and client certs
+    /// (mTLS inbound). Required when `mtls`.
+    #[serde(default)] pub ca_path: Option<String>,
+    /// When true, require + verify a CA-signed client cert on the peer listener
+    /// (mutual TLS). Requires `enabled` + `cluster.enabled` + ca/peer/client paths.
+    #[serde(default)] pub mtls: bool,
+    /// Bind address for the mTLS peer listener (required when `mtls`).
+    #[serde(default)] pub peer_addr: Option<String>,
+    /// THIS node's client identity cert PEM for outbound mTLS (required when `mtls`).
+    #[serde(default)] pub client_cert_path: Option<String>,
+    /// THIS node's client identity key PEM for outbound mTLS (required when `mtls`).
+    #[serde(default)] pub client_key_path: Option<String>,
+}
+
 impl QuotaConfig {
     /// Project the manager-relevant durable limits into a [`ledge_workspace::QuotaLimits`]
     /// (Copy). The rate/burst are NOT included — they build the `TenantRateLimiter`
@@ -191,7 +218,9 @@ impl LedgeConfig {
             .set_default("cluster.num_shards",                 1i64).map_err(map_cfg)?
             .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?
             .set_default("auth.enabled",                       false).map_err(map_cfg)?
-            .set_default("quotas.enabled",                     false).map_err(map_cfg)?;
+            .set_default("quotas.enabled",                     false).map_err(map_cfg)?
+            .set_default("tls.enabled", false).map_err(map_cfg)?
+            .set_default("tls.mtls",    false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -202,12 +231,49 @@ impl LedgeConfig {
         builder = builder.add_source(
             Environment::with_prefix("LEDGE").separator("__").try_parsing(true),
         );
-        builder.build().map_err(map_cfg)?.try_deserialize::<LedgeConfig>().map_err(map_cfg)
+        let cfg: LedgeConfig = builder
+            .build()
+            .map_err(map_cfg)?
+            .try_deserialize()
+            .map_err(map_cfg)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Fail-fast config invariants (Phase 4d-4). Called at the end of `load()` so
+    /// the server refuses to boot half-configured rather than failing at the first
+    /// handshake.
+    fn validate(&self) -> ledge_core::Result<()> {
+        if self.tls.enabled
+            && (self.tls.cert_path.is_none() || self.tls.key_path.is_none())
+        {
+            return Err(invalid_config(
+                "tls.enabled requires tls.cert_path and tls.key_path",
+            ));
+        }
+        if self.tls.mtls {
+            let ok = self.tls.enabled
+                && self.cluster.enabled
+                && self.tls.ca_path.is_some()
+                && self.tls.peer_addr.is_some()
+                && self.tls.client_cert_path.is_some()
+                && self.tls.client_key_path.is_some();
+            if !ok {
+                return Err(invalid_config(
+                    "tls.mtls requires tls.enabled + cluster.enabled + tls.{ca_path,peer_addr,client_cert_path,client_key_path}",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
 fn map_cfg(e: config::ConfigError) -> LedgeError {
     LedgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn invalid_config(msg: &str) -> LedgeError {
+    LedgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string()))
 }
 
 #[cfg(test)]
@@ -404,5 +470,68 @@ mod tests {
         let cfg = LedgeConfig::load(None).unwrap();
         assert_eq!(cfg.server.addr, "10.0.0.1:5000");
         std::env::remove_var("LEDGE__SERVER__ADDR");
+    }
+
+    #[test]
+    fn tls_config_defaults_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert!(!cfg.tls.enabled);
+        assert!(!cfg.tls.mtls);
+        assert!(cfg.tls.cert_path.is_none());
+    }
+
+    #[test]
+    fn tls_enabled_requires_cert_and_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[tls]\nenabled=true").unwrap();
+        assert!(
+            LedgeConfig::load(Some(&f.path().to_path_buf())).is_err(),
+            "enabled without cert/key must fail validation"
+        );
+    }
+
+    #[test]
+    fn tls_mtls_requires_full_peer_identity_and_cluster() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[tls]\nenabled=true\ncert_path=\"/c.pem\"\nkey_path=\"/k.pem\"\nmtls=true"
+        )
+        .unwrap();
+        assert!(
+            LedgeConfig::load(Some(&f.path().to_path_buf())).is_err(),
+            "mtls without ca/peer/client/cluster must fail"
+        );
+    }
+
+    #[test]
+    fn tls_full_valid_config_ok() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[cluster]\nenabled=true\nnode_id=1\nnum_shards=1\nraft_bind=\"0.0.0.0:4001\"\n\
+             [tls]\nenabled=true\ncert_path=\"/c.pem\"\nkey_path=\"/k.pem\"\nca_path=\"/ca.pem\"\n\
+             mtls=true\npeer_addr=\"0.0.0.0:4443\"\nclient_cert_path=\"/cc.pem\"\nclient_key_path=\"/ck.pem\""
+        )
+        .unwrap();
+        assert!(LedgeConfig::load(Some(&f.path().to_path_buf())).is_ok());
+    }
+
+    #[test]
+    fn tls_enabled_env_parses_with_cert_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("LEDGE__TLS__ENABLED", "true");
+        std::env::set_var("LEDGE__TLS__CERT_PATH", "/c.pem");
+        std::env::set_var("LEDGE__TLS__KEY_PATH", "/k.pem");
+        let cfg = LedgeConfig::load(None).unwrap();
+        assert!(cfg.tls.enabled);
+        assert_eq!(cfg.tls.cert_path.as_deref(), Some("/c.pem"));
+        std::env::remove_var("LEDGE__TLS__ENABLED");
+        std::env::remove_var("LEDGE__TLS__CERT_PATH");
+        std::env::remove_var("LEDGE__TLS__KEY_PATH");
     }
 }
