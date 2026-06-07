@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.cluster.node_id,
                 map,
                 raft_config,
+                if cfg.auth.enabled { cfg.auth.cluster_secret.clone() } else { None },
             )
             .await?;
 

@@ -207,10 +207,43 @@ impl HttpRaftNetworkFactory {
     /// Build a factory for `shard` over the given `node_id -> base_url` table.
     /// The `reqwest::Client` is pooled (keep-alive) and cloned per connection.
     pub fn new(shard: ShardId, peers: HashMap<NodeId, PeerAddr>) -> Self {
+        Self::with_secret(shard, peers, None)
+    }
+
+    /// Like [`new`](Self::new), but when `cluster_secret` is `Some`, the pooled
+    /// `reqwest::Client` attaches `Authorization: Bearer <secret>` as a default
+    /// header on every `/raft/*` RPC, so a peer's INTERNAL classifier accepts
+    /// the call when auth is enabled (spec §4.5). `None` ⇒ a bare client,
+    /// byte-identical to [`new`](Self::new).
+    pub fn with_secret(
+        shard: ShardId,
+        peers: HashMap<NodeId, PeerAddr>,
+        cluster_secret: Option<String>,
+    ) -> Self {
+        let client = match cluster_secret {
+            Some(secret) => {
+                // A malformed header value (control bytes in the secret) is a
+                // config error; fall back to a bare client rather than panic so
+                // the node still boots — auth will simply reject its RPCs, which
+                // surfaces the misconfiguration loudly instead of silently.
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}"))
+                    .ok()
+                    .and_then(|val| {
+                        let mut headers = reqwest::header::HeaderMap::new();
+                        headers.insert(reqwest::header::AUTHORIZATION, val);
+                        reqwest::Client::builder()
+                            .default_headers(headers)
+                            .build()
+                            .ok()
+                    })
+                    .unwrap_or_default()
+            }
+            None => reqwest::Client::new(),
+        };
         Self {
             shard,
             peers: Arc::new(peers),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -1078,5 +1111,68 @@ mod tests {
         assert!(store_live.exists(id).await.unwrap(), "live peer got it");
 
         server_live.abort();
+    }
+
+    #[tokio::test]
+    async fn with_secret_factory_attaches_bearer_on_raft_rpc() {
+        // A factory built `with_secret(Some(..))` must attach
+        // `Authorization: Bearer <secret>` on every outbound `/raft/*` RPC, so a
+        // peer's INTERNAL classifier accepts node-to-node Raft traffic when auth
+        // is enabled (spec §4.5). We capture the header on a tiny axum endpoint.
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::Router;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Captures the Authorization header the server saw, then returns a valid
+        // empty WireResult::Ok so the client side decodes cleanly.
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        async fn route(
+            State(seen): State<Arc<Mutex<Option<String>>>>,
+            headers: HeaderMap,
+            _path: axum::extract::Path<(u32, String)>,
+            _body: axum::body::Bytes,
+        ) -> Vec<u8> {
+            *seen.lock().unwrap() = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            // A vote RPC expects a WireResult::Ok(bincode(VoteResponse)); encode
+            // one so the client decodes without erroring (the response value is
+            // irrelevant — this test only asserts the header the server received).
+            let vr = VoteResponse::<NodeId>::new(Vote::new(9, 1), None, false);
+            enc(&WireResult::Ok(enc(&vr).unwrap())).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/raft/{shard}/{kind}", post(route))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut peers = HashMap::new();
+        peers.insert(1u64, format!("http://{addr}"));
+        let mut factory =
+            HttpRaftNetworkFactory::with_secret(ShardId(0), peers, Some("svc-secret".to_string()));
+        let mut conn = factory.new_client(1, &Node::new(format!("http://{addr}"))).await;
+        let _ = conn
+            .vote(
+                VoteRequest::new(Vote::new(9, 1), None),
+                RPCOption::new(std::time::Duration::from_secs(2)),
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("Bearer svc-secret"),
+            "raft RPC from a with_secret factory must carry the Bearer cluster secret"
+        );
     }
 }

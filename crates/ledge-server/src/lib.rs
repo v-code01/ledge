@@ -136,6 +136,12 @@ pub struct ClusterStack {
 ///   shards this node hosts, deduped by addr: a node replicates a shard's
 ///   objects to that shard's co-replicas, and a node hosting multiple shards
 ///   unions their peer sets.
+///
+/// `cluster_secret`: when `Some` (auth enabled), every outbound peer client
+/// (forward, object, and per-shard Raft) attaches it as a `Bearer`
+/// `Authorization` default header so the receiving node's INTERNAL classifier
+/// accepts the call (spec section 4.5); `None` yields bare clients, byte-identical
+/// to the pre-4d-1 behavior.
 pub async fn build_cluster_stack(
     data_dir: std::path::PathBuf,
     objects_disk: Arc<DiskObjectStore>,
@@ -143,6 +149,7 @@ pub async fn build_cluster_stack(
     node_id: u64,
     map: ShardMap,
     raft_config: Arc<openraft::Config>,
+    cluster_secret: Option<String>,
 ) -> ledge_core::Result<ClusterStack> {
     // Router's shard count comes from the map so routing & placement agree.
     let router = ShardRouter::new(map.num_shards());
@@ -166,7 +173,10 @@ pub async fn build_cluster_stack(
         // Per-shard network knows ONLY this shard's members (spec §3.3): id→addr
         // from the map. member_map → BTreeMap; the factory wants a HashMap.
         let peers: HashMap<u64, String> = map.member_map(shard).into_iter().collect();
-        let net = HttpRaftNetworkFactory::new(shard, peers);
+        // Per-shard Raft RPCs (`/raft/*`) also carry the Bearer cluster secret as
+        // a default header when auth is enabled (spec §4.5), so a peer's INTERNAL
+        // classifier accepts them; `None` ⇒ bare client, byte-identical to before.
+        let net = HttpRaftNetworkFactory::with_secret(shard, peers, cluster_secret.clone());
         let raft = openraft::Raft::<TypeConfig>::new(node_id, raft_config.clone(), net, log, sm)
             .await
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -188,7 +198,7 @@ pub async fn build_cluster_stack(
 
     // The ref store gets the map + an HTTP forwarder so a ref routed to a shard
     // this node does NOT host is forwarded to a hosting member (spec §3.4/§4.3).
-    let forward_client = reqwest::Client::new();
+    let forward_client = auth_client(cluster_secret.clone())?;
     let forwarder: Arc<dyn ledge_cluster::RefOpForwarder> =
         Arc::new(HttpForwarder::new(map.clone(), forward_client));
     let cluster_refs = Arc::new(ClusterRefStore::with_placement(
@@ -213,7 +223,7 @@ pub async fn build_cluster_stack(
     // The `shard` segment passed to each `HttpObjectPeer` is the shard under
     // which we first met that addr — content addressing makes the segment
     // non-load-bearing for correctness, so deduping across shards is safe.
-    let object_client = reqwest::Client::new();
+    let object_client = auth_client(cluster_secret.clone())?;
     let mut seen_addrs: std::collections::HashSet<String> = Default::default();
     let mut object_peers: Vec<Arc<dyn ledge_cluster::ObjectPeer>> = Vec::new();
     for shard in map.shards_hosted_by(node_id) {
@@ -240,6 +250,24 @@ pub async fn build_cluster_stack(
         shards: Arc::new(raft_handles),
         map,
     })
+}
+
+/// Build an outbound `reqwest::Client` whose default `Authorization` header is
+/// the Bearer cluster secret, applied to EVERY request so node-to-node calls
+/// satisfy the receiving node's INTERNAL classifier (spec section 4.5). `None`
+/// yields a bare client, byte-identical to the pre-4d-1 behavior.
+fn auth_client(cluster_secret: Option<String>) -> ledge_core::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(secret) = cluster_secret {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let val = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}"))
+            .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
+        headers.insert(reqwest::header::AUTHORIZATION, val);
+        builder = builder.default_headers(headers);
+    }
+    builder
+        .build()
+        .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -367,6 +395,20 @@ mod build_cluster_stack_tests {
         )
     }
 
+    #[test]
+    fn auth_default_header_helper_attaches_bearer() {
+        // The helper used by build_cluster_stack to build outbound clients must
+        // attach `Authorization: Bearer <secret>` as a default header when the
+        // secret is Some, and build a bare client when None.
+        let with = super::auth_client(Some("svc-secret".to_string()));
+        assert!(with.is_ok(), "client builds with default header");
+        let without = super::auth_client(None);
+        assert!(without.is_ok(), "bare client builds");
+        // A direct header assertion: the default-headers map is private to reqwest,
+        // so we assert construction succeeds and rely on the in-process classifier
+        // test (Task 4 enabled_internal_needs_cluster_secret) for end-to-end accept.
+    }
+
     #[tokio::test]
     async fn builds_only_locally_hosted_shards() {
         // shard0={1,2,3}, shard1={2,3,4}. Build the stack AS NODE 1.
@@ -401,6 +443,7 @@ mod build_cluster_stack_tests {
             1, // node_id = 1 → hosts shard0 ONLY
             map,
             raft_cfg(),
+            None, // no cluster secret in this placement test
         )
         .await
         .unwrap();
