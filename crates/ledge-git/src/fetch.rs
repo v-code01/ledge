@@ -816,11 +816,35 @@ mod tests {
 
     #[test]
     fn present_store_roundtrip_both_segments() {
-        for seg in ["", "workspaces/abc/"] {
+        // Phase 4d-2: a multi-segment tenant prefix ("tenants/<t>/") composes
+        // identically to the workspace segment — the machinery is a pure string
+        // insert/strip after `refs/`, transparent to segment depth.
+        for seg in ["", "workspaces/abc/", "tenants/acme/"] {
             for client in ["refs/heads/main", "refs/tags/v1", "refs/heads/feature/x"] {
                 assert_eq!(present_ref(&store_ref(client, seg), seg), client);
             }
         }
+    }
+
+    #[test]
+    fn present_store_roundtrip_tenant_segment() {
+        // refs/heads/main ↔ refs/tenants/acme/heads/main (durable default-repo
+        // ref for a named tenant — spec §3.1).
+        assert_eq!(
+            store_ref("refs/heads/main", "tenants/acme/"),
+            "refs/tenants/acme/heads/main"
+        );
+        assert_eq!(
+            present_ref("refs/tenants/acme/heads/main", "tenants/acme/"),
+            "refs/heads/main"
+        );
+        // A different tenant's stored ref does NOT match acme's segment ⇒ filtered
+        // out of acme's view (discovery lists only `refs/tenants/acme/`, but prove
+        // present_ref is defensive on a non-matching name too).
+        assert_eq!(
+            present_ref("refs/tenants/globex/heads/main", "tenants/acme/"),
+            "refs/tenants/globex/heads/main"
+        );
     }
 
     #[test]
