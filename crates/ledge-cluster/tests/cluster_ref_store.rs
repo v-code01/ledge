@@ -329,6 +329,7 @@ async fn cluster_update_replicates_to_all_replicas_of_shard() {
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_targets_by_shard_returns_hosted_shard_targets() {
+    use ledge_cluster::forward::RefOpForwarder;
     use ledge_cluster::router::ShardId;
     use ledge_cluster::shard_map::{Replica, ShardMap};
     use ledge_cluster::testkit::MultiShardCluster;

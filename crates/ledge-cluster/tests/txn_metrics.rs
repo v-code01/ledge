@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use ledge_cluster::forward::{ClusterOp, InMemoryForwarder, RefOpResponse};
+use ledge_cluster::forward::{ClusterOp, InMemoryForwarder, RefOpForwarder, RefOpResponse};
 use ledge_cluster::ref_store::StoreApplier;
 use ledge_cluster::router::ShardId;
 use ledge_cluster::shard_map::{Replica, ShardMap};

@@ -139,6 +139,11 @@ pub enum RefOpResponse {
 pub trait RefOpForwarder: Send + Sync {
     /// Forward `op` for `shard` to a hosting node and return its applied result.
     async fn forward(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse>;
+
+    /// Update the placement map used to pick forward targets (Phase 4g live
+    /// reconfiguration). Default no-op for forwarders that don't route by a map
+    /// (e.g. the reject-all stub). HttpForwarder/InMemoryForwarder override.
+    fn set_map(&self, _map: crate::shard_map::ShardMap) {}
 }
 
 /// The local-apply entry point a hosting node exposes: apply an ALREADY
@@ -163,7 +168,7 @@ pub struct InMemoryForwarder {
 
 impl InMemoryForwarder {
     /// Empty registry; populate with [`register`](Self::register) and the map
-    /// with [`set_map`](Self::set_map).
+    /// with [`set_map`](RefOpForwarder::set_map).
     pub fn new() -> Self {
         Self::default()
     }
@@ -172,15 +177,16 @@ impl InMemoryForwarder {
     pub fn register(&self, node_id: u64, applier: std::sync::Arc<dyn LocalApplier>) {
         self.appliers.lock().unwrap().insert(node_id, applier);
     }
-
-    /// Set the shard map used to pick a forward target.
-    pub fn set_map(&self, map: crate::shard_map::ShardMap) {
-        *self.map.lock().unwrap() = Some(map);
-    }
 }
 
 #[async_trait]
 impl RefOpForwarder for InMemoryForwarder {
+    /// Set the shard map used to pick a forward target (overrides the trait
+    /// default no-op; Phase 4g live reconfiguration swaps this map in place).
+    fn set_map(&self, map: crate::shard_map::ShardMap) {
+        *self.map.lock().unwrap() = Some(map);
+    }
+
     async fn forward(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse> {
         // Pick any member of the target shard (no leader preference in-mem).
         let target = {
@@ -271,6 +277,15 @@ mod tests {
 
     fn oid(b: u8) -> ObjectId {
         ObjectId::from_bytes([b; 32])
+    }
+
+    /// `set_map` is callable through an `Arc<dyn RefOpForwarder>` (Phase 4g live
+    /// reconfiguration updates forward targets through the trait object, not a
+    /// concrete type). RED until `set_map` is lifted onto the trait.
+    #[test]
+    fn set_map_through_trait_object() {
+        let f: std::sync::Arc<dyn RefOpForwarder> = std::sync::Arc::new(InMemoryForwarder::new());
+        f.set_map(crate::shard_map::ShardMap::default()); // must compile + run via the trait
     }
 
     /// Two nodes, two shards. Node 1 hosts ONLY shard 0; node 2 hosts ONLY

@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tempfile::TempDir;
 
-use ledge_cluster::forward::InMemoryForwarder;
+use ledge_cluster::forward::{InMemoryForwarder, RefOpForwarder};
 use ledge_cluster::gc::ClusterGc;
 use ledge_cluster::ref_store::{ClusterRefStore, StoreApplier};
 use ledge_cluster::router::ShardId;

@@ -269,6 +269,10 @@ mod tests {
     use ledge_workspace::lease::LeaseStore;
     use ledge_workspace::{TenantUsage, UsageMap};
 
+    // `set_map` is now a trait method on `RefOpForwarder`; the trait must be in
+    // scope to call it on a concrete `InMemoryForwarder`.
+    use crate::forward::RefOpForwarder;
+
     use crate::router::ShardId;
     use crate::shard_map::{Replica, ShardMap};
     use crate::testkit::MultiShardCluster;
