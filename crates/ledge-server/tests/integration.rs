@@ -190,7 +190,7 @@ async fn appstate_holds_trait_objects() {
 
     let view = state
         .workspaces
-        .fork(std::slice::from_ref(&main), Duration::from_secs(60))
+        .fork(std::slice::from_ref(&main), Duration::from_secs(60), "root")
         .await
         .unwrap();
     assert_eq!(view.refs.len(), 1);
@@ -203,7 +203,7 @@ async fn appstate_holds_trait_objects() {
     let durable = RefName::new("refs/heads/promoted").unwrap();
     let outcomes = state
         .workspaces
-        .commit(view.id, &[(ws_ref, durable.clone())])
+        .commit(view.id, &[(ws_ref, durable.clone())], "root")
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 1);

@@ -451,7 +451,7 @@ async fn workspace_manager_over_cluster_ref_store() {
 
     // --- fork: copies ref deltas through the cluster (n cluster CAS-creates) ---
     let view = mgr
-        .fork(&[main.clone(), dev.clone()], Duration::from_secs(3600))
+        .fork(&[main.clone(), dev.clone()], Duration::from_secs(3600), "root")
         .await
         .unwrap();
     assert_eq!(view.refs.len(), 2, "fork copied both source refs");
@@ -468,7 +468,7 @@ async fn workspace_manager_over_cluster_ref_store() {
     let durable = name("refs/heads/release");
     let ws_dev = name(&format!("refs/workspaces/{}/heads/dev", view.id.to_hex()));
     let outcomes = mgr
-        .commit(view.id, &[(ws_main.clone(), durable.clone())])
+        .commit(view.id, &[(ws_main.clone(), durable.clone())], "root")
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 1);
@@ -486,7 +486,7 @@ async fn workspace_manager_over_cluster_ref_store() {
     );
 
     // --- get: resolve the workspace view back through the cluster store ---
-    let got = mgr.get(view.id).await.unwrap().expect("workspace present");
+    let got = mgr.get(view.id, "root").await.unwrap().expect("workspace present");
     let mut got_names: Vec<&str> = got.refs.iter().map(|(n, _)| n.as_str()).collect();
     got_names.sort_unstable();
     assert_eq!(
@@ -498,8 +498,8 @@ async fn workspace_manager_over_cluster_ref_store() {
     assert!(refs.get(&ws_dev).await.unwrap().is_some());
 
     // --- release: tears down workspace refs across the cluster, idempotently ---
-    mgr.release(view.id).await.unwrap();
-    assert!(mgr.get(view.id).await.unwrap().is_none());
+    mgr.release(view.id, "root").await.unwrap();
+    assert!(mgr.get(view.id, "root").await.unwrap().is_none());
     assert!(
         refs.get(&ws_main).await.unwrap().is_none(),
         "workspace refs must be deleted from the cluster on release"

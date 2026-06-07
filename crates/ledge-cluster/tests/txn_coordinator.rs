@@ -572,7 +572,7 @@ async fn workspace_commit_cross_shard_is_atomic() {
 
     // Fork both sources; the manager re-roots each under refs/workspaces/<id>/.
     let view = mgr
-        .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60))
+        .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60), "root")
         .await
         .unwrap();
 
@@ -598,7 +598,7 @@ async fn workspace_commit_cross_shard_is_atomic() {
     // Commit ws1→s1 and ws2→s2 in one call. s1/s2 are on distinct shards ⇒ the
     // coordinator runs cross-shard 2PC; both must commit atomically.
     let outcomes = mgr
-        .commit(view.id, &[(ws1, s1.clone()), (ws2, s2.clone())])
+        .commit(view.id, &[(ws1, s1.clone()), (ws2, s2.clone())], "root")
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 2, "both mappings promoted");

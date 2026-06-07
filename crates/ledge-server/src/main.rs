@@ -275,13 +275,18 @@ async fn main() -> anyhow::Result<()> {
                     Ok(expired) => {
                         let n = expired.len() as u64;
                         for lease in expired {
-                            if let Err(e) = workspaces.release(lease.id).await {
+                            // The sweeper runs cross-tenant; release on behalf of
+                            // the lease's OWNING tenant so the ownership check
+                            // (manager) matches (root passes "" ⇄ "root").
+                            if let Err(e) = workspaces.release(lease.id, &lease.tenant_id).await {
                                 tracing::warn!(error = %e, id = %lease.id.to_hex(), "expiry release failed");
                             }
                         }
                         if n > 0 {
                             ledge_server::metrics::record_lease_expired(n);
-                            if let Ok(live) = workspaces.list().await {
+                            // Active gauge is a CROSS-TENANT total; count all live
+                            // leases directly (the manager's list is tenant-scoped).
+                            if let Ok(live) = leases.live(now_ms).await {
                                 ledge_server::metrics::set_workspaces_active(live.len() as f64);
                             }
                         }

@@ -157,10 +157,16 @@ fn map_lookup_err(e: ledge_core::LedgeError) -> Response {
 }
 
 /// Live (unexpired, non-tombstoned) workspace count, for the active gauge.
+/// CROSS-TENANT total: driven off the lease store directly (the manager's `list`
+/// is tenant-scoped), so the gauge reflects every tenant's live workspaces.
 async fn live_count(state: &AppState) -> f64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     state
-        .workspaces
-        .list()
+        .leases
+        .live(now_ms)
         .await
         .map(|v| v.len() as f64)
         .unwrap_or(0.0)
@@ -185,7 +191,7 @@ pub async fn create_workspace(
     let ttl_secs = req.ttl_seconds.unwrap_or(state.default_ttl_secs);
     match state
         .workspaces
-        .fork(&sources, Duration::from_secs(ttl_secs))
+        .fork(&sources, Duration::from_secs(ttl_secs), "root")
         .await
     {
         Ok(view) => {
@@ -214,7 +220,7 @@ pub async fn create_workspace(
 
 /// GET /workspaces
 pub async fn list_workspaces(State(state): State<AppState>) -> Response {
-    match state.workspaces.list().await {
+    match state.workspaces.list("root").await {
         Ok(views) => {
             let out: Vec<WorkspaceSummary> = views
                 .iter()
@@ -238,7 +244,7 @@ pub async fn get_workspace(State(state): State<AppState>, Path(id): Path<String>
         Some(w) => w,
         None => return StatusCode::NOT_FOUND.into_response(),
     };
-    match state.workspaces.get(wid).await {
+    match state.workspaces.get(wid, "root").await {
         Ok(Some(view)) => {
             // A returned view whose lease has expired is Gone, not Found.
             if view.lease.expires_at_ms <= wall_now_ms() {
@@ -272,7 +278,7 @@ pub async fn renew_workspace(
     };
     match state
         .workspaces
-        .renew(wid, Duration::from_secs(req.ttl_seconds))
+        .renew(wid, Duration::from_secs(req.ttl_seconds), "root")
         .await
     {
         Ok(lease) => (
@@ -317,7 +323,7 @@ pub async fn commit_workspace(
         };
         mappings.push((ws_ref, d_ref));
     }
-    match state.workspaces.commit(wid, &mappings).await {
+    match state.workspaces.commit(wid, &mappings, "root").await {
         Ok(outcomes) => {
             metrics::record_workspace_commit(outcomes.len() as u64);
             let out: Vec<CommitOutcomeDto> = outcomes
@@ -351,7 +357,7 @@ pub async fn delete_workspace(
         Some(w) => w,
         None => return StatusCode::NOT_FOUND.into_response(),
     };
-    match state.workspaces.release(wid).await {
+    match state.workspaces.release(wid, "root").await {
         Ok(()) => {
             metrics::record_workspace_release();
             metrics::set_workspaces_active(live_count(&state).await);
