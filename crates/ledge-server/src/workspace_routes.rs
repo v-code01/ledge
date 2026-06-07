@@ -484,6 +484,35 @@ mod tests {
     }
 }
 
+/// Shared test `AppState` builder, visible to sibling test modules (the auth
+/// middleware tests need it). Mirrors `route_tests::test_state` but `pub(crate)`
+/// so `auth::middleware`'s tests can construct a real-shaped `AppState`.
+#[cfg(test)]
+pub(crate) fn test_state_for_auth(dir: &tempfile::TempDir) -> AppState {
+    use std::sync::Arc;
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(ledge_core::HLC::new());
+    let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+    let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    let (workspaces, leases, gc) =
+        crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+    AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards: None,
+        cluster_refs: None,
+        shard_map: None,
+        cluster_gc: None,
+        auth: crate::auth::AuthCtx::disabled(),
+    }
+}
+
 #[cfg(test)]
 mod route_tests {
     use super::*;

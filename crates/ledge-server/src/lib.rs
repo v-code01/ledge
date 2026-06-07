@@ -243,6 +243,9 @@ pub async fn build_cluster_stack(
 }
 
 pub fn build_app(state: AppState) -> Router {
+    // The auth middleware needs its own clone of the state (`with_state` below
+    // consumes `state` into the router's handler state).
+    let auth_state = state.clone();
     Router::new()
         .route("/healthz", axum::routing::get(routes::healthz))
         .route("/metrics", axum::routing::get(routes::metrics_handler))
@@ -332,6 +335,16 @@ pub fn build_app(state: AppState) -> Router {
                 .layer(TimeoutLayer::with_status_code(
                     axum::http::StatusCode::REQUEST_TIMEOUT,
                     Duration::from_secs(60),
+                ))
+                // Auth chokepoint (spec §4.3): innermost of these three layers,
+                // so a request is traced → timeout-guarded → authed → routed.
+                // It classifies PUBLIC/INTERNAL/CLIENT, verifies the credential,
+                // gates `/admin/*`, and injects the resolved `Principal` before
+                // any handler runs. Disabled ⇒ synthetic root (byte-identical
+                // behavior); 401/403 responses are still traced + timeout-bounded.
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state,
+                    crate::auth::middleware::auth_layer,
                 )),
         )
 }

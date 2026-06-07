@@ -32,6 +32,13 @@ pub const SNAPSHOT_DURATION: &str = "ledge_snapshot_duration_seconds";
 pub const RPC_REQUESTS_TOTAL: &str = "ledge_rpc_requests_total";
 pub const RPC_REQUEST_DURATION: &str = "ledge_rpc_request_duration_seconds";
 
+// ── Auth metrics (Phase 4d-1, spec §7/§8). Emitted by the auth middleware on
+//    every classified request; the gauge tracks the live key count. Labels are
+//    low-cardinality (`result` ∈ ok/unauthenticated/forbidden) and NEVER include
+//    the path or any credential, so no secret leaks into the metrics surface. ───
+pub const AUTH_REQUESTS_TOTAL: &str = "ledge_auth_requests_total";
+pub const AUTH_KEYS: &str = "ledge_auth_keys";
+
 // ── Per-shard Raft gauges/counters (spec §7). Populated ONLY in cluster mode by
 //    `record_raft_metrics`; single-node never emits these series, so `/metrics`
 //    output for a single-node server is unchanged. ─────────────────────────────
@@ -135,6 +142,18 @@ pub fn record_snapshot(stats: &ledge_cow::CloneStats, d: std::time::Duration) {
 pub fn record_rpc_request(method: &'static str, d: std::time::Duration) {
     metrics::counter!(RPC_REQUESTS_TOTAL, "method" => method).increment(1);
     metrics::histogram!(RPC_REQUEST_DURATION, "method" => method).record(d.as_secs_f64());
+}
+
+/// Record one auth decision. `result` ∈ `ok` / `unauthenticated` / `forbidden`.
+/// Never includes the path or any credential as a label (low cardinality + no
+/// secret leakage — spec §8).
+pub fn record_auth_request(result: &'static str) {
+    metrics::counter!(AUTH_REQUESTS_TOTAL, "result" => result).increment(1);
+}
+
+/// Gauge: count of live (non-revoked, non-expired) API keys.
+pub fn set_auth_keys(n: f64) {
+    metrics::gauge!(AUTH_KEYS).set(n);
 }
 
 /// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
@@ -314,6 +333,20 @@ mod tests {
     fn rpc_record_helper_no_panic_without_recorder() {
         record_rpc_request("writeObject", std::time::Duration::from_millis(1));
         record_rpc_request("unknown", std::time::Duration::from_micros(50));
+    }
+
+    #[test]
+    fn auth_metric_constants_correct() {
+        assert_eq!(AUTH_REQUESTS_TOTAL, "ledge_auth_requests_total");
+        assert_eq!(AUTH_KEYS, "ledge_auth_keys");
+    }
+
+    #[test]
+    fn auth_record_helpers_no_panic_without_recorder() {
+        record_auth_request("ok");
+        record_auth_request("unauthenticated");
+        record_auth_request("forbidden");
+        set_auth_keys(7.0);
     }
 
     #[test]
