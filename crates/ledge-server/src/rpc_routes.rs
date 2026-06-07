@@ -54,6 +54,10 @@ pub async fn rpc(
         workspaces: state.workspaces.clone(),
         gc: state.gc.clone(),
         default_ttl_secs: state.default_ttl_secs,
+        // 4d-2: per-tenant scoping rides on the verified principal — every
+        // workspace op in dispatch keys off this, giving RPC the SAME isolation
+        // as REST. Disabled auth injects the synthetic root → tenant "root".
+        tenant_id: principal.tenant_id.clone(),
     };
 
     let result = ledge_rpc::dispatch(&body, &ctx).instrument(span).await;
@@ -190,5 +194,125 @@ mod tests {
         let state = state_over(&dir);
         let (status, _) = post_rpc(crate::build_app(state), vec![0xFFu8; 3]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// §6.8 — RPC parity end-to-end: a fork by acme is invisible to globex via
+    /// getWorkspace over /rpc (the tenant rides on the key, through the auth
+    /// middleware into `RpcCtx.tenant_id`). Mirrors the REST 404 as an RPC
+    /// `Response.error` ("unknown workspace …") — no view, no existence leak.
+    #[tokio::test]
+    async fn rpc_get_workspace_is_tenant_isolated() {
+        use crate::auth::store::AuthStore;
+        use crate::auth::AuthCtx;
+        use crate::auth::{PrincipalKind, Scopes};
+        use ledge_rpc::ledge_capnp::request;
+
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().to_path_buf();
+        let hlc = Arc::new(HLC::new());
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+        let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+        let (workspaces, leases, gc) =
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc.clone())
+                .unwrap();
+        let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
+        let acme = store
+            .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        let globex = store
+            .mint("globex", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        let auth = AuthCtx { enabled: true, store, cluster_secret: None };
+        let state = AppState {
+            objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+            workspaces,
+            leases,
+            gc,
+            default_ttl_secs: 3600,
+            data_dir: p,
+            raft_shards: None,
+            cluster_refs: None,
+            shard_map: None,
+            cluster_gc: None,
+            auth,
+        };
+        let app = crate::build_app(state);
+
+        // acme forks an empty workspace via /rpc.
+        let fork_req = {
+            let mut msg = Builder::new_default();
+            {
+                let root = msg.init_root::<request::Builder>();
+                let mut f = root.init_fork();
+                f.set_ttl_seconds(3600);
+                f.init_sources(0);
+            }
+            let mut buf = Vec::new();
+            serialize::write_message(&mut buf, &msg).unwrap();
+            buf
+        };
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc")
+                    .header("content-type", CONTENT_TYPE)
+                    .header("authorization", format!("Bearer {acme}"))
+                    .body(Body::from(fork_req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let out = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let reader = serialize::read_message(&mut &out[..], ReaderOptions::new()).unwrap();
+        let id = match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+            response::Which::Workspace(w) => {
+                w.unwrap().get_id().unwrap().to_str().unwrap().to_string()
+            }
+            _ => panic!("expected workspace from acme fork"),
+        };
+
+        // globex getWorkspace(id) over /rpc ⇒ Response.error (not the workspace).
+        let get_req = {
+            let mut msg = Builder::new_default();
+            {
+                let root = msg.init_root::<request::Builder>();
+                let mut g = root.init_get_workspace();
+                g.set_workspace_id(id.as_str());
+            }
+            let mut buf = Vec::new();
+            serialize::write_message(&mut buf, &msg).unwrap();
+            buf
+        };
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc")
+                    .header("content-type", CONTENT_TYPE)
+                    .header("authorization", format!("Bearer {globex}"))
+                    .body(Body::from(get_req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK); // business error rides in the body
+        let out2 = to_bytes(r2.into_body(), usize::MAX).await.unwrap();
+        let reader2 = serialize::read_message(&mut &out2[..], ReaderOptions::new()).unwrap();
+        match reader2.get_root::<response::Reader>().unwrap().which().unwrap() {
+            response::Which::Error(e) => {
+                assert!(
+                    e.unwrap().to_str().unwrap().contains("unknown workspace"),
+                    "globex must get unknown-workspace, never acme's view"
+                );
+            }
+            _ => panic!("globex must NOT see acme's workspace"),
+        }
     }
 }

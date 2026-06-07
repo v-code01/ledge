@@ -52,6 +52,12 @@ pub struct RpcCtx {
     pub gc: Arc<Gc>,
     /// Fallback TTL (seconds) applied when a `fork` request sends `ttlSeconds == 0`.
     pub default_ttl_secs: u64,
+    /// The caller's tenant (Phase 4d-2 spec §3.4). A plain `String` — NOT the
+    /// server's `Principal` — so `ledge-rpc` gains no `ledge-server` dependency
+    /// (which would close a crate cycle). Threaded into every workspace op so the
+    /// RPC path enforces the SAME per-tenant isolation as REST. `"root"` (or "")
+    /// is the global/legacy namespace.
+    pub tenant_id: String,
 }
 
 impl RpcCtx {

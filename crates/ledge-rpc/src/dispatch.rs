@@ -189,7 +189,7 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 Ok(n) => n,
                 Err(e) => return DispatchResult::Error(e),
             };
-            match ctx.workspaces.fork(&names, ctx.resolve_ttl(ttl_seconds), "root").await {
+            match ctx.workspaces.fork(&names, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id).await {
                 Ok(view) => DispatchResult::Workspace(view),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
@@ -211,7 +211,7 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 };
                 parsed.push((w, d));
             }
-            match ctx.workspaces.commit(id, &parsed, "root").await {
+            match ctx.workspaces.commit(id, &parsed, &ctx.tenant_id).await {
                 Ok(outcomes) => DispatchResult::CommitOutcomes(outcomes),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
@@ -221,7 +221,7 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 Ok(id) => id,
                 Err(e) => return DispatchResult::Error(e.to_string()),
             };
-            match ctx.workspaces.renew(id, ctx.resolve_ttl(ttl_seconds), "root").await {
+            match ctx.workspaces.renew(id, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id).await {
                 Ok(lease) => DispatchResult::Lease(lease),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
@@ -231,7 +231,7 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 Ok(id) => id,
                 Err(e) => return DispatchResult::Error(e.to_string()),
             };
-            match ctx.workspaces.release(id, "root").await {
+            match ctx.workspaces.release(id, &ctx.tenant_id).await {
                 Ok(()) => DispatchResult::Ok,
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
@@ -241,13 +241,13 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 Ok(id) => id,
                 Err(e) => return DispatchResult::Error(e.to_string()),
             };
-            match ctx.workspaces.get(id, "root").await {
+            match ctx.workspaces.get(id, &ctx.tenant_id).await {
                 Ok(Some(view)) => DispatchResult::Workspace(view),
                 Ok(None) => DispatchResult::Error(format!("unknown workspace {workspace_id}")),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
         }
-        DecodedRequest::ListWorkspaces => match ctx.workspaces.list("root").await {
+        DecodedRequest::ListWorkspaces => match ctx.workspaces.list(&ctx.tenant_id).await {
             Ok(views) => DispatchResult::WorkspaceList(views),
             Err(e) => DispatchResult::Error(e.to_string()),
         },
