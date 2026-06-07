@@ -79,6 +79,28 @@ pub struct InfoRefsQuery {
     service: String,
 }
 
+/// Verify that workspace `id` is owned by `tenant`; `Ok(())` if owned, `Err(404)`
+/// otherwise (a foreign or unknown workspace is indistinguishable — no existence
+/// leak, spec §5). The check is one lease read; workspace refs themselves stay
+/// physically tenant-agnostic (`refs/workspaces/<id>/…`, R2).
+async fn ws_tenant_ok(state: &AppState, id: &str, tenant: &str) -> Result<(), StatusCode> {
+    let wid = ledge_workspace::WorkspaceId::from_hex(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    match state.leases.get(wid).await {
+        Ok(Some(l)) => {
+            let norm = |t: &str| if t.is_empty() { "root" } else { t }.to_string();
+            if norm(&l.tenant_id) == norm(tenant) {
+                Ok(())
+            } else {
+                metrics::record_tenant_denied();
+                Err(StatusCode::NOT_FOUND)
+            }
+        }
+        // Absent lease: a never-existed workspace → 404 (same as unknown id).
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 pub async fn healthz() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
 }
@@ -94,7 +116,13 @@ pub async fn info_refs(
     Path(repo): Path<String>,
     Query(q): Query<InfoRefsQuery>,
     State(state): State<AppState>,
+    principal: crate::auth::Principal,
 ) -> Response {
+    // Default-repo durable refs are physically namespaced per tenant: root →
+    // "" (legacy global, byte-identical), a named tenant → "tenants/<t>/", so the
+    // client's `refs/heads/main` is stored/listed as `refs/tenants/<t>/heads/main`
+    // and presented stripped (spec §3.1).
+    let segment = ledge_core::tenant_prefix(&principal.tenant_id);
     let start = Instant::now();
     info!(repo = %repo, service = %q.service, "git info/refs");
     match q.service.as_str() {
@@ -104,7 +132,7 @@ pub async fn info_refs(
                 state.objects.clone(),
                 state.refs.clone(),
                 state.objects_disk.as_ref(),
-                "",
+                &segment,
             )
             .await;
             metrics::record_git_request_duration("upload-pack", start.elapsed());
@@ -121,7 +149,7 @@ pub async fn info_refs(
             let result = ledge_git::push::handle_receive_pack_discovery(
                 state.refs.clone(),
                 state.objects_disk.as_ref(),
-                "",
+                &segment,
             )
             .await;
             metrics::record_git_request_duration("receive-pack", start.elapsed());
@@ -143,8 +171,10 @@ pub async fn info_refs(
 pub async fn upload_pack(
     Path(repo): Path<String>,
     State(state): State<AppState>,
+    principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
+    let segment = ledge_core::tenant_prefix(&principal.tenant_id);
     let start = Instant::now();
     info!(repo = %repo, "git-upload-pack");
     metrics::record_git_request("upload-pack");
@@ -153,7 +183,7 @@ pub async fn upload_pack(
         state.objects.clone(),
         state.refs.clone(),
         state.objects_disk.as_ref(),
-        "",
+        &segment,
     )
     .await;
     metrics::record_git_request_duration("upload-pack", start.elapsed());
@@ -169,9 +199,10 @@ pub async fn upload_pack(
 pub async fn receive_pack(
     Path(repo): Path<String>,
     State(state): State<AppState>,
-    _principal: crate::auth::Principal,
+    principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
+    let segment = ledge_core::tenant_prefix(&principal.tenant_id);
     let start = Instant::now();
     info!(repo = %repo, "git-receive-pack");
     metrics::record_git_request("receive-pack");
@@ -179,7 +210,7 @@ pub async fn receive_pack(
         body,
         state.refs.clone(),
         state.objects_disk.as_ref(),
-        "",
+        &segment,
     )
     .await;
     metrics::record_git_request_duration("receive-pack", start.elapsed());
@@ -197,7 +228,14 @@ pub async fn ws_info_refs(
     Path(id): Path<String>,
     Query(q): Query<InfoRefsQuery>,
     State(state): State<AppState>,
+    principal: crate::auth::Principal,
 ) -> Response {
+    // Cross-tenant access to a foreign/unknown workspace is 404 (no existence
+    // leak). Workspace refs stay physically tenant-agnostic (R2); isolation is
+    // this ownership check + the unguessable id.
+    if let Err(code) = ws_tenant_ok(&state, &id, &principal.tenant_id).await {
+        return code.into_response();
+    }
     let segment = format!("workspaces/{id}/");
     let start = Instant::now();
     info!(ws = %id, service = %q.service, "ws git info/refs");
@@ -248,8 +286,12 @@ pub async fn ws_info_refs(
 pub async fn ws_upload_pack(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
+    if let Err(code) = ws_tenant_ok(&state, &id, &principal.tenant_id).await {
+        return code.into_response();
+    }
     let segment = format!("workspaces/{id}/");
     let start = Instant::now();
     metrics::record_git_request("upload-pack");
@@ -275,9 +317,12 @@ pub async fn ws_upload_pack(
 pub async fn ws_receive_pack(
     Path(id): Path<String>,
     State(state): State<AppState>,
-    _principal: crate::auth::Principal,
+    principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
+    if let Err(code) = ws_tenant_ok(&state, &id, &principal.tenant_id).await {
+        return code.into_response();
+    }
     let segment = format!("workspaces/{id}/");
     let start = Instant::now();
     metrics::record_git_request("receive-pack");
@@ -314,5 +359,175 @@ mod tests {
         let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["status"], "ok");
+    }
+}
+
+#[cfg(test)]
+mod tenant_git_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request};
+    use ledge_core::{ObjectId, RefName, RefStore, HLC};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    /// Two-tenant app PLUS handles to the shared ref + object stores, so a test
+    /// can seed a tenant's PHYSICAL durable ref (pointing at a REAL git object, so
+    /// the wire discovery can resolve its SHA-1) and assert isolation at the wire.
+    type GitApp = (
+        axum::Router,
+        String,
+        String,
+        Arc<ledge_ref_store::RefStoreImpl>,
+        Arc<ledge_object_store::DiskObjectStore>,
+    );
+
+    async fn git_app(dir: &TempDir) -> GitApp {
+        use crate::auth::principal::{PrincipalKind, Scopes};
+        use crate::auth::store::AuthStore;
+        use crate::auth::AuthCtx;
+        let p = dir.path().to_path_buf();
+        let hlc = Arc::new(HLC::new());
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+        let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+        let (workspaces, leases, gc) =
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc.clone())
+                .unwrap();
+        let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
+        let acme = store
+            .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        let globex = store
+            .mint("globex", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        let auth = AuthCtx { enabled: true, store, cluster_secret: None };
+        let state = AppState {
+            objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+            workspaces,
+            leases,
+            gc,
+            default_ttl_secs: 3600,
+            data_dir: p,
+            raft_shards: None,
+            cluster_refs: None,
+            shard_map: None,
+            cluster_gc: None,
+            auth,
+        };
+        (crate::build_app(state), acme, globex, refs, objects)
+    }
+
+    /// Write a real git blob so the wire discovery can resolve its SHA-1, and
+    /// return the BLAKE3 [`ObjectId`] to point a ref at.
+    async fn seed_blob(
+        objects: &ledge_object_store::DiskObjectStore,
+        content: &'static [u8],
+    ) -> ObjectId {
+        objects
+            .write_git_object(3, axum::body::Bytes::from_static(content))
+            .await
+            .unwrap()
+    }
+
+    async fn discovery(app: &axum::Router, token: &str) -> String {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/repo/info/refs?service=git-upload-pack")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// §6.5/§6.6 — each tenant's default-repo discovery lists ONLY its own
+    /// branches (physically under refs/tenants/<t>/), presented as refs/heads/main.
+    #[tokio::test]
+    async fn default_repo_discovery_is_tenant_isolated() {
+        let dir = TempDir::new().unwrap();
+        let (app, acme, globex, refs, objects) = git_app(&dir).await;
+        // Seed each tenant's PHYSICAL durable ref directly, pointing at a real
+        // git object so the wire discovery can resolve its SHA-1.
+        let acme_oid = seed_blob(&objects, b"acme blob").await;
+        let globex_oid = seed_blob(&objects, b"globex blob").await;
+        refs.update(&RefName::new("refs/tenants/acme/heads/main").unwrap(), acme_oid, None)
+            .await
+            .unwrap();
+        refs.update(
+            &RefName::new("refs/tenants/globex/heads/feature").unwrap(),
+            globex_oid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let acme_adv = discovery(&app, &acme).await;
+        // acme sees its own branch, presented client-facing (prefix stripped).
+        assert!(acme_adv.contains("refs/heads/main"), "acme must see its main: {acme_adv}");
+        assert!(!acme_adv.contains("refs/heads/feature"), "acme must NOT see globex's feature");
+        assert!(!acme_adv.contains("tenants/"), "client never sees the physical prefix");
+
+        let globex_adv = discovery(&app, &globex).await;
+        assert!(globex_adv.contains("refs/heads/feature"));
+        assert!(!globex_adv.contains("refs/heads/main"), "globex must NOT see acme's main");
+    }
+
+    /// §6.4 — globex GET /ws/<acme-id>/info/refs → 404; acme on its own → 200.
+    #[tokio::test]
+    async fn workspace_git_ownership_enforced() {
+        let dir = TempDir::new().unwrap();
+        let (app, acme, globex, _refs, _objects) = git_app(&dir).await;
+        // acme creates a workspace via REST.
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces")
+                    .header("content-type", "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {acme}"))
+                    .body(Body::from(r#"{"source":[],"ttl_seconds":3600}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let id = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let ws_get = |token: &str| {
+            let app = app.clone();
+            let uri = format!("/ws/{id}/info/refs?service=git-upload-pack");
+            let token = token.to_string();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(ws_get(&globex).await, StatusCode::NOT_FOUND, "globex denied acme's ws git");
+        assert_eq!(ws_get(&acme).await, StatusCode::OK, "acme serves its own ws git");
     }
 }
