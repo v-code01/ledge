@@ -1,8 +1,10 @@
 //! Mark-and-sweep garbage collection for the object store (spec §6).
 //!
 //! GC reclaims content-addressed objects that are no longer reachable from any
-//! root. Roots are (a) durable refs `refs/heads/*` + `refs/tags/*` and (b) the
-//! refs of every *live-lease* workspace `refs/workspaces/<id>/*`. The pass is
+//! root. Roots are (a) every durable ref — any ref NOT under `refs/workspaces/*`
+//! (covers `refs/heads/*`, `refs/tags/*`, and per-tenant `refs/tenants/<t>/*`,
+//! Phase 4d-2 R6) — and (b) the refs of every *live-lease* workspace
+//! `refs/workspaces/<id>/*`. The pass is
 //! crash-safe and race-safe via a candidate-set freeze (§6 safety argument):
 //! the set of deletion candidates is snapshotted *before* marking, so any object
 //! written after the snapshot is structurally excluded from this pass and can
@@ -94,10 +96,16 @@ impl Gc {
         // Monotonic timer for the pass duration (Instant is clock-skew-immune).
         let start = std::time::Instant::now();
         // ── 1. Snapshot roots ────────────────────────────────────────────────
-        // Durable refs are unconditional roots.
+        // Durable refs are unconditional roots. Phase 4d-2 (R6): a real tenant's
+        // durable refs live under refs/tenants/<t>/heads|tags/*, so we root EVERY
+        // ref that is NOT a workspace ref — mirroring the cluster GC filter
+        // `!starts_with("refs/workspaces/")` (ledge-cluster/src/ref_store.rs:618).
+        // Root-tenant refs (refs/heads/*, refs/tags/*) are a SUBSET of this widened
+        // filter, so single-tenant/root behavior is byte-identical; workspace refs
+        // stay lease-gated (rooted only when their lease is live, added below).
         let mut roots: Vec<ObjectId> = Vec::new();
-        for prefix in ["refs/heads/", "refs/tags/"] {
-            for (_name, entry) in self.refs.list(prefix).await? {
+        for (name, entry) in self.refs.list("refs/").await? {
+            if !name.as_str().starts_with("refs/workspaces/") {
                 roots.push(entry.target);
             }
         }
@@ -477,5 +485,74 @@ mod tests {
         );
         // And it would never be deleted: a real run() built from
         // `candidates_before` only ever calls delete() on members of that set.
+    }
+
+    // 9 ───────────────────────────────────────────────────────────────────────
+    /// Phase 4d-2 GC interaction (R6): a tenant's DURABLE ref
+    /// (refs/tenants/<t>/heads/…) is a root — its object survives GC — while a
+    /// RELEASED workspace's exclusive object is reclaimed once its lease is
+    /// tombstoned. This proves the widened durable-root filter keeps tenant
+    /// durable refs AND the lease-gated workspace reclamation intact: too narrow
+    /// would lose tenant data; too broad would never reclaim workspace garbage.
+    #[tokio::test]
+    async fn tenant_durable_survives_gc_released_workspace_reclaims() {
+        let h = setup();
+        // Two blobs: one reachable from a tenant durable ref, one only from a
+        // soon-to-be-released workspace ref.
+        let durable_obj = write_blob(&h.objects, b"durable payload").await;
+        let ws_obj = write_blob(&h.objects, b"workspace only payload").await;
+
+        // Tenant acme's PHYSICAL durable ref roots durable_obj. Note this is
+        // neither refs/heads/* nor refs/tags/* — under the OLD two-prefix filter
+        // it would have been IGNORED and durable_obj wrongly reclaimed.
+        set_ref(&h.refs, "refs/tenants/acme/heads/main", durable_obj).await;
+
+        // A workspace (live lease) roots ws_obj via a workspace ref.
+        let id = WorkspaceId::generate(&h.hlc);
+        set_ref(
+            &h.refs,
+            &format!("refs/workspaces/{}/heads/wip", id.to_hex()),
+            ws_obj,
+        )
+        .await;
+        // Stamp the live lease as acme-owned (GC roots ALL live workspaces via the
+        // unscoped `live()`, regardless of tenant).
+        let mut l = lease(id, now_ms_test() + 600_000); // live
+        l.tenant_id = "acme".to_string();
+        h.leases.put(l).await.unwrap();
+
+        // While the lease is live, BOTH survive.
+        h.gc.run().await.unwrap();
+        assert!(
+            h.objects.exists(durable_obj).await.unwrap(),
+            "tenant durable survives (live)"
+        );
+        assert!(
+            h.objects.exists(ws_obj).await.unwrap(),
+            "live workspace object survives"
+        );
+
+        // Release the workspace (tombstone the lease + delete its refs).
+        h.leases.tombstone(id).await.unwrap();
+        for (name, entry) in h
+            .refs
+            .list(&format!("refs/workspaces/{}/", id.to_hex()))
+            .await
+            .unwrap()
+        {
+            h.refs.delete(&name, entry.target).await.unwrap();
+        }
+
+        // After release, the workspace-only object is reclaimed; the tenant
+        // durable object STILL survives (it is a durable root, R6).
+        h.gc.run().await.unwrap();
+        assert!(
+            h.objects.exists(durable_obj).await.unwrap(),
+            "tenant durable persists after release"
+        );
+        assert!(
+            !h.objects.exists(ws_obj).await.unwrap(),
+            "released workspace's exclusive object must be reclaimed"
+        );
     }
 }

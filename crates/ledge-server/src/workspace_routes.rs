@@ -165,12 +165,16 @@ fn map_lookup_err(e: ledge_core::LedgeError) -> Response {
 }
 
 /// Like `map_lookup_err`, but a denial-shaped error also bumps
-/// `ledge_tenant_denied_total`. A cross-tenant ownership mismatch surfaces as
-/// `NotFound` (renew/release, R4) or as a `Corruption("commit: unknown
-/// workspace …")` (commit, Task 3); both map to 404 in `map_lookup_err`. A
-/// genuine unknown-id 404 also counts: from the server's view both are "you
-/// asked for an id you may not have", and the metric is a coarse probing/misconfig
-/// signal (spec §7).
+/// `ledge_tenant_denied_total`. A cross-tenant ownership mismatch ALWAYS
+/// surfaces as `LedgeError::NotFound` — on every op (renew/commit/release) it
+/// flows from `owned_lease`'s `cross_tenant_not_found()` (R4) — so the
+/// `matches!(NotFound)` arm is what catches cross-tenant attempts. The separate
+/// `"unknown workspace"` string-match catches the ABSENT-id case (an id with no
+/// lease at all, which `owned_lease` reports as `Ok(None)` and the commit handler
+/// turns into a `Corruption("commit: unknown workspace …")`); a genuine
+/// unknown-id 404 thus also counts. Both map to 404 in `map_lookup_err`: from the
+/// server's view both are "you asked for an id you may not have", and the metric
+/// is a coarse probing/misconfig signal (spec §7).
 fn map_lookup_err_counting_denials(e: ledge_core::LedgeError) -> Response {
     let is_denial = matches!(e, ledge_core::LedgeError::NotFound(_))
         || e.to_string().contains("unknown workspace");
