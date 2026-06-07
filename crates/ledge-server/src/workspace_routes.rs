@@ -153,8 +153,20 @@ fn map_lookup_err(e: ledge_core::LedgeError) -> Response {
     // mis-mapped by the generic substring checks below.
     if let ledge_core::LedgeError::QuotaExceeded(ref m) = e {
         if m.starts_with("requests:") {
+            metrics::record_quota_denied("requests");
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
+        // Classify the 507 resource from the message prefix for the metric label.
+        let resource = if m.starts_with("workspaces:") {
+            "workspaces"
+        } else if m.starts_with("durable_bytes:") {
+            "durable_bytes"
+        } else if m.starts_with("object_count:") {
+            "object_count"
+        } else {
+            "storage"
+        };
+        metrics::record_quota_denied(resource);
         return StatusCode::INSUFFICIENT_STORAGE.into_response();
     }
     // A retryable cluster-availability fault must surface as 503, NOT 500, so

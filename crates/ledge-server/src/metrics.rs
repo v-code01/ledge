@@ -179,6 +179,27 @@ pub fn record_quota_denied(resource: &'static str) {
     metrics::counter!(QUOTA_DENIED_TOTAL, "resource" => resource).increment(1);
 }
 
+// ── Quota usage gauges (Phase 4d-3, spec §5). `denied_total{resource}` (above)
+//    bumps on every denial; the usage gauges below reflect the latest GC
+//    measurement, labeled by tenant (cardinality bounded by tenant count —
+//    spec §5). NEVER labeled with another tenant's secret; the resource/tenant
+//    labels are low-cardinality. ──────────────────────────────────────────────
+pub const QUOTA_USAGE_BYTES: &str = "ledge_quota_usage_bytes";
+pub const QUOTA_USAGE_OBJECTS: &str = "ledge_quota_usage_objects";
+pub const QUOTA_WORKSPACES: &str = "ledge_quota_workspaces";
+
+/// Set the per-tenant usage gauges from the latest GC measurement. Called by the
+/// GC scheduler after each pass refreshes the `UsageMap` (Phase 4d-3, spec §5).
+pub fn set_quota_usage(tenant: &str, bytes: u64, objects: u64) {
+    metrics::gauge!(QUOTA_USAGE_BYTES, "tenant" => tenant.to_string()).set(bytes as f64);
+    metrics::gauge!(QUOTA_USAGE_OBJECTS, "tenant" => tenant.to_string()).set(objects as f64);
+}
+
+/// Set the per-tenant live-workspace gauge (Phase 4d-3, spec §5).
+pub fn set_quota_workspaces(tenant: &str, n: u64) {
+    metrics::gauge!(QUOTA_WORKSPACES, "tenant" => tenant.to_string()).set(n as f64);
+}
+
 /// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
 ///
 /// Called from the cluster-mode metrics poller (one task per shard, started in
@@ -380,6 +401,24 @@ mod tests {
     #[test]
     fn tenant_denied_record_helper_no_panic_without_recorder() {
         record_tenant_denied();
+    }
+
+    #[test]
+    fn quota_metric_constants_correct() {
+        assert_eq!(QUOTA_DENIED_TOTAL, "ledge_quota_denied_total");
+        assert_eq!(QUOTA_USAGE_BYTES, "ledge_quota_usage_bytes");
+        assert_eq!(QUOTA_USAGE_OBJECTS, "ledge_quota_usage_objects");
+        assert_eq!(QUOTA_WORKSPACES, "ledge_quota_workspaces");
+    }
+
+    #[test]
+    fn quota_record_helpers_no_panic_without_recorder() {
+        record_quota_denied("workspaces");
+        record_quota_denied("durable_bytes");
+        record_quota_denied("object_count");
+        record_quota_denied("requests");
+        set_quota_usage("acme", 4096, 7);
+        set_quota_workspaces("acme", 3);
     }
 
     #[test]

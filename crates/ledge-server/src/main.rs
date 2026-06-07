@@ -323,12 +323,20 @@ async fn main() -> anyhow::Result<()> {
     // window to ≤ one interval — spec §3.4/§6.)
     {
         let gc = gc.clone();
+        let quota_usage = quota_usage.clone();
         let interval_secs = cfg.workspace.gc_interval_secs;
+        // Publish per-tenant usage gauges from the freshly-stored UsageMap (spec §5).
+        let publish_gauges = |usage: &ledge_workspace::UsageMap| {
+            for (tenant, u) in usage.load().iter() {
+                ledge_server::metrics::set_quota_usage(tenant, u.bytes, u.objects);
+            }
+        };
         tokio::spawn(async move {
             // Startup measurement: refresh usage once before steady-state ticking
             // so the storage quota (commit gate) + gauges have data at boot.
-            if let Err(e) = gc.run().await {
-                tracing::warn!(error = %e, "startup gc/usage measurement failed");
+            match gc.run().await {
+                Ok(_) => publish_gauges(&quota_usage),
+                Err(e) => tracing::warn!(error = %e, "startup gc/usage measurement failed"),
             }
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -338,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 match gc.run().await {
                     Ok(stats) => {
                         ledge_server::metrics::record_gc_run(&stats, start.elapsed());
+                        publish_gauges(&quota_usage);
                         tracing::info!(reclaimed = stats.reclaimed, bytes_freed = stats.bytes_freed, "scheduled gc pass");
                     }
                     Err(e) => tracing::warn!(error = %e, "scheduled gc pass failed"),
@@ -371,13 +380,20 @@ async fn main() -> anyhow::Result<()> {
     //    boot; subsequent refreshes ride the on-demand GC requests. Per-node
     //    (honest — spec §6).
     if let Some(cgc) = cluster_gc.clone() {
+        let quota_usage = quota_usage.clone();
         tokio::spawn(async move {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if let Err(e) = cgc.run(now).await {
-                tracing::warn!(error = %e, "startup cluster gc/usage measurement failed");
+            match cgc.run(now).await {
+                Ok(_) => {
+                    // Publish per-tenant usage gauges from this node's measurement (spec §5).
+                    for (tenant, u) in quota_usage.load().iter() {
+                        ledge_server::metrics::set_quota_usage(tenant, u.bytes, u.objects);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "startup cluster gc/usage measurement failed"),
             }
         });
     }
