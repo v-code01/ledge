@@ -200,6 +200,17 @@ pub fn set_quota_workspaces(tenant: &str, n: u64) {
     metrics::gauge!(QUOTA_WORKSPACES, "tenant" => tenant.to_string()).set(n as f64);
 }
 
+/// Transport-posture gauges (Phase 4d-4): set ONCE at boot so /metrics reflects
+/// whether TLS / mTLS is active. Zero label cardinality.
+pub const TLS_ENABLED: &str = "ledge_tls_enabled";
+pub const TLS_MTLS_ENABLED: &str = "ledge_tls_mtls_enabled";
+
+/// Publish the boot transport posture (1.0 = on, 0.0 = off).
+pub fn set_tls_posture(tls_enabled: bool, mtls_enabled: bool) {
+    metrics::gauge!(TLS_ENABLED).set(if tls_enabled { 1.0 } else { 0.0 });
+    metrics::gauge!(TLS_MTLS_ENABLED).set(if mtls_enabled { 1.0 } else { 0.0 });
+}
+
 /// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
 ///
 /// Called from the cluster-mode metrics poller (one task per shard, started in
@@ -274,6 +285,18 @@ pub fn set_prepared_locks(n: u64) { metrics::gauge!(PREPARED_LOCKS).set(n as f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_metric_constants_correct() {
+        assert_eq!(TLS_ENABLED, "ledge_tls_enabled");
+        assert_eq!(TLS_MTLS_ENABLED, "ledge_tls_mtls_enabled");
+    }
+    #[test]
+    fn tls_record_helpers_no_panic_without_recorder() {
+        set_tls_posture(true, false);
+        set_tls_posture(true, true);
+        set_tls_posture(false, false);
+    }
 
     #[test]
     fn txn_metric_names_match_spec() {

@@ -102,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.clone())?);
     ledge_server::metrics::install_recorder()?;
+    // Phase 4d-4: install the rustls crypto provider before ANY TLS config is
+    // built (the cluster-stack client config below + the serve listeners need it).
+    ledge_server::tls::install_crypto_provider();
+    ledge_server::metrics::set_tls_posture(cfg.tls.enabled, cfg.tls.mtls);
 
     // ── Auth store (Phase 4d-1): opened in both single-node and cluster paths.
     //    Disabled (default) ⇒ an in-memory ctx (the middleware never reads it),
@@ -451,8 +455,44 @@ async fn main() -> anyhow::Result<()> {
         .addr
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid addr {}: {}", cfg.server.addr, e))?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(bound_addr = %listener.local_addr()?, "ledge listening");
-    axum::serve(listener, app).await?;
+
+    if !cfg.tls.enabled {
+        // Plaintext path — byte-identical to pre-4d-4.
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!(bound_addr = %listener.local_addr()?, "ledge listening (http)");
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
+
+    // TLS on: client listener (server-cert only). cert/key presence is guaranteed
+    // by config validation (Task 3), so the expects are unreachable on a validated config.
+    let cert = cfg.tls.cert_path.as_deref().expect("validated: tls.cert_path");
+    let key = cfg.tls.key_path.as_deref().expect("validated: tls.key_path");
+    let client_tls = ledge_server::tls::server_config_tls_only(cert, key)?;
+    let client_rustls = axum_server::tls_rustls::RustlsConfig::from_config(client_tls);
+
+    if cfg.tls.mtls {
+        let peer_addr: SocketAddr = cfg
+            .tls
+            .peer_addr
+            .as_deref()
+            .expect("validated: tls.peer_addr")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid tls.peer_addr: {}", e))?;
+        let ca = cfg.tls.ca_path.as_deref().expect("validated: tls.ca_path");
+        let peer_tls = ledge_server::tls::server_config_mtls(cert, key, ca)?;
+        let peer_rustls = axum_server::tls_rustls::RustlsConfig::from_config(peer_tls);
+        let peer_app = app.clone();
+        info!(client_addr = %addr, peer_addr = %peer_addr, "ledge listening (https client + mTLS peer listeners)");
+        let client_fut = axum_server::bind_rustls(addr, client_rustls).serve(app.into_make_service());
+        let peer_fut = axum_server::bind_rustls(peer_addr, peer_rustls).serve(peer_app.into_make_service());
+        tokio::try_join!(
+            async { client_fut.await.map_err(anyhow::Error::from) },
+            async { peer_fut.await.map_err(anyhow::Error::from) },
+        )?;
+    } else {
+        info!(bound_addr = %addr, "ledge listening (https client listener)");
+        axum_server::bind_rustls(addr, client_rustls).serve(app.into_make_service()).await?;
+    }
     Ok(())
 }
