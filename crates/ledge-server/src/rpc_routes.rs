@@ -111,6 +111,7 @@ mod tests {
             shard_map: None,
             cluster_gc: None,
             auth: crate::auth::AuthCtx::disabled(),
+            quota: crate::quota::QuotaCtx::disabled(),
         }
     }
 
@@ -239,6 +240,7 @@ mod tests {
             shard_map: None,
             cluster_gc: None,
             auth,
+            quota: crate::quota::QuotaCtx::disabled(),
         };
         let app = crate::build_app(state);
 

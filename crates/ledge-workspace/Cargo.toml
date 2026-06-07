@@ -11,6 +11,7 @@ authors.workspace      = true
 ledge-core         = { path = "../ledge-core" }
 ledge-object-store = { path = "../ledge-object-store" }
 ledge-ref-store    = { path = "../ledge-ref-store" }
+arc-swap.workspace = true
 tokio.workspace       = true
 bytes.workspace       = true
 serde.workspace       = true

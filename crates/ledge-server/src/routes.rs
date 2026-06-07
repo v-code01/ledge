@@ -72,6 +72,11 @@ pub struct AppState {
     /// the node-to-node cluster secret. `AuthCtx::disabled()` in single-node dev
     /// and all tests; the real ctx in `main.rs` when `[auth] enabled=true`.
     pub auth: crate::auth::AuthCtx,
+    /// Per-tenant quota context (Phase 4d-3): the durable limits, the shared
+    /// usage snapshot, and the request-rate limiter. `QuotaCtx::disabled()` in
+    /// single-node dev + all tests; the real ctx in `main.rs` when
+    /// `[quotas] enabled=true`. With it disabled, every gate is a no-op (R Q15).
+    pub quota: crate::quota::QuotaCtx,
 }
 
 #[derive(Deserialize)]
@@ -418,6 +423,7 @@ mod tenant_git_tests {
             shard_map: None,
             cluster_gc: None,
             auth,
+            quota: crate::quota::QuotaCtx::disabled(),
         };
         (crate::build_app(state), acme, globex, refs, objects)
     }

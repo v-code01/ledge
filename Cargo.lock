@@ -1703,6 +1703,7 @@ dependencies = [
 name = "ledge-workspace"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bincode",
  "bytes",

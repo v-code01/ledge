@@ -5,6 +5,7 @@ pub mod cluster_routes;
 pub mod config;
 pub mod metrics;
 pub mod object_routes;
+pub mod quota;
 pub mod routes;
 pub mod rpc_routes;
 pub mod workspace_routes;

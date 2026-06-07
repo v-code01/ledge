@@ -72,6 +72,7 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
         shard_map: None,
         cluster_gc: None,
         auth: ledge_server::auth::AuthCtx::disabled(),
+        quota: ledge_server::quota::QuotaCtx::disabled(),
     }
 }
 
@@ -319,6 +320,7 @@ fn cluster_state(
         shard_map: Some(map.clone()),
         cluster_gc: Some(cluster_gc),
         auth: ledge_server::auth::AuthCtx::disabled(),
+        quota: ledge_server::quota::QuotaCtx::disabled(),
     }
 }
 

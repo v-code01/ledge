@@ -11,6 +11,7 @@ pub struct LedgeConfig {
     pub workspace: WorkspaceConfig,
     pub cluster: ClusterConfig,
     pub auth: AuthConfig,
+    pub quotas: QuotaConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -116,6 +117,44 @@ pub struct AuthConfig {
     pub bootstrap_admin_token: Option<String>,
 }
 
+/// Per-tenant quota (Phase 4d-3) configuration. Disabled by default: a
+/// default-loaded config enforces NO quota and is byte-identical to Phase 4d-2.
+/// `root` is always exempt regardless of `enabled`. `None` per-limit = unlimited.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct QuotaConfig {
+    /// When false (default), NO quota is enforced (back-compat: quotas off).
+    pub enabled: bool,
+    /// Max LIVE workspaces per non-root tenant (exact, at `fork`).
+    #[serde(default)]
+    pub max_workspaces: Option<u64>,
+    /// Max durable bytes per non-root tenant (SOFT, at `commit`).
+    #[serde(default)]
+    pub max_durable_bytes: Option<u64>,
+    /// Max durable object count per non-root tenant (SOFT, at `commit`).
+    #[serde(default)]
+    pub max_object_count: Option<u64>,
+    /// Per-tenant token-bucket sustained rate (requests/sec). `None` = unlimited.
+    #[serde(default)]
+    pub max_requests_per_sec: Option<u32>,
+    /// Token-bucket burst capacity. `None` ⇒ defaults to `max_requests_per_sec`.
+    #[serde(default)]
+    pub burst: Option<u32>,
+}
+
+impl QuotaConfig {
+    /// Project the manager-relevant durable limits into a [`ledge_workspace::QuotaLimits`]
+    /// (Copy). The rate/burst are NOT included — they build the `TenantRateLimiter`
+    /// (R Q13).
+    pub fn to_limits(&self) -> ledge_workspace::QuotaLimits {
+        ledge_workspace::QuotaLimits {
+            enabled: self.enabled,
+            max_workspaces: self.max_workspaces,
+            max_durable_bytes: self.max_durable_bytes,
+            max_object_count: self.max_object_count,
+        }
+    }
+}
+
 impl ClusterConfig {
     /// Build the validated [`ShardMap`] from the declared `[[cluster.shards]]`.
     /// An empty `shards` (single-node / no-cluster) yields an empty, valid map
@@ -151,7 +190,8 @@ impl LedgeConfig {
             .set_default("cluster.node_id",                    1i64).map_err(map_cfg)?
             .set_default("cluster.num_shards",                 1i64).map_err(map_cfg)?
             .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?
-            .set_default("auth.enabled",                       false).map_err(map_cfg)?;
+            .set_default("auth.enabled",                       false).map_err(map_cfg)?
+            .set_default("quotas.enabled",                     false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -319,6 +359,42 @@ mod tests {
         assert!(cfg.auth.enabled);
         assert_eq!(cfg.auth.cluster_secret.as_deref(), Some("svc-secret"));
         assert_eq!(cfg.auth.bootstrap_admin_token.as_deref(), Some("ledge_x_y"));
+    }
+
+    #[test]
+    fn quota_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert!(!cfg.quotas.enabled, "quotas disabled by default (back-compat)");
+        assert!(cfg.quotas.max_workspaces.is_none());
+        assert!(cfg.quotas.max_durable_bytes.is_none());
+        assert!(cfg.quotas.max_object_count.is_none());
+        assert!(cfg.quotas.max_requests_per_sec.is_none());
+        assert!(cfg.quotas.burst.is_none());
+    }
+
+    #[test]
+    fn quota_config_toml_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[quotas]\nenabled=true\nmax_workspaces=2\nmax_durable_bytes=1048576\nmax_object_count=100\nmax_requests_per_sec=10\nburst=20"
+        )
+        .unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.quotas.enabled);
+        assert_eq!(cfg.quotas.max_workspaces, Some(2));
+        assert_eq!(cfg.quotas.max_durable_bytes, Some(1_048_576));
+        assert_eq!(cfg.quotas.max_object_count, Some(100));
+        assert_eq!(cfg.quotas.max_requests_per_sec, Some(10));
+        assert_eq!(cfg.quotas.burst, Some(20));
+        // The projected limits carry only the manager-relevant fields (R Q13).
+        let lim = cfg.quotas.to_limits();
+        assert!(lim.enabled);
+        assert_eq!(lim.max_workspaces, Some(2));
+        assert_eq!(lim.max_durable_bytes, Some(1_048_576));
+        assert_eq!(lim.max_object_count, Some(100));
     }
 
     #[test]

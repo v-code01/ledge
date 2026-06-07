@@ -76,6 +76,7 @@ async fn app_with_store(
         shard_map: None,
         cluster_gc: None,
         auth,
+        quota: ledge_server::quota::QuotaCtx::disabled(),
     };
     build_app(state)
 }

@@ -357,6 +357,10 @@ async fn main() -> anyhow::Result<()> {
         // (opened once, first-boot-bootstrapped, compaction task spawned) when
         // [auth] enabled, otherwise the infallible disabled (in-memory) context.
         auth: auth_ctx,
+        // Quota (Phase 4d-3): the disabled (inert) context for now — Task 5
+        // replaces this with the real `QuotaCtx` built from `cfg.quotas` when
+        // `[quotas] enabled=true`. Disabled ⇒ every gate is a no-op (R Q15).
+        quota: ledge_server::quota::QuotaCtx::disabled(),
     });
     let addr: SocketAddr = cfg
         .server

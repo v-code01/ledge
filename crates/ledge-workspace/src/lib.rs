@@ -9,8 +9,10 @@ pub mod gc;
 pub mod id;
 pub mod lease;
 pub mod manager;
+pub mod quota;
 
 pub use gc::{Gc, GcStats};
 pub use id::WorkspaceId;
 pub use lease::{Lease, LeaseStore};
 pub use manager::{CommitOutcome, WorkspaceManager, WorkspaceView};
+pub use quota::{QuotaLimits, TenantUsage, UsageMap};
