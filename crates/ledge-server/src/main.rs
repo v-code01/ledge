@@ -245,12 +245,23 @@ async fn main() -> anyhow::Result<()> {
             )
         };
 
-    // Quota (Phase 4d-3): the inert (disabled) context for now — Task 5 replaces
-    // this with the real `QuotaCtx` built from `cfg.quotas` when `[quotas]
-    // enabled=true`. Built BEFORE the workspace stack so the manager + GC + the
-    // `QuotaCtx` all share ONE usage `Arc` and the SAME limits (R Q1/Q15);
-    // disabled ⇒ every gate is a no-op (byte-identical to Phase 4d-2).
-    let quota = ledge_server::quota::QuotaCtx::disabled();
+    // Quota (Phase 4d-3): build the real context from `[quotas]` config. Its
+    // `usage` Arc is shared into the manager (commit gate), the GC + cluster GC
+    // (writers), and `AppState` (gauges) so one store, many parties, no cycle
+    // (R Q1/Q4/Q15). Built BEFORE the workspace stack so every party holds the
+    // SAME `Arc` + the SAME limits. `enabled=false` (default) ⇒ every gate is a
+    // no-op (byte-identical to Phase 4d-2); measurement still runs (feeds gauges).
+    let quota_limits = cfg.quotas.to_limits();
+    let quota_usage = std::sync::Arc::new(ledge_workspace::UsageMap::default());
+    let quota_rate = std::sync::Arc::new(ledge_server::quota::rate::TenantRateLimiter::new(
+        cfg.quotas.max_requests_per_sec,
+        cfg.quotas.burst,
+    ));
+    let quota = ledge_server::quota::QuotaCtx {
+        limits: quota_limits,
+        usage: quota_usage.clone(),
+        rate: quota_rate,
+    };
 
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack_dyn(
         data_dir.clone(),
@@ -307,10 +318,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── GC scheduler: every gc_interval_secs, run a mark-and-sweep pass. ──────────
+    // (Each pass ALSO refreshes the shared per-tenant UsageMap — the GC holds the
+    // same Arc, R Q4/Q9. A startup pass bounds the "fails-open until first measure"
+    // window to ≤ one interval — spec §3.4/§6.)
     {
         let gc = gc.clone();
         let interval_secs = cfg.workspace.gc_interval_secs;
         tokio::spawn(async move {
+            // Startup measurement: refresh usage once before steady-state ticking
+            // so the storage quota (commit gate) + gauges have data at boot.
+            if let Err(e) = gc.run().await {
+                tracing::warn!(error = %e, "startup gc/usage measurement failed");
+            }
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -341,8 +360,27 @@ async fn main() -> anyhow::Result<()> {
             leases.clone(),
             objects.clone(),
             std::time::Duration::from_secs(3600),
+            quota_usage.clone(),
         ))
     });
+
+    // ── Cluster startup measurement (Phase 4d-3, R Q9). There is no cluster GC
+    //    SCHEDULER (cluster GC is on-demand via `/admin/gc` + `/cluster/gc`), so
+    //    run one node-local pass at boot to refresh the per-tenant UsageMap from
+    //    this node's hosted-shard durable refs. Bounds the fails-open window to
+    //    boot; subsequent refreshes ride the on-demand GC requests. Per-node
+    //    (honest — spec §6).
+    if let Some(cgc) = cluster_gc.clone() {
+        tokio::spawn(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Err(e) = cgc.run(now).await {
+                tracing::warn!(error = %e, "startup cluster gc/usage measurement failed");
+            }
+        });
+    }
 
     let app = build_app(AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
@@ -366,10 +404,11 @@ async fn main() -> anyhow::Result<()> {
         // (opened once, first-boot-bootstrapped, compaction task spawned) when
         // [auth] enabled, otherwise the infallible disabled (in-memory) context.
         auth: auth_ctx,
-        // Quota (Phase 4d-3): the inert context built above and SHARED (limits +
-        // usage `Arc`) with the workspace manager + GC. Task 5 swaps it for the
-        // real `QuotaCtx` from `cfg.quotas` when `[quotas] enabled=true`.
-        // Disabled ⇒ every gate is a no-op (R Q15).
+        // Quota (Phase 4d-3): the real context built above from `[quotas]`, SHARED
+        // (limits + usage `Arc`) with the workspace manager + GC + cluster GC. The
+        // GC refreshes the same `usage` map each pass (+ a startup pass), so the
+        // commit gate + gauges read fresh measurements. `enabled=false` (default)
+        // ⇒ every gate is a no-op (R Q15).
         quota,
     });
     let addr: SocketAddr = cfg
