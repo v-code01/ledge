@@ -152,7 +152,7 @@ mod route_tests {
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
         let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
         AppState {
             objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),

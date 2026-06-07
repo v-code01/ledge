@@ -18,6 +18,7 @@ use ledge_core::{ObjectId, RefStore, Result};
 use ledge_object_store::{graph, DiskObjectStore};
 
 use crate::lease::LeaseStore;
+use crate::quota::UsageMap;
 
 /// Mark-and-sweep GC engine. Holds shared handles only; no per-pass state.
 ///
@@ -38,6 +39,12 @@ pub struct Gc {
     refs: Arc<dyn RefStore>,
     leases: Arc<LeaseStore>,
     objects: Arc<DiskObjectStore>,
+    /// The shared per-tenant usage snapshot the GC pass measures into (Phase
+    /// 4d-3, R Q4/Q14). The SAME `Arc` the manager's commit gate and `QuotaCtx`
+    /// hold. Not yet written by `run` (the measurement pass lands in Task 5);
+    /// carried now so the assembly wires one shared store across every party.
+    #[allow(dead_code)]
+    usage: Arc<UsageMap>,
 }
 
 /// Per-pass GC accounting (spec §4.3).
@@ -81,11 +88,13 @@ impl Gc {
         refs: Arc<dyn RefStore>,
         leases: Arc<LeaseStore>,
         objects: Arc<DiskObjectStore>,
+        usage: Arc<UsageMap>,
     ) -> Self {
         Self {
             refs,
             leases,
             objects,
+            usage,
         }
     }
 
@@ -213,7 +222,12 @@ mod tests {
         let refs = Arc::new(RefStoreImpl::open(root.clone(), hlc.clone()).unwrap());
         let leases = Arc::new(LeaseStore::open(root.clone(), hlc.clone()).unwrap());
         let objects = Arc::new(DiskObjectStore::new(root.clone()).unwrap());
-        let gc = Gc::new(refs.clone(), leases.clone(), objects.clone());
+        let gc = Gc::new(
+            refs.clone(),
+            leases.clone(),
+            objects.clone(),
+            Arc::new(crate::quota::UsageMap::default()),
+        );
         Harness {
             _dir: dir,
             hlc,

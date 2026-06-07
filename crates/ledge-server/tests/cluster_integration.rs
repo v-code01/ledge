@@ -57,7 +57,7 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) =
-        build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+        build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),
@@ -280,7 +280,7 @@ fn cluster_state(
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs_disk = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) =
-        build_workspace_stack(p.clone(), objects.clone(), refs_disk.clone(), hlc).unwrap();
+        build_workspace_stack(p.clone(), objects.clone(), refs_disk.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
     // The node's clustered ref store (hosts only its mapped shards); the handler
     // never forwards, so an inert in-memory forwarder is fine.
     let cluster_refs: Arc<ClusterRefStore> = cluster.cluster_ref_store_hosting(

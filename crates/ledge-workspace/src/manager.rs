@@ -26,6 +26,7 @@ use ledge_ref_store::{AtomicCommit, AtomicCommitResult};
 
 use crate::id::WorkspaceId;
 use crate::lease::{Lease, LeaseStore};
+use crate::quota::{QuotaLimits, UsageMap};
 
 /// Orchestrates the workspace lifecycle over a ref store and a lease store.
 ///
@@ -43,6 +44,18 @@ pub struct WorkspaceManager {
     /// shard `RefBatch` fast path + multi-shard 2PC). Plugged in at assembly, so
     /// this crate never depends on `ledge-cluster` (which would close a cycle).
     coordinator: Arc<dyn AtomicCommit>,
+    /// Per-tenant durable quota limits (Phase 4d-3, R Q1). Held by value (Copy);
+    /// `QuotaLimits::default()` (enabled=false) ⇒ every gate is a no-op
+    /// (byte-identical to Phase 4d-2). Read by `fork` (workspace count) and
+    /// `commit` (durable bytes/objects).
+    quotas: QuotaLimits,
+    /// The shared last-GC-measured per-tenant usage (R Q4). `commit`'s SOFT
+    /// storage gate reads this `ArcSwap` snapshot; the GC writes it. The SAME
+    /// `Arc` the server creates and injects into the GC + `QuotaCtx`. Not yet
+    /// read by the manager (the commit gate lands in Task 6); held now so the
+    /// assembly wires one shared store across the manager, GC, and `QuotaCtx`.
+    #[allow(dead_code)]
+    usage: Arc<UsageMap>,
 }
 
 /// A point-in-time view of a workspace: its id, governing lease, and the set of
@@ -139,12 +152,16 @@ impl WorkspaceManager {
         leases: Arc<LeaseStore>,
         hlc: Arc<HLC>,
         coordinator: Arc<dyn AtomicCommit>,
+        quotas: QuotaLimits,
+        usage: Arc<UsageMap>,
     ) -> Self {
         Self {
             refs,
             leases,
             hlc,
             coordinator,
+            quotas,
+            usage,
         }
     }
 
@@ -181,6 +198,21 @@ impl WorkspaceManager {
         tenant_id: &str,
     ) -> Result<WorkspaceView> {
         let tenant = tenant_norm(tenant_id);
+
+        // Phase 4d-3: workspace-count quota (EXACT — the lease index is the
+        // source of truth, R Q6). Enforced only when enabled AND tenant != root
+        // (R Q7). Counts the tenant's LIVE workspaces; at/over the limit ⇒ 507.
+        if self.quotas.enforced_for(tenant) {
+            if let Some(max) = self.quotas.max_workspaces {
+                let live = self.leases.live_for_tenant(now_ms(), tenant).await?.len() as u64;
+                if live >= max {
+                    return Err(LedgeError::QuotaExceeded(format!(
+                        "workspaces: {max} limit reached"
+                    )));
+                }
+            }
+        }
+
         let id = WorkspaceId::generate(&self.hlc);
 
         let mut view_refs: Vec<(String, RefEntry)> = Vec::with_capacity(source.len());
@@ -472,7 +504,31 @@ mod tests {
         // genuinely all-or-nothing across every ref in one batch.
         let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
             Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
-        let mgr = WorkspaceManager::new(refs, leases, hlc, coordinator);
+        let mgr = WorkspaceManager::new(
+            refs,
+            leases,
+            hlc,
+            coordinator,
+            crate::quota::QuotaLimits::default(),
+            Arc::new(crate::quota::UsageMap::default()),
+        );
+        (mgr, dir)
+    }
+
+    /// Build a manager with explicit quota limits (and a fresh empty usage map),
+    /// otherwise identical to `setup()`. Returns the manager + the TempDir guard.
+    fn setup_quota(limits: crate::quota::QuotaLimits) -> (WorkspaceManager, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let hlc = Arc::new(HLC::new());
+        let refs =
+            Arc::new(RefStoreImpl::open(dir.path().join("refs"), hlc.clone()).expect("ref store"));
+        let leases = Arc::new(
+            LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("lease store"),
+        );
+        let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+            Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
+        let usage = Arc::new(crate::quota::UsageMap::default());
+        let mgr = WorkspaceManager::new(refs, leases, hlc, coordinator, limits, usage);
         (mgr, dir)
     }
 
@@ -704,7 +760,14 @@ mod tests {
             from: oid(5),
             to: oid(9),
         });
-        let mgr = WorkspaceManager::new(refs.clone(), leases, hlc, coordinator);
+        let mgr = WorkspaceManager::new(
+            refs.clone(),
+            leases,
+            hlc,
+            coordinator,
+            crate::quota::QuotaLimits::default(),
+            Arc::new(crate::quota::UsageMap::default()),
+        );
 
         let view = mgr
             .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60), "root")
@@ -1061,5 +1124,116 @@ mod tests {
             mgr.refs.get(&r("refs/heads/main")).await.unwrap().is_none(),
             "global refs/heads/main must be untouched (it was never acme's)"
         );
+    }
+
+    #[tokio::test]
+    async fn fork_workspace_count_quota_rejects_over_limit() {
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_workspaces: Some(2),
+            ..Default::default()
+        };
+        let (mgr, _dir) = setup_quota(limits);
+        // acme forks from its OWN durable namespace (refs/tenants/acme/...).
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let src = r("refs/heads/main");
+
+        // First two forks succeed (live count 0, then 1 — both < 2).
+        let w1 = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let _w2 = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+
+        // Third fork: live count is 2 ⇒ 2 >= 2 ⇒ QuotaExceeded (→507).
+        let err = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap_err();
+        match err {
+            LedgeError::QuotaExceeded(m) => {
+                assert!(m.starts_with("workspaces:"), "msg names the resource: {m}");
+                assert!(m.contains("2 limit reached"), "msg names the limit: {m}");
+            }
+            other => panic!("expected QuotaExceeded, got {other:?}"),
+        }
+
+        // Release one ⇒ a slot frees ⇒ the next fork succeeds (count back to 1).
+        mgr.release(w1.id, "acme").await.unwrap();
+        let _w4 = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_workspace_count_quota_root_exempt_and_other_tenant_independent() {
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_workspaces: Some(1),
+            ..Default::default()
+        };
+        let (mgr, _dir) = setup_quota(limits);
+        // Seed root + two tenants' durable refs.
+        mgr.refs.update(&r("refs/heads/main"), oid(1), None).await.unwrap();
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        mgr.refs
+            .update(&r("refs/tenants/globex/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let src = r("refs/heads/main");
+
+        // root is EXEMPT: many forks despite max_workspaces=1.
+        for _ in 0..3 {
+            mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "root")
+                .await
+                .unwrap();
+        }
+
+        // acme: first ok, second rejected (limit 1).
+        mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let acme_err = mgr
+            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap_err();
+        assert!(matches!(acme_err, LedgeError::QuotaExceeded(_)));
+
+        // globex is INDEPENDENT: its first fork still succeeds (acme's count does
+        // not count against globex — per-tenant limits).
+        mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "globex")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_count_quota_disabled_never_rejects() {
+        // enabled=false (default) ⇒ the gate is a no-op even with a tiny limit set.
+        let limits = crate::quota::QuotaLimits {
+            enabled: false,
+            max_workspaces: Some(1),
+            ..Default::default()
+        };
+        let (mgr, _dir) = setup_quota(limits);
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let src = r("refs/heads/main");
+        for _ in 0..5 {
+            mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+                .await
+                .unwrap();
+        }
     }
 }

@@ -58,9 +58,15 @@ async fn app_with_store(
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) =
-        ledge_server::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc.clone())
-            .unwrap();
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc.clone(),
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
     let auth = AuthCtx::new(enabled, store, cluster_secret);
     let state = AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,

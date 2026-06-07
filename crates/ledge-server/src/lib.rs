@@ -44,6 +44,8 @@ pub fn build_workspace_stack(
     objects: Arc<DiskObjectStore>,
     refs: Arc<RefStoreImpl>,
     hlc: Arc<HLC>,
+    quotas: ledge_workspace::QuotaLimits,
+    usage: Arc<ledge_workspace::UsageMap>,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     // Single-node atomic-commit seam: one ArcSwap root swap over the SAME concrete
     // `RefStoreImpl` the manager already reads/writes. Built here, before the
@@ -58,6 +60,8 @@ pub fn build_workspace_stack(
         refs as Arc<dyn RefStore>,
         hlc,
         coordinator,
+        quotas,
+        usage,
     )
 }
 
@@ -73,6 +77,8 @@ pub fn build_workspace_stack_dyn(
     refs: Arc<dyn RefStore>,
     hlc: Arc<HLC>,
     coordinator: Arc<dyn ledge_ref_store::AtomicCommit>,
+    quotas: ledge_workspace::QuotaLimits,
+    usage: Arc<ledge_workspace::UsageMap>,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     let leases = Arc::new(LeaseStore::open(data_dir, hlc.clone())?);
     let manager = Arc::new(WorkspaceManager::new(
@@ -80,8 +86,10 @@ pub fn build_workspace_stack_dyn(
         leases.clone(),
         hlc,
         coordinator,
+        quotas,
+        usage.clone(),
     ));
-    let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk));
+    let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk, usage));
     Ok((manager, leases, gc))
 }
 

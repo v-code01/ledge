@@ -29,12 +29,15 @@ fn ctx() -> (RpcCtx, TempDir) {
         leases.clone(),
         hlc.clone(),
         coordinator,
-    ));
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        ));
     let gc = Arc::new(ledge_workspace::Gc::new(
         refs.clone(),
         leases,
         objects.clone(),
-    ));
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        ));
     let ctx = RpcCtx {
         objects,
         refs,
@@ -66,8 +69,10 @@ fn two_tenant_ctxs() -> (RpcCtx, RpcCtx, TempDir) {
         leases.clone(),
         hlc.clone(),
         coordinator,
-    ));
-    let gc = Arc::new(ledge_workspace::Gc::new(refs.clone(), leases, objects.clone()));
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        ));
+    let gc = Arc::new(ledge_workspace::Gc::new(refs.clone(), leases, objects.clone(), std::sync::Arc::new(ledge_workspace::UsageMap::default())));
     let base = RpcCtx {
         objects,
         refs,

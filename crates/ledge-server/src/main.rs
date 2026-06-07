@@ -245,12 +245,21 @@ async fn main() -> anyhow::Result<()> {
             )
         };
 
+    // Quota (Phase 4d-3): the inert (disabled) context for now — Task 5 replaces
+    // this with the real `QuotaCtx` built from `cfg.quotas` when `[quotas]
+    // enabled=true`. Built BEFORE the workspace stack so the manager + GC + the
+    // `QuotaCtx` all share ONE usage `Arc` and the SAME limits (R Q1/Q15);
+    // disabled ⇒ every gate is a no-op (byte-identical to Phase 4d-2).
+    let quota = ledge_server::quota::QuotaCtx::disabled();
+
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack_dyn(
         data_dir.clone(),
         objects.clone(),
         refs_dyn.clone(),
         hlc.clone(),
         coordinator,
+        quota.limits,
+        quota.usage.clone(),
     )?;
 
     // ── Lease WAL compaction: collapse the append log to a checkpoint when it
@@ -357,10 +366,11 @@ async fn main() -> anyhow::Result<()> {
         // (opened once, first-boot-bootstrapped, compaction task spawned) when
         // [auth] enabled, otherwise the infallible disabled (in-memory) context.
         auth: auth_ctx,
-        // Quota (Phase 4d-3): the disabled (inert) context for now — Task 5
-        // replaces this with the real `QuotaCtx` built from `cfg.quotas` when
-        // `[quotas] enabled=true`. Disabled ⇒ every gate is a no-op (R Q15).
-        quota: ledge_server::quota::QuotaCtx::disabled(),
+        // Quota (Phase 4d-3): the inert context built above and SHARED (limits +
+        // usage `Arc`) with the workspace manager + GC. Task 5 swaps it for the
+        // real `QuotaCtx` from `cfg.quotas` when `[quotas] enabled=true`.
+        // Disabled ⇒ every gate is a no-op (R Q15).
+        quota,
     });
     let addr: SocketAddr = cfg
         .server

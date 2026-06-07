@@ -568,7 +568,7 @@ async fn workspace_commit_cross_shard_is_atomic() {
     let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
     let coordinator: Arc<dyn AtomicCommit> = Arc::new(TxnCoordinator::new(store1.clone()));
     let refs_dyn: Arc<dyn RefStore> = store1.clone();
-    let mgr = WorkspaceManager::new(refs_dyn, leases, hlc, coordinator);
+    let mgr = WorkspaceManager::new(refs_dyn, leases, hlc, coordinator, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()));
 
     // Fork both sources; the manager re-roots each under refs/workspaces/<id>/.
     let view = mgr

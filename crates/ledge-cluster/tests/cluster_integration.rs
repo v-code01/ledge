@@ -439,7 +439,7 @@ async fn workspace_manager_over_cluster_ref_store() {
     let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
     let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
         Arc::new(ledge_cluster::TxnCoordinator::new(cluster_refs));
-    let mgr = WorkspaceManager::new(Arc::clone(&refs), leases, hlc, coordinator);
+    let mgr = WorkspaceManager::new(Arc::clone(&refs), leases, hlc, coordinator, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()));
 
     // Seed two durable source refs that route to DISTINCT shards, so the forked
     // workspace's refs (re-rooted under refs/workspaces/<hex>/...) land on one

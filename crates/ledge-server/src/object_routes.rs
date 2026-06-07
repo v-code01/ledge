@@ -113,6 +113,8 @@ mod tests {
             objects.clone(),
             refs.clone(),
             hlc,
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
         )
         .unwrap();
         let state = AppState {

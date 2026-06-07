@@ -36,6 +36,8 @@ async fn two_tenant(
         objects.clone(),
         refs.clone(),
         hlc.clone(),
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
     )
     .unwrap();
     let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
@@ -206,4 +208,109 @@ async fn foreign_workspace_is_404_everywhere() {
             "globex {method} {uri} must be 404"
         );
     }
+}
+
+/// Like [`two_tenant`] but with quotas ENABLED (`max_workspaces`) so the manager's
+/// `fork` count gate fires. The manager's limits + the `QuotaCtx`'s limits share
+/// ONE value, and the usage `Arc` is shared (R Q1/Q15) — built once, threaded into
+/// `build_workspace_stack` and `AppState.quota`.
+async fn two_tenant_quota(dir: &TempDir, max_workspaces: u64) -> (axum::Router, String) {
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(HLC::new());
+    let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+    let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    // The enabled quota context: the manager + the AppState.quota share these
+    // exact limits (Copy) and the SAME usage Arc.
+    let limits = ledge_workspace::QuotaLimits {
+        enabled: true,
+        max_workspaces: Some(max_workspaces),
+        ..Default::default()
+    };
+    let usage = std::sync::Arc::new(ledge_workspace::UsageMap::default());
+    let quota = ledge_server::quota::QuotaCtx {
+        limits,
+        usage: usage.clone(),
+        rate: std::sync::Arc::new(ledge_server::quota::rate::TenantRateLimiter::unlimited()),
+    };
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc.clone(),
+        limits,
+        usage,
+    )
+    .unwrap();
+    let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
+    let acme = store
+        .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+        .await
+        .unwrap();
+    let auth = AuthCtx {
+        enabled: true,
+        store,
+        cluster_secret: None,
+    };
+    let state = AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards: None,
+        cluster_refs: None,
+        shard_map: None,
+        cluster_gc: None,
+        auth,
+        quota,
+    };
+    (build_app(state), acme)
+}
+
+/// Phase 4d-3 (end-to-end) — with quotas enabled and `max_workspaces=1`, acme's
+/// SECOND `POST /workspaces` is rejected by the manager's `fork` count gate and
+/// surfaces as **507 Insufficient Storage** through the REST handler (the
+/// `QuotaExceeded("workspaces: …")` → `map_lookup_err` non-`requests:` mapping).
+#[tokio::test]
+async fn over_quota_fork_is_507_through_rest() {
+    let dir = TempDir::new().unwrap();
+    let (app, acme) = two_tenant_quota(&dir, 1).await;
+
+    let create = || {
+        let app = app.clone();
+        let acme = acme.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces")
+                    .header("content-type", "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {acme}"))
+                    .body(Body::from(r#"{"source":[],"ttl_seconds":3600}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // First fork: under the limit ⇒ created (201/200).
+    let first = create().await;
+    assert!(
+        first.status().is_success(),
+        "first fork must succeed, got {}",
+        first.status()
+    );
+
+    // Second fork: at the limit ⇒ QuotaExceeded("workspaces: 1 limit reached")
+    // ⇒ 507 Insufficient Storage.
+    let second = create().await;
+    assert_eq!(
+        second.status(),
+        StatusCode::INSUFFICIENT_STORAGE,
+        "over-quota fork must surface as 507"
+    );
 }

@@ -246,8 +246,13 @@ pub async fn create_workspace(
             (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
+            // Phase 4d-3: route through `map_lookup_err` so a fork-time quota
+            // denial surfaces with the correct status — `QuotaExceeded`
+            // ("workspaces: …") ⇒ 507 Insufficient Storage, never a generic 500.
+            // Other fork faults (e.g. a missing source ref) keep their prior
+            // mapping (Corruption ⇒ 500) since the message matches no special arm.
             warn!(error = %e, "fork failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            map_lookup_err(e)
         }
     }
 }
@@ -587,7 +592,7 @@ pub(crate) fn test_state_for_auth(dir: &tempfile::TempDir) -> AppState {
     let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) =
-        crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+        crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),
@@ -622,7 +627,7 @@ mod route_tests {
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
         let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
         AppState {
             objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -895,7 +900,14 @@ mod tenant_rest_tests {
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
         let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc.clone())
+            crate::build_workspace_stack(
+                    p.clone(),
+                    objects.clone(),
+                    refs.clone(),
+                    hlc.clone(),
+                    ledge_workspace::QuotaLimits::default(),
+                    std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+                )
                 .unwrap();
         let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
         let acme = store

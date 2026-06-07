@@ -14,6 +14,7 @@ async fn start_server() -> (String, TempDir) {
     let refs    = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
         data_dir.path().to_path_buf(), objects.clone(), refs.clone(), hlc,
+        ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()),
     ).unwrap();
     let app     = build_app(AppState { objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>, objects_disk: objects.clone(), refs: refs.clone() as Arc<dyn ledge_core::RefStore>, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf(), raft_shards: None, cluster_refs: None, shard_map: None, cluster_gc: None, auth: ledge_server::auth::AuthCtx::disabled(), quota: ledge_server::quota::QuotaCtx::disabled() });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -162,7 +163,7 @@ async fn appstate_holds_trait_objects() {
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) =
-        ledge_server::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc).unwrap();
+        ledge_server::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
 
     // Build AppState with the ref/object trait-object seams explicitly typed.
     let refs_dyn: Arc<dyn RefStore> = refs.clone();
