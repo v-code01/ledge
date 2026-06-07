@@ -39,6 +39,12 @@ pub const RPC_REQUEST_DURATION: &str = "ledge_rpc_request_duration_seconds";
 pub const AUTH_REQUESTS_TOTAL: &str = "ledge_auth_requests_total";
 pub const AUTH_KEYS: &str = "ledge_auth_keys";
 
+// ── Tenant-isolation metric (Phase 4d-2, spec §7). Bumped whenever a workspace
+//    op is denied by a cross-tenant ownership mismatch (a 404 from the manager's
+//    NotFound, or a foreign-id `get` → None). Unlabeled — it carries NO tenant id
+//    (no cross-tenant info on the metrics surface). ─────────────────────────────
+pub const TENANT_DENIED_TOTAL: &str = "ledge_tenant_denied_total";
+
 // ── Per-shard Raft gauges/counters (spec §7). Populated ONLY in cluster mode by
 //    `record_raft_metrics`; single-node never emits these series, so `/metrics`
 //    output for a single-node server is unchanged. ─────────────────────────────
@@ -154,6 +160,13 @@ pub fn record_auth_request(result: &'static str) {
 /// Gauge: count of live (non-revoked, non-expired) API keys.
 pub fn set_auth_keys(n: f64) {
     metrics::gauge!(AUTH_KEYS).set(n);
+}
+
+/// Count a cross-tenant access denied (an ownership-mismatch 404). Helps
+/// operators spot misconfigured clients / probing. Never labeled with the other
+/// tenant's id (no cross-tenant info in metrics — spec §7).
+pub fn record_tenant_denied() {
+    metrics::counter!(TENANT_DENIED_TOTAL).increment(1);
 }
 
 /// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
@@ -347,6 +360,16 @@ mod tests {
         record_auth_request("unauthenticated");
         record_auth_request("forbidden");
         set_auth_keys(7.0);
+    }
+
+    #[test]
+    fn tenant_denied_metric_constant_correct() {
+        assert_eq!(TENANT_DENIED_TOTAL, "ledge_tenant_denied_total");
+    }
+
+    #[test]
+    fn tenant_denied_record_helper_no_panic_without_recorder() {
+        record_tenant_denied();
     }
 
     #[test]
