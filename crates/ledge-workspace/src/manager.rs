@@ -51,10 +51,7 @@ pub struct WorkspaceManager {
     quotas: QuotaLimits,
     /// The shared last-GC-measured per-tenant usage (R Q4). `commit`'s SOFT
     /// storage gate reads this `ArcSwap` snapshot; the GC writes it. The SAME
-    /// `Arc` the server creates and injects into the GC + `QuotaCtx`. Not yet
-    /// read by the manager (the commit gate lands in Task 6); held now so the
-    /// assembly wires one shared store across the manager, GC, and `QuotaCtx`.
-    #[allow(dead_code)]
+    /// `Arc` the server creates and injects into the GC + `QuotaCtx`.
     usage: Arc<UsageMap>,
 }
 
@@ -311,6 +308,33 @@ impl WorkspaceManager {
                 "commit: unknown workspace {}",
                 id.to_hex()
             )));
+        }
+
+        // Phase 4d-3: durable storage quota — SOFT, against the LAST GC-measured
+        // usage (spec §3.4, R Q6/Q9). Enforced only when enabled AND tenant != root
+        // (R Q7). At/over a limit ⇒ QuotaExceeded (→507). SOFT by construction: a
+        // commit that crosses from under to over SUCCEEDS (the pre-gate saw under);
+        // the NEXT commit after the GC re-measures is rejected (overshoot ≤ one
+        // inter-GC burst — spec §2/§6). An unmeasured tenant reads {0,0} ⇒ passes
+        // (fails OPEN until the first GC measurement, R Q9). Placed BEFORE
+        // commit_atomic: a rejected commit mutates NO durable ref (atomicity intact).
+        if self.quotas.enforced_for(tenant) {
+            let snapshot = self.usage.load();
+            let cur = snapshot.get(tenant).copied().unwrap_or_default();
+            if let Some(max) = self.quotas.max_durable_bytes {
+                if cur.bytes >= max {
+                    return Err(LedgeError::QuotaExceeded(format!(
+                        "durable_bytes: {max} limit reached"
+                    )));
+                }
+            }
+            if let Some(max) = self.quotas.max_object_count {
+                if cur.objects >= max {
+                    return Err(LedgeError::QuotaExceeded(format!(
+                        "object_count: {max} limit reached"
+                    )));
+                }
+            }
         }
 
         // Authorization (unchanged): every source ref MUST live under THIS
@@ -1235,5 +1259,199 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    // ── Task 6: SOFT durable-storage / object-count commit gate ────────────
+
+    /// Like `setup_quota` but also returns the shared usage map so a test can
+    /// simulate a GC measurement (store a `TenantUsage`) and then exercise the
+    /// commit soft-gate against it.
+    fn setup_quota_usage(
+        limits: crate::quota::QuotaLimits,
+    ) -> (WorkspaceManager, Arc<crate::quota::UsageMap>, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let hlc = Arc::new(HLC::new());
+        let refs =
+            Arc::new(RefStoreImpl::open(dir.path().join("refs"), hlc.clone()).expect("ref store"));
+        let leases = Arc::new(
+            LeaseStore::open(dir.path().join("leases"), hlc.clone()).expect("lease store"),
+        );
+        let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
+            Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
+        let usage = Arc::new(crate::quota::UsageMap::default());
+        let mgr = WorkspaceManager::new(refs, leases, hlc, coordinator, limits, usage.clone());
+        (mgr, usage, dir)
+    }
+
+    /// Set the last-measured usage for a tenant (simulates a GC pass).
+    fn set_usage(map: &crate::quota::UsageMap, tenant: &str, u: crate::quota::TenantUsage) {
+        let mut m = std::collections::HashMap::new();
+        m.insert(tenant.to_string(), u);
+        map.store(Arc::new(m));
+    }
+
+    #[tokio::test]
+    async fn commit_durable_bytes_quota_soft_overshoot_then_reject() {
+        use crate::quota::TenantUsage;
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_durable_bytes: Some(1000),
+            ..Default::default()
+        };
+        let (mgr, usage, _dir) = setup_quota_usage(limits);
+        // acme forks + advances a workspace ref so it has work to commit.
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+
+        // Last-measured usage is UNDER the limit (999 < 1000) ⇒ this commit (which
+        // pushes over) SUCCEEDS — the pre-gate saw under (soft semantics, §2/§6).
+        set_usage(&usage, "acme", TenantUsage { bytes: 999, objects: 1 });
+        let out = mgr
+            .commit(view.id, &[(ws.clone(), client.clone())], "acme")
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], CommitOutcome::Ok { .. }),
+            "crossing commit succeeds (soft)"
+        );
+
+        // Simulate the NEXT GC re-measuring acme AT/OVER the limit. The next commit
+        // is now REJECTED (507) — the documented one-burst overshoot bound.
+        set_usage(&usage, "acme", TenantUsage { bytes: 1000, objects: 2 });
+        // Advance the ws ref again so there is something to promote.
+        mgr.refs.update(&ws, oid(3), Some(oid(2))).await.unwrap();
+        let err = mgr
+            .commit(view.id, &[(ws.clone(), client.clone())], "acme")
+            .await
+            .unwrap_err();
+        match err {
+            LedgeError::QuotaExceeded(m) => {
+                assert!(m.starts_with("durable_bytes:"), "msg: {m}")
+            }
+            other => panic!("expected QuotaExceeded(durable_bytes), got {other:?}"),
+        }
+        // No-clobber: the rejected commit never moved the durable ref off oid(2).
+        assert_eq!(
+            mgr.refs
+                .get(&r("refs/tenants/acme/heads/main"))
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            oid(2),
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_object_count_quota_rejects_at_limit() {
+        use crate::quota::TenantUsage;
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_object_count: Some(5),
+            ..Default::default()
+        };
+        let (mgr, usage, _dir) = setup_quota_usage(limits);
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+
+        // acme measured AT the object-count limit (5 >= 5) ⇒ reject.
+        set_usage(&usage, "acme", TenantUsage { bytes: 0, objects: 5 });
+        let err = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap_err();
+        match err {
+            LedgeError::QuotaExceeded(m) => assert!(m.starts_with("object_count:"), "msg: {m}"),
+            other => panic!("expected QuotaExceeded(object_count), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_storage_quota_under_limit_succeeds() {
+        use crate::quota::TenantUsage;
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_durable_bytes: Some(1000),
+            max_object_count: Some(10),
+            ..Default::default()
+        };
+        let (mgr, usage, _dir) = setup_quota_usage(limits);
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+
+        // Strictly under both limits ⇒ commit succeeds.
+        set_usage(&usage, "acme", TenantUsage { bytes: 500, objects: 3 });
+        let out = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap();
+        assert!(matches!(out[0], CommitOutcome::Ok { .. }), "under limit succeeds");
+    }
+
+    #[tokio::test]
+    async fn commit_storage_quota_root_exempt_and_disabled_passes() {
+        use crate::quota::TenantUsage;
+        // root is exempt even with usage far over a tiny limit.
+        let limits = crate::quota::QuotaLimits {
+            enabled: true,
+            max_durable_bytes: Some(1),
+            max_object_count: Some(1),
+            ..Default::default()
+        };
+        let (mgr, usage, _dir) = setup_quota_usage(limits);
+        mgr.refs.update(&r("refs/heads/main"), oid(1), None).await.unwrap();
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "root")
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+        set_usage(&usage, "root", TenantUsage { bytes: 10_000, objects: 10_000 });
+        // root is exempt ⇒ commit succeeds despite being far over.
+        let out = mgr.commit(view.id, &[(ws, client)], "root").await.unwrap();
+        assert!(matches!(out[0], CommitOutcome::Ok { .. }), "root exempt");
+    }
+
+    #[tokio::test]
+    async fn commit_storage_quota_disabled_passes_far_over() {
+        use crate::quota::TenantUsage;
+        // enabled=false (default) ⇒ no gate even for a real tenant far over.
+        let (mgr, usage, _dir) = setup_quota_usage(crate::quota::QuotaLimits::default());
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+        set_usage(&usage, "acme", TenantUsage { bytes: 10_000, objects: 10_000 });
+        let out = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap();
+        assert!(matches!(out[0], CommitOutcome::Ok { .. }), "disabled ⇒ no gate");
     }
 }
