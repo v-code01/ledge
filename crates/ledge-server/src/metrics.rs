@@ -169,6 +169,16 @@ pub fn record_tenant_denied() {
     metrics::counter!(TENANT_DENIED_TOTAL).increment(1);
 }
 
+/// Metric name for quota denials (pull-forward from Task 7; Task 7 adds the
+/// usage gauges + the metric-name test alongside this).
+pub const QUOTA_DENIED_TOTAL: &str = "ledge_quota_denied_total";
+
+/// Count a quota denial. `resource` ∈ workspaces|durable_bytes|object_count|requests.
+/// Never labeled with a tenant id (spec §5).
+pub fn record_quota_denied(resource: &'static str) {
+    metrics::counter!(QUOTA_DENIED_TOTAL, "resource" => resource).increment(1);
+}
+
 /// Update the per-shard Raft gauges/counters from a `RaftMetrics` snapshot.
 ///
 /// Called from the cluster-mode metrics poller (one task per shard, started in

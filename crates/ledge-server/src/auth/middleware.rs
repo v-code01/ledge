@@ -154,6 +154,20 @@ pub async fn auth_layer(State(state): State<AppState>, mut req: Request, next: N
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // ── Rate quota (Phase 4d-3): CLIENT requests only, post-principal (tenant
+    //    known), pre-next.run. Enforced only when quotas enabled AND tenant != root
+    //    (R Q7); root/disabled bypass via `enforced_for`. A deny is a 429. The
+    //    clock is injected inside `check_now` (Instant::now) so the limiter stays
+    //    deterministic-testable in isolation (Task 4.1). ───────────────────────────
+    if class == Class::Client
+        && state.quota.limits.enforced_for(&principal.tenant_id)
+        && !state.quota.rate.check_now(&principal.tenant_id)
+    {
+        metrics::record_quota_denied("requests");
+        tracing::warn!(path = %path, tenant = %principal.tenant_id, "quota 429 (rate)");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
     metrics::record_auth_request("ok");
     req.extensions_mut().insert(principal);
     next.run(req).await
@@ -426,5 +440,128 @@ mod tests {
             status_of(app, "GET", "/healthz", None).await,
             StatusCode::OK
         );
+    }
+
+    /// A router like `app_with` but with an ENABLED rate quota (rate/burst) and a
+    /// minted tenant key, so we can drive the middleware's 429 path. `/healthz`
+    /// is mounted to assert PUBLIC routes are never rate-limited.
+    async fn app_with_rate(rate: u32, burst: u32) -> (Router, String) {
+        async fn whoami(p: Principal) -> String {
+            p.principal_id
+        }
+        async fn public_ok() -> &'static str {
+            "ok"
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::workspace_routes::test_state_for_auth(&dir);
+        let store = Arc::new(AuthStore::in_memory(Arc::new(ledge_core::HLC::new())));
+        let token = store
+            .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        state.auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
+        state.quota = crate::quota::QuotaCtx {
+            limits: ledge_workspace::QuotaLimits {
+                enabled: true,
+                ..Default::default()
+            },
+            usage: std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+            rate: std::sync::Arc::new(crate::quota::rate::TenantRateLimiter::new(
+                Some(rate),
+                Some(burst),
+            )),
+        };
+        let app = Router::new()
+            .route("/workspaces", get(whoami))
+            .route("/healthz", get(public_ok))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_layer,
+            ))
+            .with_state(state);
+        (app, token)
+    }
+
+    #[tokio::test]
+    async fn enabled_rate_quota_429_after_burst() {
+        // burst=2 ⇒ first two CLIENT requests pass, the third is 429.
+        let (app, token) = app_with_rate(1, 2).await;
+        assert_eq!(
+            status_of(app.clone(), "GET", "/workspaces", Some(("Bearer", &token))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(app.clone(), "GET", "/workspaces", Some(("Bearer", &token))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(app, "GET", "/workspaces", Some(("Bearer", &token))).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "third request (burst exhausted) must be 429",
+        );
+    }
+
+    #[tokio::test]
+    async fn public_route_never_rate_limited() {
+        // /healthz is PUBLIC: even with the bucket exhausted, it must stay 200.
+        let (app, token) = app_with_rate(1, 1).await;
+        // Exhaust the CLIENT bucket.
+        assert_eq!(
+            status_of(app.clone(), "GET", "/workspaces", Some(("Bearer", &token))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(app.clone(), "GET", "/workspaces", Some(("Bearer", &token))).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // PUBLIC route is unaffected by the rate limiter, repeatedly.
+        for _ in 0..20 {
+            assert_eq!(
+                status_of(app.clone(), "GET", "/healthz", None).await,
+                StatusCode::OK,
+                "PUBLIC route must never be rate-limited",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_quota_never_rate_limits() {
+        // Auth ENABLED but the rate limiter unlimited (default QuotaCtx) ⇒ no 429
+        // ever, even under a flood. (The default disabled() limits ⇒ enforced_for
+        // is false ⇒ the rate check is bypassed entirely.)
+        let store = Arc::new(AuthStore::in_memory(Arc::new(ledge_core::HLC::new())));
+        let token = store
+            .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::workspace_routes::test_state_for_auth(&dir);
+        state.auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
+        // state.quota stays QuotaCtx::disabled() (from test_state_for_auth).
+        async fn whoami(p: Principal) -> String {
+            p.principal_id
+        }
+        let app = Router::new()
+            .route("/workspaces", get(whoami))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_layer,
+            ))
+            .with_state(state);
+        for _ in 0..50 {
+            assert_eq!(
+                status_of(app.clone(), "GET", "/workspaces", Some(("Bearer", &token))).await,
+                StatusCode::OK,
+                "disabled quota must never 429",
+            );
+        }
     }
 }
