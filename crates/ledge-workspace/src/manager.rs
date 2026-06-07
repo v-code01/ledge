@@ -95,6 +95,42 @@ fn client_ref(id: &WorkspaceId, stored: &str) -> String {
     }
 }
 
+/// Normalize a tenant id: the empty string (a legacy lease decoded without a
+/// `tenant_id`) is the synthetic `root` tenant. Applied to BOTH sides of every
+/// ownership comparison and stamped onto every new lease, so `""` (legacy) and
+/// `"root"` (synthetic) are one tenant — matching `ledge_core::tenant_prefix`'s
+/// `root == ""` semantics (Phase 4d-2 R7).
+fn tenant_norm(t: &str) -> &str {
+    if t.is_empty() {
+        "root"
+    } else {
+        t
+    }
+}
+
+/// A cross-tenant ownership mismatch surfaces as `NotFound` (never `Conflict` or
+/// a tenant-naming error) so the HTTP layer maps it to 404 — existence is never
+/// revealed (Phase 4d-2 spec §5). The carried `ObjectId` is a zero sentinel; it
+/// is never shown to the client (only the 404 status is).
+fn cross_tenant_not_found() -> LedgeError {
+    LedgeError::NotFound(ObjectId::from_bytes([0u8; 32]))
+}
+
+/// Re-root a CLIENT-facing durable ref into the tenant's physical namespace.
+/// `refs/heads/main` + tenant `acme` → `refs/tenants/acme/heads/main`; root → unchanged.
+/// (Wraps `ledge_core::tenant_prefix` as the `ledge-git` `store_ref` does.)
+fn durable_ref(tenant: &str, client: &RefName) -> Result<RefName> {
+    let prefix = ledge_core::tenant_prefix(tenant);
+    if prefix.is_empty() {
+        return Ok(client.clone());
+    }
+    let rest = client
+        .as_str()
+        .strip_prefix("refs/")
+        .ok_or_else(|| LedgeError::InvalidRefName(client.as_str().to_string()))?;
+    RefName::new(&format!("refs/{prefix}{rest}"))
+}
+
 impl WorkspaceManager {
     /// Construct a manager over a ref store, lease store, shared clock, and the
     /// atomic-commit seam used to promote workspace refs to durable refs.
@@ -117,6 +153,17 @@ impl WorkspaceManager {
         format!("refs/workspaces/{}/", id.to_hex())
     }
 
+    /// Load a lease and verify it belongs to `tenant`. `Ok(Some(lease))` if owned,
+    /// `Ok(None)` if the lease is absent/tombstoned, `Err(NotFound)` if it exists
+    /// but belongs to a DIFFERENT tenant (404 — no existence leak, spec §5).
+    async fn owned_lease(&self, id: WorkspaceId, tenant: &str) -> Result<Option<Lease>> {
+        match self.leases.get(id).await? {
+            None => Ok(None),
+            Some(l) if tenant_norm(&l.tenant_id) == tenant_norm(tenant) => Ok(Some(l)),
+            Some(_) => Err(cross_tenant_not_found()),
+        }
+    }
+
     /// Fork a workspace from `source` refs with lifetime `ttl`.
     ///
     /// For each source ref: read its durable entry; if present, create the
@@ -127,16 +174,27 @@ impl WorkspaceManager {
     /// Complexity: O(n) ref reads + O(n) ref creates for n source refs, plus one
     /// lease put. Side effects: n ref-store WAL appends + one lease WAL append.
     #[tracing::instrument(skip(self, source), fields(ttl_secs = ttl.as_secs()))]
-    pub async fn fork(&self, source: &[RefName], ttl: Duration) -> Result<WorkspaceView> {
+    pub async fn fork(
+        &self,
+        source: &[RefName],
+        ttl: Duration,
+        tenant_id: &str,
+    ) -> Result<WorkspaceView> {
+        let tenant = tenant_norm(tenant_id);
         let id = WorkspaceId::generate(&self.hlc);
 
         let mut view_refs: Vec<(String, RefEntry)> = Vec::with_capacity(source.len());
         let mut source_names: Vec<String> = Vec::with_capacity(source.len());
 
         for src in source {
-            let entry = self.refs.get(src).await?.ok_or_else(|| {
+            // Read the tenant's OWN durable ref (root ⇒ identity, today's path).
+            let durable = durable_ref(tenant, src)?;
+            let entry = self.refs.get(&durable).await?.ok_or_else(|| {
                 LedgeError::Corruption(format!("fork: source ref does not exist: {}", src.as_str()))
             })?;
+            // The workspace ref is re-rooted from the CLIENT-facing source name,
+            // so the view + workspace namespace are tenant-agnostic (isolation is
+            // the lease.tenant_id + the unguessable id, not a physical prefix).
             let ws = workspace_ref(&id, src)?;
             // create-if-absent: a brand-new workspace namespace must be empty.
             self.refs.update(&ws, entry.target, None).await?;
@@ -155,7 +213,7 @@ impl WorkspaceManager {
             expires_at_ms: expires,
             hlc: self.hlc.tick(),
             generation: 1,
-            tenant_id: "root".to_string(),
+            tenant_id: tenant.to_string(),
         };
         self.leases.put(lease.clone()).await?;
 
@@ -172,8 +230,8 @@ impl WorkspaceManager {
     ///
     /// Complexity: one lease get + one lease put. Side effect: one lease WAL append.
     #[tracing::instrument(skip(self), fields(id = %id, ttl_secs = ttl.as_secs()))]
-    pub async fn renew(&self, id: WorkspaceId, ttl: Duration) -> Result<Lease> {
-        let mut lease = self.leases.get(id).await?.ok_or_else(|| {
+    pub async fn renew(&self, id: WorkspaceId, ttl: Duration, tenant_id: &str) -> Result<Lease> {
+        let mut lease = self.owned_lease(id, tenant_id).await?.ok_or_else(|| {
             LedgeError::Corruption(format!("renew: unknown workspace {}", id.to_hex()))
         })?;
         let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
@@ -212,11 +270,21 @@ impl WorkspaceManager {
         &self,
         id: WorkspaceId,
         mappings: &[(RefName, RefName)],
+        tenant_id: &str,
     ) -> Result<Vec<CommitOutcome>> {
-        // Authorization: every source ref MUST live under this workspace's
-        // namespace. Promoting a ref from a *different* workspace would let a
-        // caller leak another workspace's work into a durable ref. Reject the
-        // whole batch (no partial promotion) before any write touches storage.
+        // Ownership: a foreign workspace id is a 404 (never reveal it exists).
+        let tenant = tenant_norm(tenant_id);
+        if self.owned_lease(id, tenant).await?.is_none() {
+            return Err(LedgeError::Corruption(format!(
+                "commit: unknown workspace {}",
+                id.to_hex()
+            )));
+        }
+
+        // Authorization (unchanged): every source ref MUST live under THIS
+        // workspace's namespace. Promoting a ref from a *different* workspace
+        // would let a caller leak another workspace's work into a durable ref.
+        // Reject the whole batch (no partial promotion) before any write.
         let ws_prefix = Self::ws_prefix(&id);
         for mapping in mappings {
             if !mapping.0.as_str().starts_with(&ws_prefix) {
@@ -228,23 +296,40 @@ impl WorkspaceManager {
             }
         }
 
-        // Build the (durable, target, expected) promotion set. A workspace ref
-        // that is absent is silently skipped (mirrors git's no-op).
+        // Build the (durable, target, expected) set. The durable TARGET is
+        // rewritten into the tenant's physical namespace; we keep the CLIENT name
+        // to report back so the API contract (refs/heads/feature) is stable. A
+        // workspace ref that is absent is silently skipped (mirrors git's no-op).
         let mut promotions: Vec<(RefName, ObjectId, Option<ObjectId>)> =
             Vec::with_capacity(mappings.len());
-        for (ws_ref, durable_ref) in mappings {
+        let mut client_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(mappings.len());
+        for (ws_ref, client_durable) in mappings {
             let ws_entry = match self.refs.get(ws_ref).await? {
                 Some(e) => e,
                 None => continue, // nothing to promote from this workspace ref
             };
-            let current = self.refs.get(durable_ref).await?;
+            let phys_durable = durable_ref(tenant, client_durable)?;
+            client_names.insert(
+                phys_durable.as_str().to_string(),
+                client_durable.as_str().to_string(),
+            );
+            let current = self.refs.get(&phys_durable).await?;
             let expected = current.as_ref().map(|c| c.target);
-            promotions.push((durable_ref.clone(), ws_entry.target, expected));
+            promotions.push((phys_durable, ws_entry.target, expected));
         }
 
         if promotions.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Map a physical durable name back to the client-facing name for output.
+        let to_client = |phys: &str| -> String {
+            client_names
+                .get(phys)
+                .cloned()
+                .unwrap_or_else(|| phys.to_string())
+        };
 
         // ATOMIC all-or-nothing promotion through the injected seam.
         let result = self.coordinator.commit_atomic(promotions).await?;
@@ -253,7 +338,7 @@ impl WorkspaceManager {
             AtomicCommitResult::Committed(committed) => committed
                 .into_iter()
                 .map(|(name, entry)| CommitOutcome::Ok {
-                    target: name.as_str().to_string(),
+                    target: to_client(name.as_str()),
                     entry,
                 })
                 .collect(),
@@ -271,7 +356,7 @@ impl WorkspaceManager {
                         hlc: 0,
                     });
                     out.push(CommitOutcome::Conflict {
-                        target: name.as_str().to_string(),
+                        target: to_client(name.as_str()),
                         current,
                     });
                 }
@@ -289,7 +374,16 @@ impl WorkspaceManager {
     ///
     /// Complexity: O(k) deletes for k workspace refs + one lease tombstone.
     #[tracing::instrument(skip(self), fields(id = %id))]
-    pub async fn release(&self, id: WorkspaceId) -> Result<()> {
+    pub async fn release(&self, id: WorkspaceId, tenant_id: &str) -> Result<()> {
+        // Ownership: releasing a FOREIGN live workspace is a 404 (owned_lease
+        // returns Err(NotFound) → propagated, no existence leak). An ABSENT lease
+        // is a no-op success (owned_lease returns Ok(None) ⇒ idempotent release).
+        if self.owned_lease(id, tenant_id).await?.is_none() {
+            // Reached here with Ok(None) ⇒ the lease is absent/tombstoned ⇒
+            // idempotent success. Still tombstone defensively (no-op if gone).
+            self.leases.tombstone(id).await?;
+            return Ok(());
+        }
         let prefix = Self::ws_prefix(&id);
         for (name, entry) in self.refs.list(&prefix).await? {
             match self.refs.delete(&name, entry.target).await {
@@ -309,10 +403,16 @@ impl WorkspaceManager {
     /// Maps stored workspace ref names back to client-facing names (§3.2 inverse).
     ///
     /// Complexity: one lease get + O(k) for k workspace refs (list + map).
-    pub async fn get(&self, id: WorkspaceId) -> Result<Option<WorkspaceView>> {
-        let lease = match self.leases.get(id).await? {
-            Some(l) => l,
-            None => return Ok(None),
+    pub async fn get(&self, id: WorkspaceId, tenant_id: &str) -> Result<Option<WorkspaceView>> {
+        // A foreign workspace is indistinguishable from a missing one (Ok(None)):
+        // existence is never revealed cross-tenant (spec §5). owned_lease returns
+        // Err(NotFound) for foreign, which we MAP to Ok(None) here so the read
+        // path never 500s and the handler 404s uniformly.
+        let lease = match self.owned_lease(id, tenant_id).await {
+            Ok(Some(l)) => l,
+            Ok(None) => return Ok(None),
+            Err(LedgeError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
         };
         let prefix = Self::ws_prefix(&id);
         let refs = self
@@ -330,11 +430,11 @@ impl WorkspaceManager {
     /// A lease that vanished between `live` and `get` is skipped (race-safe).
     ///
     /// Complexity: one `live` scan + O(w) `get`s for w live workspaces.
-    pub async fn list(&self) -> Result<Vec<WorkspaceView>> {
-        let live = self.leases.live(now_ms()).await?;
+    pub async fn list(&self, tenant_id: &str) -> Result<Vec<WorkspaceView>> {
+        let live = self.leases.live_for_tenant(now_ms(), tenant_id).await?;
         let mut views = Vec::with_capacity(live.len());
         for lease in live {
-            if let Some(view) = self.get(lease.id).await? {
+            if let Some(view) = self.get(lease.id, tenant_id).await? {
                 views.push(view);
             }
         }
@@ -390,7 +490,7 @@ mod tests {
         mgr.refs.update(&main, target, None).await.unwrap();
 
         let view = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(60), "root")
             .await
             .unwrap();
 
@@ -421,7 +521,7 @@ mod tests {
         let (mgr, _dir) = setup();
         let absent = r("refs/heads/nope");
         let err = mgr
-            .fork(&[absent], Duration::from_secs(60))
+            .fork(&[absent], Duration::from_secs(60), "root")
             .await
             .unwrap_err();
         match err {
@@ -444,6 +544,7 @@ mod tests {
             .fork(
                 &[main.clone(), dev.clone(), tag.clone()],
                 Duration::from_secs(60),
+                "root",
             )
             .await
             .unwrap();
@@ -466,10 +567,10 @@ mod tests {
         let (mgr, _dir) = setup();
         let main = r("refs/heads/main");
         mgr.refs.update(&main, oid(1), None).await.unwrap();
-        let view = mgr.fork(&[main], Duration::from_secs(1)).await.unwrap();
+        let view = mgr.fork(&[main], Duration::from_secs(1), "root").await.unwrap();
         let before = view.lease.clone();
 
-        let renewed = mgr.renew(view.id, Duration::from_secs(3600)).await.unwrap();
+        let renewed = mgr.renew(view.id, Duration::from_secs(3600), "root").await.unwrap();
 
         assert_eq!(renewed.id, before.id);
         assert_eq!(renewed.generation, before.generation + 1);
@@ -495,7 +596,7 @@ mod tests {
         let src_target = oid(1);
         mgr.refs.update(&src, src_target, None).await.unwrap();
         let view = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60), "root")
             .await
             .unwrap();
 
@@ -505,7 +606,7 @@ mod tests {
 
         let ws = workspace_ref(&view.id, &src).unwrap();
         let outcomes = mgr
-            .commit(view.id, &[(ws.clone(), durable.clone())])
+            .commit(view.id, &[(ws.clone(), durable.clone())], "root")
             .await
             .unwrap();
 
@@ -606,7 +707,7 @@ mod tests {
         let mgr = WorkspaceManager::new(refs.clone(), leases, hlc, coordinator);
 
         let view = mgr
-            .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60))
+            .fork(&[s1.clone(), s2.clone()], Duration::from_secs(60), "root")
             .await
             .unwrap();
         let ws1 = workspace_ref(&view.id, &s1).unwrap();
@@ -617,7 +718,7 @@ mod tests {
         // WHOLE batch aborts. Under the OLD sequential loop ws2→d2 would have
         // committed first; the atomic seam guarantees it does NOT.
         let outcomes = mgr
-            .commit(view.id, &[(ws1, d1.clone()), (ws2, d2.clone())])
+            .commit(view.id, &[(ws1, d1.clone()), (ws2, d2.clone())], "root")
             .await
             .unwrap();
         assert!(
@@ -643,7 +744,7 @@ mod tests {
         let src = r("refs/heads/main");
         mgr.refs.update(&src, oid(1), None).await.unwrap();
         let view = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60), "root")
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &src).unwrap();
@@ -651,7 +752,7 @@ mod tests {
 
         // A SECOND workspace forked from the same source, with DIFFERENT work.
         let view2 = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60), "root")
             .await
             .unwrap();
         let ws2 = workspace_ref(&view2.id, &src).unwrap();
@@ -661,7 +762,7 @@ mod tests {
 
         // First workspace commits: reads durable oid(1), CAS oid(1)->oid(2). Ok.
         let first = mgr
-            .commit(view.id, &[(ws.clone(), durable.clone())])
+            .commit(view.id, &[(ws.clone(), durable.clone())], "root")
             .await
             .unwrap();
         assert!(matches!(first[0], CommitOutcome::Ok { .. }));
@@ -704,12 +805,12 @@ mod tests {
 
         // Workspace A: the target of the commit call.
         let view_a = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60), "root")
             .await
             .unwrap();
         // Workspace B: a DIFFERENT workspace whose ref we maliciously pass to A.
         let view_b = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(60))
+            .fork(std::slice::from_ref(&src), Duration::from_secs(60), "root")
             .await
             .unwrap();
 
@@ -722,7 +823,7 @@ mod tests {
 
         // Promoting B's ref through A's commit must be rejected.
         let err = mgr
-            .commit(view_a.id, &[(b_ws_ref.clone(), durable.clone())])
+            .commit(view_a.id, &[(b_ws_ref.clone(), durable.clone())], "root")
             .await
             .unwrap_err();
         match err {
@@ -745,7 +846,7 @@ mod tests {
         mgr.refs.update(&main, oid(1), None).await.unwrap();
         mgr.refs.update(&tag, oid(2), None).await.unwrap();
         let view = mgr
-            .fork(&[main.clone(), tag.clone()], Duration::from_secs(60))
+            .fork(&[main.clone(), tag.clone()], Duration::from_secs(60), "root")
             .await
             .unwrap();
 
@@ -753,12 +854,12 @@ mod tests {
         let prefix = format!("refs/workspaces/{}/", view.id.to_hex());
         assert_eq!(mgr.refs.list(&prefix).await.unwrap().len(), 2);
 
-        mgr.release(view.id).await.unwrap();
+        mgr.release(view.id, "root").await.unwrap();
 
         // Workspace refs gone.
         assert!(mgr.refs.list(&prefix).await.unwrap().is_empty());
         // get() returns None after release.
-        assert!(mgr.get(view.id).await.unwrap().is_none());
+        assert!(mgr.get(view.id, "root").await.unwrap().is_none());
         // Durable source refs are UNTOUCHED.
         assert_eq!(mgr.refs.get(&main).await.unwrap().unwrap().target, oid(1));
         assert_eq!(mgr.refs.get(&tag).await.unwrap().unwrap().target, oid(2));
@@ -769,16 +870,16 @@ mod tests {
         let (mgr, _dir) = setup();
         let main = r("refs/heads/main");
         mgr.refs.update(&main, oid(1), None).await.unwrap();
-        let view = mgr.fork(&[main], Duration::from_secs(60)).await.unwrap();
+        let view = mgr.fork(&[main], Duration::from_secs(60), "root").await.unwrap();
 
-        mgr.release(view.id).await.unwrap();
+        mgr.release(view.id, "root").await.unwrap();
         // Second release on an already-released workspace must still be Ok.
-        mgr.release(view.id).await.unwrap();
+        mgr.release(view.id, "root").await.unwrap();
         // Release on a never-existed workspace id is also Ok.
         let phantom = WorkspaceId::generate(&mgr.hlc);
-        mgr.release(phantom).await.unwrap();
+        mgr.release(phantom, "root").await.unwrap();
 
-        assert!(mgr.get(view.id).await.unwrap().is_none());
+        assert!(mgr.get(view.id, "root").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -789,11 +890,11 @@ mod tests {
         mgr.refs.update(&main, oid(1), None).await.unwrap();
         mgr.refs.update(&tag, oid(2), None).await.unwrap();
         let view = mgr
-            .fork(&[main, tag], Duration::from_secs(60))
+            .fork(&[main, tag], Duration::from_secs(60), "root")
             .await
             .unwrap();
 
-        let got = mgr.get(view.id).await.unwrap().expect("present");
+        let got = mgr.get(view.id, "root").await.unwrap().expect("present");
         let mut names: Vec<&str> = got.refs.iter().map(|(n, _)| n.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["refs/heads/main", "refs/tags/v1"]);
@@ -812,23 +913,23 @@ mod tests {
 
         // Live workspace (long TTL).
         let live = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(3600))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "root")
             .await
             .unwrap();
         // Released workspace (tombstoned -> not live).
         let released = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(3600))
+            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "root")
             .await
             .unwrap();
-        mgr.release(released.id).await.unwrap();
+        mgr.release(released.id, "root").await.unwrap();
         // Expired workspace (TTL already elapsed). expires_at_ms == created_at_ms;
         // `live` uses `expires_at_ms > now_ms`, so a 0ms TTL is not live.
         let expired = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_millis(0))
+            .fork(std::slice::from_ref(&main), Duration::from_millis(0), "root")
             .await
             .unwrap();
 
-        let listed = mgr.list().await.unwrap();
+        let listed = mgr.list("root").await.unwrap();
         let ids: Vec<WorkspaceId> = listed.iter().map(|v| v.id).collect();
 
         assert!(ids.contains(&live.id), "live workspace must be listed");
@@ -839,6 +940,126 @@ mod tests {
         assert!(
             !ids.contains(&expired.id),
             "expired workspace must not be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_get_is_none_renew_release_are_404() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        // acme forks from its OWN durable namespace (refs/tenants/acme/...).
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        // acme forks a workspace.
+        let view = mgr
+            .fork(std::slice::from_ref(&main), Duration::from_secs(60), "acme")
+            .await
+            .unwrap();
+
+        // globex cannot SEE it (Ok(None), not an error, not the view).
+        assert!(mgr.get(view.id, "globex").await.unwrap().is_none());
+
+        // globex renew/release on it ⇒ NotFound (→ 404 at the HTTP layer).
+        let renew_err = mgr
+            .renew(view.id, Duration::from_secs(60), "globex")
+            .await
+            .unwrap_err();
+        assert!(matches!(renew_err, LedgeError::NotFound(_)));
+
+        let rel_err = mgr.release(view.id, "globex").await.unwrap_err();
+        assert!(matches!(rel_err, LedgeError::NotFound(_)));
+
+        // acme still owns it.
+        assert!(mgr.get(view.id, "acme").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn list_is_tenant_scoped() {
+        let (mgr, _dir) = setup();
+        let main = r("refs/heads/main");
+        // Each tenant forks from its OWN durable namespace.
+        mgr.refs
+            .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        mgr.refs
+            .update(&r("refs/tenants/globex/heads/main"), oid(1), None)
+            .await
+            .unwrap();
+        let acme = mgr
+            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "acme")
+            .await
+            .unwrap();
+        let globex = mgr
+            .fork(
+                std::slice::from_ref(&main),
+                Duration::from_secs(3600),
+                "globex",
+            )
+            .await
+            .unwrap();
+
+        let acme_ids: Vec<_> = mgr
+            .list("acme")
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        assert!(acme_ids.contains(&acme.id));
+        assert!(
+            !acme_ids.contains(&globex.id),
+            "globex's ws must not appear in acme's list"
+        );
+
+        let globex_ids: Vec<_> = mgr
+            .list("globex")
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        assert!(globex_ids.contains(&globex.id));
+        assert!(!globex_ids.contains(&acme.id));
+    }
+
+    #[tokio::test]
+    async fn fork_and_commit_land_in_the_tenant_namespace() {
+        let (mgr, _dir) = setup();
+        // acme's durable ref is physically refs/tenants/acme/heads/main.
+        let phys = r("refs/tenants/acme/heads/main");
+        mgr.refs.update(&phys, oid(1), None).await.unwrap();
+
+        // acme forks from the CLIENT name refs/heads/main (resolves to its phys ref).
+        let client = r("refs/heads/main");
+        let view = mgr
+            .fork(std::slice::from_ref(&client), Duration::from_secs(60), "acme")
+            .await
+            .unwrap();
+        assert_eq!(view.refs[0].0, "refs/heads/main", "view shows client-facing name");
+        assert_eq!(view.refs[0].1.target, oid(1));
+
+        // Advance the workspace ref, then commit back to the CLIENT durable name.
+        let ws = workspace_ref(&view.id, &client).unwrap();
+        mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
+        let outcomes = mgr
+            .commit(view.id, &[(ws, client.clone())], "acme")
+            .await
+            .unwrap();
+        match &outcomes[0] {
+            CommitOutcome::Ok { target, entry } => {
+                assert_eq!(target, "refs/heads/main", "reported name is client-facing");
+                assert_eq!(entry.target, oid(2));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // It landed PHYSICALLY under the tenant namespace, not the global one.
+        assert_eq!(mgr.refs.get(&phys).await.unwrap().unwrap().target, oid(2));
+        assert!(
+            mgr.refs.get(&r("refs/heads/main")).await.unwrap().is_none(),
+            "global refs/heads/main must be untouched (it was never acme's)"
         );
     }
 }
