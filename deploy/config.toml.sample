@@ -1,0 +1,77 @@
+# Ledge sample configuration. Copy to /etc/ledge/config.toml (systemd) or mount
+# into the container, and run `ledge start --config /etc/ledge/config.toml`.
+# Every value can also be set via env: LEDGE__<SECTION>__<KEY> (double underscore).
+# Defaults are shown; uncomment + change what you need.
+#
+# IMPORTANT: the server serves EVERYTHING on [server].addr (the "client port") —
+# git/REST/RPC/admin + /healthz + /metrics + /raft + /cluster. [metrics].addr and
+# [cluster].raft_bind are parsed but are NOT currently separate listeners. Cluster
+# peers therefore reach /raft on each other's client port (or the [tls].peer_addr
+# port under mTLS).
+
+[server]
+addr = "0.0.0.0:3000"
+data_dir = "/var/lib/ledge"
+
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090"   # parsed but not a separate listener; /metrics is on [server].addr
+
+[workspace]
+expiry_interval_secs = 30
+gc_interval_secs = 300
+default_ttl_secs = 3600
+
+# ── Authentication (Phase 4d-1) ──────────────────────────────────────────────
+# Disabled by default. ENABLE IN PRODUCTION. When enabled + clustered, set a
+# strong cluster_secret (node-to-node bearer for /raft, /cluster, /objects).
+[auth]
+enabled = false
+# cluster_secret = "change-me-to-a-long-random-secret"
+# bootstrap_admin_token = "ledge_admin_<random>"   # minted as a root admin key on first boot if the store is empty
+
+# ── Per-tenant quotas (Phase 4d-3) ───────────────────────────────────────────
+# Disabled by default; root tenant is always exempt. None = unlimited.
+[quotas]
+enabled = false
+# max_workspaces = 100
+# max_durable_bytes = 10737418240
+# max_object_count = 1000000
+# max_requests_per_sec = 100
+# burst = 200
+
+# ── TLS / mTLS (Phase 4d-4) ──────────────────────────────────────────────────
+# Disabled by default. ENABLE IN PRODUCTION (encrypts client tokens in transit).
+# enabled ⇒ cert_path + key_path required. mtls ⇒ also cluster.enabled + ca_path +
+# peer_addr + client_cert_path + client_key_path (mutual node auth on the peer
+# listener; outbound peer clients present this node's identity).
+[tls]
+enabled = false
+# cert_path = "/etc/ledge/tls/tls.crt"
+# key_path = "/etc/ledge/tls/tls.key"
+# ca_path = "/etc/ledge/tls/ca.crt"
+# mtls = false
+# peer_addr = "0.0.0.0:4443"
+# client_cert_path = "/etc/ledge/tls/client.crt"
+# client_key_path = "/etc/ledge/tls/client.key"
+
+# ── Cluster (Phase 3 / 4a) ───────────────────────────────────────────────────
+# Disabled by default (single node). For a cluster, set enabled + node_id (UNIQUE
+# per node) and declare the shard map (IDENTICAL on every node). After all nodes
+# are up, bootstrap each shard ONCE:
+#   curl -X POST http://<node>:3000/cluster/init \
+#     -H "Authorization: Bearer <cluster_secret>" -H "content-type: application/json" \
+#     -d '{"shard":0,"members":{"1":"http://node-1:3000","2":"http://node-2:3000","3":"http://node-3:3000"}}'
+[cluster]
+enabled = false
+# node_id = 1
+# num_shards = 1
+# raft_bind = "0.0.0.0:4001"   # parsed but not a separate listener; /raft is on [server].addr
+#
+# [[cluster.shards]]
+# id = 0
+# members = [
+#   { id = 1, addr = "http://node-1:3000" },
+#   { id = 2, addr = "http://node-2:3000" },
+#   { id = 3, addr = "http://node-3:3000" },
+# ]

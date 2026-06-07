@@ -1,0 +1,44 @@
+[Unit]
+Description=Ledge — agent-native Git storage
+Documentation=https://github.com/vanshverma/ledge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ledge
+Group=ledge
+ExecStart=/usr/local/bin/ledge start --config /etc/ledge/config.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# State lives under /var/lib/ledge (objects/refs/leases/auth + shard-* in cluster
+# mode). StateDirectory creates it 0700 owned by User=ledge on first start.
+StateDirectory=ledge
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/ledge
+
+# Hardening — least privilege. Ledge needs no elevated capabilities (binds ports
+# >1024 by default), writes only its state dir, and never executes helpers.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+# StateDirectory=ledge implies ReadWritePaths=/var/lib/ledge; listed explicitly
+# for clarity in case the config/state dir is relocated.
+ReadWritePaths=/var/lib/ledge
+# TLS material (when [tls] enabled) is read from /etc/ledge; ProtectSystem=strict
+# already leaves /etc read-only-accessible, so no extra path is needed for reads.
+
+[Install]
+WantedBy=multi-user.target
