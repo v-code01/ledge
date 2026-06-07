@@ -44,6 +44,7 @@ async fn start_server() -> (String, TempDir) {
         cluster_refs: None,
         shard_map: None,
         cluster_gc: None,
+        auth: ledge_server::auth::AuthCtx::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

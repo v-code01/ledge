@@ -269,6 +269,17 @@ async fn main() -> anyhow::Result<()> {
         cluster_refs,
         shard_map,
         cluster_gc,
+        // Auth (Phase 4d-1): open a WAL-backed key store when [auth] enabled,
+        // reusing this node's HLC; otherwise the infallible disabled context.
+        // No enforcement yet (middleware is Task 4); bootstrap-admin minting is
+        // Task 7 — this only opens the store + builds the ctx.
+        auth: if cfg.auth.enabled {
+            let store =
+                Arc::new(ledge_server::auth::AuthStore::open(data_dir.clone(), hlc.clone())?);
+            ledge_server::auth::AuthCtx::new(true, store, cfg.auth.cluster_secret.clone())
+        } else {
+            ledge_server::auth::AuthCtx::disabled()
+        },
     });
     let addr: SocketAddr = cfg
         .server

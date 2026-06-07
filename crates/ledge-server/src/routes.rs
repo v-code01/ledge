@@ -68,6 +68,10 @@ pub struct AppState {
     /// `/cluster/status` report declared placement (members) for EVERY shard, not
     /// just the locally-hosted ones. `None` single-node.
     pub shard_map: Option<ledge_cluster::ShardMap>,
+    /// Authentication context (Phase 4d-1): enabled flag, the API-key store, and
+    /// the node-to-node cluster secret. `AuthCtx::disabled()` in single-node dev
+    /// and all tests; the real ctx in `main.rs` when `[auth] enabled=true`.
+    pub auth: crate::auth::AuthCtx,
 }
 
 #[derive(Deserialize)]

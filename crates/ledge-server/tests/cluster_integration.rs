@@ -71,6 +71,7 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
         cluster_refs: None,
         shard_map: None,
         cluster_gc: None,
+        auth: ledge_server::auth::AuthCtx::disabled(),
     }
 }
 
@@ -317,6 +318,7 @@ fn cluster_state(
         cluster_refs: Some(cluster_refs),
         shard_map: Some(map.clone()),
         cluster_gc: Some(cluster_gc),
+        auth: ledge_server::auth::AuthCtx::disabled(),
     }
 }
 

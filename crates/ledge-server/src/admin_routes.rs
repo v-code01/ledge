@@ -162,6 +162,7 @@ mod route_tests {
             cluster_refs: None,
             shard_map: None,
             cluster_gc: None,
+            auth: crate::auth::AuthCtx::disabled(),
         }
     }
 

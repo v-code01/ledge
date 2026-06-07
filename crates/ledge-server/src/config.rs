@@ -10,6 +10,7 @@ pub struct LedgeConfig {
     pub metrics: MetricsConfig,
     pub workspace: WorkspaceConfig,
     pub cluster: ClusterConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -98,6 +99,23 @@ pub struct ReplicaSpec {
     pub addr: String,
 }
 
+/// Authentication (Phase 4d-1) configuration. Disabled by default: a
+/// default-loaded config is unauthenticated and byte-identical to Phase 1-4c.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct AuthConfig {
+    /// When false (default), no credential is required: the middleware injects a
+    /// synthetic root principal so every handler still extracts one.
+    pub enabled: bool,
+    /// Shared node-to-node bearer secret for INTERNAL routes (`/raft|/cluster|
+    /// /objects`). Required iff `enabled && clustered`. Interim until 4d-4 mTLS.
+    #[serde(default)]
+    pub cluster_secret: Option<String>,
+    /// Optional: on first boot, if `enabled` and the store is empty, mint an
+    /// admin key from this token so a fresh cluster is reachable.
+    #[serde(default)]
+    pub bootstrap_admin_token: Option<String>,
+}
+
 impl ClusterConfig {
     /// Build the validated [`ShardMap`] from the declared `[[cluster.shards]]`.
     /// An empty `shards` (single-node / no-cluster) yields an empty, valid map
@@ -132,7 +150,8 @@ impl LedgeConfig {
             .set_default("cluster.enabled",                    false).map_err(map_cfg)?
             .set_default("cluster.node_id",                    1i64).map_err(map_cfg)?
             .set_default("cluster.num_shards",                 1i64).map_err(map_cfg)?
-            .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?;
+            .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?
+            .set_default("auth.enabled",                       false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -276,6 +295,30 @@ mod tests {
         assert!(cfg.cluster.shards.is_empty());
         let map = cfg.cluster.shard_map().expect("empty map is valid");
         assert_eq!(map.num_shards(), 0);
+    }
+
+    #[test]
+    fn auth_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config must load");
+        assert!(!cfg.auth.enabled, "auth disabled by default (back-compat)");
+        assert!(cfg.auth.cluster_secret.is_none());
+        assert!(cfg.auth.bootstrap_admin_token.is_none());
+    }
+
+    #[test]
+    fn auth_config_toml_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[auth]\nenabled=true\ncluster_secret=\"svc-secret\"\nbootstrap_admin_token=\"ledge_x_y\""
+        )
+        .unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.cluster_secret.as_deref(), Some("svc-secret"));
+        assert_eq!(cfg.auth.bootstrap_admin_token.as_deref(), Some("ledge_x_y"));
     }
 
     #[test]
