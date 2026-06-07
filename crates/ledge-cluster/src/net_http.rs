@@ -240,6 +240,19 @@ impl HttpRaftNetworkFactory {
             }
             None => reqwest::Client::new(),
         };
+        Self::with_client(shard, peers, client)
+    }
+
+    /// Construct from a PRE-BUILT `reqwest::Client` — the seam for injecting a
+    /// TLS-configured client (Phase 4d-4): the server builds one client carrying
+    /// the bearer `cluster_secret` default header AND the rustls TLS config (CA
+    /// roots + this node's mTLS identity) and hands it here. [`with_secret`]
+    /// delegates to this after building its bearer-only client.
+    pub fn with_client(
+        shard: ShardId,
+        peers: HashMap<NodeId, PeerAddr>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             shard,
             peers: Arc::new(peers),
@@ -554,6 +567,18 @@ mod tests {
         openraft::Raft::new(id, raft_config(), net, log, sm)
             .await
             .expect("Raft::new")
+    }
+
+    #[test]
+    fn factory_accepts_injected_client() {
+        // Phase 4d-4 seam: the factory can be built from a pre-configured client
+        // (the path the server uses to inject a TLS-configured reqwest client).
+        let client = reqwest::Client::new();
+        let _f = HttpRaftNetworkFactory::with_client(
+            ShardId(0),
+            std::collections::HashMap::new(),
+            client,
+        );
     }
 
     #[test]
