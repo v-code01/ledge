@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -129,13 +130,22 @@ impl ObjectPeer for LocalObjectPeer {
 pub struct ReplicatedObjectStore {
     local: Arc<DiskObjectStore>,
     /// The OTHER replicas of this shard (never self).
-    peers: Vec<Arc<dyn ObjectPeer>>,
+    ///
+    /// Behind [`ArcSwap`] so the replication peer set is **live-swappable**
+    /// (Phase 4g reconfiguration): a runtime reconfigure atomically replaces the
+    /// set so new voters start receiving pushed object writes and removed voters
+    /// stop, without tearing down the store. Readers (`write`/`read`/`exists`)
+    /// snapshot the current set with one `load()` per call.
+    peers: ArcSwap<Vec<Arc<dyn ObjectPeer>>>,
 }
 
 impl ReplicatedObjectStore {
     /// Build a replicated store over a `local` store and the shard's `peers`.
     pub fn new(local: Arc<DiskObjectStore>, peers: Vec<Arc<dyn ObjectPeer>>) -> Self {
-        Self { local, peers }
+        Self {
+            local,
+            peers: ArcSwap::from_pointee(peers),
+        }
     }
 
     /// The local store (for tests / wiring that needs the underlying handle).
@@ -149,8 +159,19 @@ impl ReplicatedObjectStore {
     /// `⌈(n+1)/2⌉` for all `n ≥ 1` (proven by [`tests::quorum_matches_ceil`]).
     /// The local write always contributes one ack.
     pub fn quorum(&self) -> usize {
-        let n = self.peers.len() + 1;
+        let n = self.peers.load().len() + 1;
         n / 2 + 1
+    }
+
+    /// Live count of replication peers (introspection / tests).
+    pub fn peer_count(&self) -> usize {
+        self.peers.load().len()
+    }
+
+    /// Atomically replace the replication peer set (Phase 4g reconfiguration):
+    /// new voters receive pushed object writes; removed voters drop out.
+    pub fn set_peers(&self, peers: Vec<Arc<dyn ObjectPeer>>) {
+        self.peers.store(Arc::new(peers));
     }
 }
 
@@ -173,8 +194,12 @@ impl ObjectStore for ReplicatedObjectStore {
         if acks >= need {
             return Ok(id); // single-replica shard: local write is the quorum.
         }
+        // Snapshot the live peer set once (owned-clone of the cheap Arcs) so we
+        // never hold the ArcSwap `Guard` across an `.await` (the Guard is not
+        // `Send`-friendly to carry across awaits; the per-write set is fixed).
+        let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
         let mut futs = FuturesUnordered::new();
-        for p in &self.peers {
+        for p in &peers {
             let p = p.clone();
             let content = content.clone();
             futs.push(async move { p.put(&id, &content).await });
@@ -223,7 +248,8 @@ impl ObjectStore for ReplicatedObjectStore {
             Err(LedgeError::NotFound(_)) => {} // fall through to peer fetch
             Err(e) => return Err(e),
         }
-        for p in &self.peers {
+        let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
+        for p in &peers {
             if let Some(bytes) = p.get(&id).await? {
                 // Content addressing makes the fetch verifiable + idempotent:
                 // the local re-write rederives the address; a mismatch means the
@@ -247,7 +273,8 @@ impl ObjectStore for ReplicatedObjectStore {
         if self.local.exists(id).await? {
             return Ok(true);
         }
-        for p in &self.peers {
+        let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
+        for p in &peers {
             if p.has(&id).await? {
                 return Ok(true);
             }
@@ -269,8 +296,9 @@ impl ReplicatedObjectStore {
         if acks >= need {
             return Ok(id);
         }
+        let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
         let mut futs = FuturesUnordered::new();
-        for p in &self.peers {
+        for p in &peers {
             let p = p.clone();
             let content = content.clone();
             futs.push(async move { p.put_git(&id, git_type, &content).await });
@@ -315,6 +343,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn set_peers_swaps_peer_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let local =
+            std::sync::Arc::new(ledge_object_store::DiskObjectStore::new(dir.path().to_path_buf()).unwrap());
+        let store = ReplicatedObjectStore::new(local.clone(), vec![]);
+        assert_eq!(store.peer_count(), 0);
+        let peer: std::sync::Arc<dyn ObjectPeer> = std::sync::Arc::new(LocalObjectPeer::new(local));
+        store.set_peers(vec![peer]);
+        assert_eq!(store.peer_count(), 1);
+    }
+
     #[test]
     fn quorum_matches_ceil() {
         // n/2 + 1 (Raft majority) must equal ⌈(n+1)/2⌉ for n ∈ 1..=6.
