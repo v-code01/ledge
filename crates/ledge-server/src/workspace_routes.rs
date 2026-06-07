@@ -169,6 +169,7 @@ async fn live_count(state: &AppState) -> f64 {
 /// POST /workspaces
 pub async fn create_workspace(
     State(state): State<AppState>,
+    _principal: crate::auth::Principal,
     Json(req): Json<ForkRequest>,
 ) -> Response {
     let mut sources = Vec::new();
@@ -261,6 +262,7 @@ pub async fn get_workspace(State(state): State<AppState>, Path(id): Path<String>
 /// POST /workspaces/:id/renew
 pub async fn renew_workspace(
     State(state): State<AppState>,
+    _principal: crate::auth::Principal,
     Path(id): Path<String>,
     Json(req): Json<RenewRequest>,
 ) -> Response {
@@ -290,6 +292,7 @@ pub async fn renew_workspace(
 /// POST /workspaces/:id/commit
 pub async fn commit_workspace(
     State(state): State<AppState>,
+    _principal: crate::auth::Principal,
     Path(id): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> Response {
@@ -339,7 +342,11 @@ pub async fn commit_workspace(
 }
 
 /// DELETE /workspaces/:id  — idempotent release
-pub async fn delete_workspace(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn delete_workspace(
+    State(state): State<AppState>,
+    _principal: crate::auth::Principal,
+    Path(id): Path<String>,
+) -> Response {
     let wid = match parse_id(&id) {
         Some(w) => w,
         None => return StatusCode::NOT_FOUND.into_response(),
@@ -362,7 +369,7 @@ pub async fn delete_workspace(State(state): State<AppState>, Path(id): Path<Stri
 /// Cluster mode (`AppState.cluster_gc` is `Some`): run the node-local
 /// `ClusterGc::run` (cross-shard roots + grace fence). Single-node (`None`): the
 /// existing single-node `Gc::run` (byte-identical behavior).
-pub async fn admin_gc(State(state): State<AppState>) -> Response {
+pub async fn admin_gc(State(state): State<AppState>, _principal: crate::auth::Principal) -> Response {
     let start = std::time::Instant::now();
     if let Some(cgc) = &state.cluster_gc {
         let now = std::time::SystemTime::now()
@@ -689,5 +696,93 @@ mod route_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 4d-1: every mutating CLIENT handler now carries a `Principal` extractor.
+    /// Under disabled auth the middleware injects the synthetic root, so the
+    /// extractor is satisfied and the full create→renew→commit→delete→gc
+    /// lifecycle behaves identically to pre-auth (never 401). This guards that
+    /// adding the extractor did not break routing or change behavior.
+    #[tokio::test]
+    async fn mutating_handlers_authenticated_under_disabled_auth() {
+        let dir = TempDir::new().unwrap();
+        let app = crate::build_app(test_state(&dir));
+
+        // create
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"source":[],"ttl_seconds":3600}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "create not 401/changed");
+        let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let id = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // renew
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workspaces/{id}/renew"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ttl_seconds":120}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "renew not 401/changed");
+
+        // commit (empty mappings → 200 with empty outcomes)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workspaces/{id}/commit"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mappings":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "commit not 401/changed");
+
+        // admin gc (single-node)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/gc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "admin_gc not 401/changed");
+
+        // delete (idempotent release)
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/workspaces/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "delete not 401/changed");
     }
 }

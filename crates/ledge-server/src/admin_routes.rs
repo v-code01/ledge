@@ -52,7 +52,11 @@ pub struct SnapshotResponse {
 /// Validates `dest` is absolute and does not already exist (400 otherwise),
 /// then runs the (blocking) recursive clone on a `spawn_blocking` worker so it
 /// does not stall the async runtime. Returns 200 with clone statistics.
-pub async fn admin_snapshot(State(state): State<AppState>, Json(req): Json<SnapshotRequest>) -> Response {
+pub async fn admin_snapshot(
+    State(state): State<AppState>,
+    _principal: crate::auth::Principal,
+    Json(req): Json<SnapshotRequest>,
+) -> Response {
     let dest = PathBuf::from(&req.dest);
     if !dest.is_absolute() {
         return (StatusCode::BAD_REQUEST, "dest must be an absolute path").into_response();

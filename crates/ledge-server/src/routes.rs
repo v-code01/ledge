@@ -169,6 +169,7 @@ pub async fn upload_pack(
 pub async fn receive_pack(
     Path(repo): Path<String>,
     State(state): State<AppState>,
+    _principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
     let start = Instant::now();
@@ -274,6 +275,7 @@ pub async fn ws_upload_pack(
 pub async fn ws_receive_pack(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    _principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
     let segment = format!("workspaces/{id}/");

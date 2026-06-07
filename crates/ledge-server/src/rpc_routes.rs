@@ -27,8 +27,20 @@ use crate::{metrics, routes::AppState};
 const CONTENT_TYPE: &str = "application/x-ledge-capnp";
 
 /// `POST /rpc` — decode one capnp `Request`, dispatch, return the `Response`.
-pub async fn rpc(State(state): State<AppState>, body: Bytes) -> Response {
+///
+/// 4d-1: `principal` is the verified identity the auth middleware injected
+/// (disabled mode injects the synthetic root). Extracting it here proves the
+/// request reached this handler authenticated; the `FromRequestParts`
+/// `Principal` extractor must precede the body-consuming `Bytes` extractor.
+/// 4d-2 will thread `principal.tenant_id` into `RpcCtx` for per-tenant
+/// resource scoping — 4d-1 only asserts presence (no `RpcCtx` change).
+pub async fn rpc(
+    State(state): State<AppState>,
+    principal: crate::auth::Principal,
+    body: Bytes,
+) -> Response {
     let start = Instant::now();
+    tracing::debug!(principal = %principal.principal_id, "rpc authenticated");
     // The metric/trace label is the request union tag, decoded once here. A
     // malformed body decodes to "unknown" (and dispatch will return Err -> 400).
     let method = ledge_rpc::method_name(&body);
