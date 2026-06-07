@@ -31,7 +31,20 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
+    /// Run the server (default launch path; byte-identical to pre-4d-1).
     Start(StartArgs),
+    /// API-key provisioning (operates on the store at --data-dir; no server).
+    Auth {
+        #[command(subcommand)]
+        cmd: ledge_server::cli::AuthCommand,
+        /// Data dir holding the auth store (overrides config/CWD resolution).
+        /// `global` so it may appear before OR after the subcommand
+        /// (`auth --data-dir D list-keys` and `auth list-keys --data-dir D`).
+        #[arg(long, global = true)]
+        data_dir: Option<String>,
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -47,7 +60,29 @@ struct StartArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let Commands::Start(args) = cli.command;
+    // Dispatch the provisioning subcommand BEFORE any server setup: it operates
+    // directly on the AuthStore at the resolved data dir and never starts a
+    // server, a listener, or the tracing subscriber. The `Start` arm falls
+    // through to the byte-identical server launch path below.
+    let args = match cli.command {
+        Commands::Auth {
+            cmd,
+            data_dir,
+            config,
+        } => {
+            let mut cfg = LedgeConfig::load(config.as_ref())?;
+            if let Some(dir) = data_dir {
+                cfg.server.data_dir = dir;
+            }
+            if let Some(line) =
+                ledge_server::cli::run_auth(cmd, PathBuf::from(&cfg.server.data_dir)).await?
+            {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        Commands::Start(args) => args,
+    };
     let mut cfg = LedgeConfig::load(args.config.as_ref())?;
     if let Some(addr) = args.addr {
         cfg.server.addr = addr;
@@ -67,6 +102,49 @@ async fn main() -> anyhow::Result<()> {
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.clone())?);
     ledge_server::metrics::install_recorder()?;
+
+    // ── Auth store (Phase 4d-1): opened in both single-node and cluster paths.
+    //    Disabled (default) ⇒ an in-memory ctx (the middleware never reads it),
+    //    byte-identical to the pre-4d-1 launch. Enabled ⇒ a real WAL-backed store
+    //    plus a first-boot bootstrap: if the store is empty and the operator set
+    //    `bootstrap_admin_token`, record that operator-supplied token as a root
+    //    admin key so a fresh cluster is reachable. Idempotent — it only fires on
+    //    an empty store, so a restart never re-bootstraps or duplicates the key. ──
+    let auth_ctx = if cfg.auth.enabled {
+        let auth_store =
+            Arc::new(ledge_server::auth::AuthStore::open(data_dir.clone(), hlc.clone())?);
+        match cfg.auth.bootstrap_admin_token.clone() {
+            Some(token) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // `bootstrap_admin_if_empty` only records on an empty store and
+                // BLAKE3-hashes the operator's secret via `put_token`; the
+                // plaintext token is NEVER logged (only the resulting key_id is).
+                match ledge_server::cli::bootstrap_admin_if_empty(&auth_store, &token, now).await? {
+                    Some(kid) => info!(key_id = %kid, "bootstrap admin key recorded from config"),
+                    None => info!("auth store already provisioned; skipping bootstrap"),
+                }
+            }
+            None if auth_store.list().is_empty() => {
+                tracing::warn!(
+                    "auth enabled but store empty and no bootstrap_admin_token; \
+                     cluster unreachable until a key is minted via `ledge auth create-key`"
+                );
+            }
+            None => {}
+        }
+        auth_store.spawn_compaction_task(64 * 1024 * 1024);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        ledge_server::metrics::set_auth_keys(auth_store.live_count(now) as f64);
+        ledge_server::auth::AuthCtx::new(true, auth_store, cfg.auth.cluster_secret.clone())
+    } else {
+        ledge_server::auth::AuthCtx::disabled()
+    };
 
     // ── Storage seam selection ───────────────────────────────────────────────
     // single-node (default): the dyn RefStore/ObjectStore seams are the same
@@ -270,17 +348,10 @@ async fn main() -> anyhow::Result<()> {
         cluster_refs,
         shard_map,
         cluster_gc,
-        // Auth (Phase 4d-1): open a WAL-backed key store when [auth] enabled,
-        // reusing this node's HLC; otherwise the infallible disabled context.
-        // No enforcement yet (middleware is Task 4); bootstrap-admin minting is
-        // Task 7 — this only opens the store + builds the ctx.
-        auth: if cfg.auth.enabled {
-            let store =
-                Arc::new(ledge_server::auth::AuthStore::open(data_dir.clone(), hlc.clone())?);
-            ledge_server::auth::AuthCtx::new(true, store, cfg.auth.cluster_secret.clone())
-        } else {
-            ledge_server::auth::AuthCtx::disabled()
-        },
+        // Auth (Phase 4d-1): the ctx assembled above — a real WAL-backed store
+        // (opened once, first-boot-bootstrapped, compaction task spawned) when
+        // [auth] enabled, otherwise the infallible disabled (in-memory) context.
+        auth: auth_ctx,
     });
     let addr: SocketAddr = cfg
         .server

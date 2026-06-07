@@ -1,5 +1,6 @@
 pub mod admin_routes;
 pub mod auth;
+pub mod cli;
 pub mod cluster_routes;
 pub mod config;
 pub mod metrics;

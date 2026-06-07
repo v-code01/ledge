@@ -291,6 +291,44 @@ impl AuthStore {
         Ok(format!("ledge_{key_id}_{secret}"))
     }
 
+    /// Record an operator-supplied full token (`ledge_<id>_<secret>`) as a key
+    /// for `tenant`/`kind`/`scopes`. Used by first-boot bootstrap (spec §4.4) so
+    /// a fresh cluster has a reachable admin without an interactive mint. Returns
+    /// the `key_id` recorded. Errors if the token is malformed.
+    ///
+    /// The operator generated the token out-of-band (so they already hold the
+    /// secret); only `BLAKE3(secret)` is persisted — the plaintext is never
+    /// stored or logged, exactly as for [`mint`](Self::mint).
+    pub async fn put_token(
+        &self,
+        token: &str,
+        tenant_id: &str,
+        kind: PrincipalKind,
+        scopes: Scopes,
+        now_ms: u64,
+    ) -> Result<String> {
+        let (key_id, secret_b64) = parse_token(token)
+            .ok_or_else(|| LedgeError::Corruption("malformed bootstrap token".into()))?;
+        let secret_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(secret_b64.as_bytes())
+            .map_err(|e| LedgeError::Corruption(format!("bootstrap token secret: {e}")))?;
+        let secret_hash = *blake3::hash(&secret_bytes).as_bytes();
+        let rec = ApiKeyRecord {
+            key_id: key_id.clone(),
+            secret_hash,
+            tenant_id: tenant_id.to_string(),
+            kind,
+            read: scopes.read,
+            write: scopes.write,
+            admin: scopes.admin,
+            created_at_ms: now_ms,
+            expires_at_ms: None,
+            revoked: false,
+        };
+        self.put(rec).await?;
+        Ok(key_id)
+    }
+
     /// Verify a presented token at `now_ms`. Parses `ledge_<key_id>_<secret>`,
     /// looks up the record, and on (present ∧ live ∧ constant-time hash match)
     /// returns the resolved [`Principal`]; else `None`. The secret is
@@ -624,6 +662,38 @@ mod tests {
         assert!(
             store.list().iter().all(|r| !r.revoked),
             "no revoked keys remain after compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_token_records_verifiable_operator_token() {
+        let dir = tempdir().unwrap();
+        let store = AuthStore::open(dir.path().to_path_buf(), hlc()).unwrap();
+        // Mint elsewhere to get a real well-formed token, then record it as bootstrap.
+        let scratch = AuthStore::in_memory(hlc());
+        let token = scratch
+            .mint("x", PrincipalKind::User, Scopes::ALL, None, 0)
+            .await
+            .unwrap();
+        store
+            .put_token(&token, "root", PrincipalKind::User, Scopes::ALL, 0)
+            .await
+            .unwrap();
+        assert!(
+            store.verify(&token, 0).is_some(),
+            "bootstrapped token verifies"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_token_rejects_malformed() {
+        let store = AuthStore::in_memory(hlc());
+        assert!(
+            store
+                .put_token("not-a-token", "root", PrincipalKind::User, Scopes::ALL, 0)
+                .await
+                .is_err(),
+            "malformed token is rejected"
         );
     }
 
