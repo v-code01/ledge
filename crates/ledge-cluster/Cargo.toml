@@ -28,6 +28,7 @@ futures = { workspace = true }
 bincode = { workspace = true }
 reqwest = { workspace = true }
 metrics = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

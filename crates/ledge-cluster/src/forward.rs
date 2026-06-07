@@ -215,21 +215,43 @@ impl RefOpForwarder for InMemoryForwarder {
 /// test is in section 2's endpoint task; the type is defined here so
 /// `build_cluster_stack` can construct it.
 pub struct HttpForwarder {
-    map: crate::shard_map::ShardMap,
+    /// Placement map for target selection, behind an `ArcSwap` so a runtime
+    /// reconfigure (Phase 4g) can live-swap the forward targets without rebuild.
+    map: arc_swap::ArcSwap<crate::shard_map::ShardMap>,
     client: reqwest::Client,
 }
 
 impl HttpForwarder {
     /// Construct over the shard map (for target selection) and a shared client.
     pub fn new(map: crate::shard_map::ShardMap, client: reqwest::Client) -> Self {
-        Self { map, client }
+        Self {
+            map: arc_swap::ArcSwap::from_pointee(map),
+            client,
+        }
+    }
+
+    /// Test-only: the addr the forwarder would currently pick for `shard` (reads
+    /// the live `ArcSwap` map). Used to assert `set_map` live-swaps targets.
+    #[cfg(test)]
+    fn target_addr(&self, shard: ShardId) -> Option<String> {
+        self.map
+            .load()
+            .pick_forward_target(shard, None)
+            .map(|r| r.addr.clone())
     }
 }
 
 #[async_trait]
 impl RefOpForwarder for HttpForwarder {
+    /// Live-swap the placement map (Phase 4g reconfiguration). Overrides the
+    /// trait default no-op so the PRODUCTION forwarder actually retargets.
+    fn set_map(&self, map: crate::shard_map::ShardMap) {
+        self.map.store(std::sync::Arc::new(map));
+    }
+
     async fn forward(&self, shard: ShardId, op: ClusterOp) -> Result<RefOpResponse> {
-        let target = self.map.pick_forward_target(shard, None).ok_or_else(|| {
+        let map = self.map.load();
+        let target = map.pick_forward_target(shard, None).ok_or_else(|| {
             ledge_core::LedgeError::Unavailable(format!("no host for shard {shard:?}"))
         })?;
         // Count the forward at the true forward site (one per outbound POST
@@ -277,6 +299,28 @@ mod tests {
 
     fn oid(b: u8) -> ObjectId {
         ObjectId::from_bytes([b; 32])
+    }
+
+    /// Phase 4g: after `set_map`, the HTTP forwarder picks its target from the
+    /// NEW map. Built over an EMPTY map (no member for shard 0 → no target),
+    /// `set_map` installs a map with a shard-0 member, and `target_addr` must
+    /// flip from `None` to that member's addr. RED until `HttpForwarder.map` is
+    /// an `ArcSwap` with a real `set_map` override.
+    #[test]
+    fn http_forwarder_set_map_updates_target() {
+        let f = HttpForwarder::new(ShardMap::default(), reqwest::Client::new());
+        assert_eq!(f.target_addr(ShardId(0)), None, "empty map has no target");
+        let m = ShardMap::from_entries([(
+            ShardId(0),
+            vec![Replica { node_id: 1, addr: "http://new-host:3000".into() }],
+        )])
+        .unwrap();
+        f.set_map(m);
+        assert_eq!(
+            f.target_addr(ShardId(0)).as_deref(),
+            Some("http://new-host:3000"),
+            "set_map must live-swap the forward target"
+        );
     }
 
     /// `set_map` is callable through an `Arc<dyn RefOpForwarder>` (Phase 4g live

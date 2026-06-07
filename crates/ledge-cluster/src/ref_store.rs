@@ -196,8 +196,10 @@ pub struct ClusterRefStore {
     mode: ConsistencyMode,
     /// The placement map (for "do I host this shard?" + forward-target choice).
     /// `Default` (empty) in single-node / Phase-3 in-process mode, where every
-    /// shard is present in `shards` so the forward branch is never taken.
-    map: ShardMap,
+    /// shard is present in `shards` so the forward branch is never taken. Behind
+    /// an `ArcSwap` so a runtime reconfigure (Phase 4g) can live-swap placement
+    /// without rebuilding the store (see [`Self::swap_placement`]).
+    map: arc_swap::ArcSwap<ShardMap>,
     /// Forwarder for non-locally-hosted shards. Defaults to a reject-all stub so
     /// a store built without placement (Phase-3 harness) behaves exactly as
     /// before for its locally-present shards.
@@ -220,7 +222,7 @@ impl ClusterRefStore {
             router,
             shards,
             mode: ConsistencyMode::Linearizable,
-            map: ShardMap::default(),
+            map: arc_swap::ArcSwap::from_pointee(ShardMap::default()),
             forwarder: Arc::new(RejectAllForwarder),
         }
     }
@@ -241,7 +243,7 @@ impl ClusterRefStore {
             router,
             shards,
             mode: ConsistencyMode::Linearizable,
-            map,
+            map: arc_swap::ArcSwap::from_pointee(map),
             forwarder,
         }
     }
@@ -250,7 +252,7 @@ impl ClusterRefStore {
     /// shards absent from the local handle map (builder-style).
     pub fn with_forwarder(mut self, forwarder: Arc<dyn RefOpForwarder>, map: ShardMap) -> Self {
         self.forwarder = forwarder;
-        self.map = map;
+        self.map = arc_swap::ArcSwap::from_pointee(map);
         self
     }
 
@@ -267,9 +269,20 @@ impl ClusterRefStore {
         self.shards.contains_key(&shard)
     }
 
-    /// The placement map this store was built with (introspection / status).
-    pub fn map(&self) -> &ShardMap {
-        &self.map
+    /// Current placement snapshot (Phase 4g: swappable at runtime). Returns an
+    /// `ArcSwap` load guard that derefs to `&ShardMap`, so existing
+    /// `.num_shards()` / `.members()` / `.shards_hosted_by()` calls work
+    /// unchanged.
+    pub fn map(&self) -> arc_swap::Guard<std::sync::Arc<ShardMap>> {
+        self.map.load()
+    }
+
+    /// Atomically swap the placement map AND propagate to the forwarder (live
+    /// reconfiguration). Routing (num_shards) is unchanged — only replica sets
+    /// move — so in-flight ops keep routing to the same shard.
+    pub fn swap_placement(&self, map: ShardMap) {
+        self.forwarder.set_map(map.clone());
+        self.map.store(std::sync::Arc::new(map));
     }
 
     /// This node's id. Needed by the `/cluster/ref-op` handler to ask the shard
@@ -991,5 +1004,28 @@ impl ClusterLeaseStore {
             out.extend(h.sm.applied_leases_expired(now_ms).await);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ShardRouter;
+
+    /// Phase 4g: `swap_placement` atomically installs a new placement map that
+    /// the getter immediately reflects (live reconfiguration). RED until the map
+    /// is an `ArcSwap` with a `swap_placement` method.
+    #[test]
+    fn swap_placement_updates_map() {
+        use crate::shard_map::{Replica, ShardMap};
+        let store = ClusterRefStore::new(1, ShardRouter::new(1), std::collections::BTreeMap::new());
+        assert_eq!(store.map().num_shards(), 0);
+        let m = ShardMap::from_entries(vec![(
+            ShardId(0),
+            vec![Replica { node_id: 1, addr: "http://a:3000".into() }],
+        )])
+        .unwrap();
+        store.swap_placement(m);
+        assert_eq!(store.map().num_shards(), 1);
     }
 }
