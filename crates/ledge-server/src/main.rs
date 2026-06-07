@@ -15,6 +15,9 @@ type StorageSeams = (
     Arc<dyn ledge_core::RefStore>,
     Option<Arc<ledge_server::routes::ClusterHandles>>,
     Option<Arc<ledge_cluster::ClusterRefStore>>,
+    // The concrete `ReplicatedObjectStore` (cluster only) — held so the Phase 4g
+    // reconfigure route can swap its replication peer set via `set_peers`.
+    Option<Arc<ledge_cluster::ReplicatedObjectStore>>,
     Option<ledge_cluster::ShardMap>,
     // The atomic-commit seam the workspace manager promotes through: single-node
     // = `LocalAtomicCommit` (one ArcSwap swap); clustered = `TxnCoordinator`
@@ -156,7 +159,15 @@ async fn main() -> anyhow::Result<()> {
     // clustered (cfg.cluster.enabled): the dyn seams are the ClusterRefStore /
     // ReplicatedObjectStore over per-shard Raft, plus the per-shard handles for
     // the /raft + /cluster routes and the metrics poller.
-    let (objects_dyn, refs_dyn, raft_shards, cluster_refs, shard_map, coordinator): StorageSeams =
+    let (
+        objects_dyn,
+        refs_dyn,
+        raft_shards,
+        cluster_refs,
+        cluster_objects,
+        shard_map,
+        coordinator,
+    ): StorageSeams =
         if cfg.cluster.enabled {
             // Build the authoritative shard map from config (identical on every
             // node). This SUPERSEDES the flat num_shards/peers fields; routing,
@@ -250,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                 stack.refs,
                 Some(stack.shards),
                 Some(stack.cluster_refs),
+                Some(stack.cluster_objects),
                 Some(stack.map),
                 coordinator,
             )
@@ -261,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
             (
                 objects.clone() as Arc<dyn ledge_core::ObjectStore>,
                 refs as Arc<dyn ledge_core::RefStore>,
+                None,
                 None,
                 None,
                 None,
@@ -437,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
         raft_shards,
         cluster_refs,
+        cluster_objects,
         shard_map,
         cluster_gc,
         // Auth (Phase 4d-1): the ctx assembled above — a real WAL-backed store

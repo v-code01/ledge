@@ -44,6 +44,7 @@ async fn start_server() -> (String, TempDir) {
         data_dir: data_dir.path().to_path_buf(),
         raft_shards: None,
         cluster_refs: None,
+        cluster_objects: None,
         shard_map: None,
         cluster_gc: None,
         auth: ledge_server::auth::AuthCtx::disabled(),

@@ -108,6 +108,10 @@ pub struct ClusterStack {
     pub cluster_refs: Arc<ClusterRefStore>,
     /// `Arc<ReplicatedObjectStore>` up-cast — `AppState.objects`.
     pub objects: Arc<dyn ObjectStore>,
+    /// The SAME `ReplicatedObjectStore` as a concrete `Arc` —
+    /// `AppState.cluster_objects`. Lets the Phase 4g reconfigure route swap the
+    /// replication peer set via `set_peers`. One store, two views.
+    pub cluster_objects: Arc<ledge_cluster::ReplicatedObjectStore>,
     /// Node-local concrete disk store — `AppState.objects_disk` (git/RPC/GC).
     pub objects_disk: Arc<DiskObjectStore>,
     /// Per-shard Raft handles for this node — `AppState.raft_shards`.
@@ -263,7 +267,8 @@ pub async fn build_cluster_stack(
     Ok(ClusterStack {
         refs: cluster_refs.clone() as Arc<dyn RefStore>,
         cluster_refs,
-        objects: replicated as Arc<dyn ObjectStore>,
+        objects: replicated.clone() as Arc<dyn ObjectStore>,
+        cluster_objects: replicated,
         objects_disk,
         shards: Arc::new(raft_handles),
         map,

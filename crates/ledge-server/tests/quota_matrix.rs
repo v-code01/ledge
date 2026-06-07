@@ -62,6 +62,7 @@ async fn app_with_quota(dir: &TempDir, quota: QuotaCtx) -> (axum::Router, String
         data_dir: p,
         raft_shards: None,
         cluster_refs: None,
+        cluster_objects: None,
         shard_map: None,
         cluster_gc: None,
         auth,

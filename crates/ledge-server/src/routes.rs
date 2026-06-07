@@ -58,6 +58,9 @@ pub struct AppState {
     /// consistent with the other cluster routes. It is the SAME `Arc` underlying
     /// `refs` in cluster mode (one store, two views).
     pub cluster_refs: Option<Arc<ledge_cluster::ClusterRefStore>>,
+    /// The concrete `ReplicatedObjectStore` in cluster mode — held so the Phase 4g
+    /// reconfigure route can swap its replication peer set. `None` single-node.
+    pub cluster_objects: Option<std::sync::Arc<ledge_cluster::ReplicatedObjectStore>>,
     /// The node-local distributed-GC driver, when `cluster.enabled`. `POST
     /// /admin/gc` runs THIS via `ClusterGc::run` in cluster mode; `POST
     /// /cluster/gc` fans out and aggregates. `None` single-node ⇒ `/admin/gc`
@@ -427,6 +430,7 @@ mod tenant_git_tests {
             data_dir: p,
             raft_shards: None,
             cluster_refs: None,
+            cluster_objects: None,
             shard_map: None,
             cluster_gc: None,
             auth,

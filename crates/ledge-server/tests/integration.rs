@@ -16,7 +16,7 @@ async fn start_server() -> (String, TempDir) {
         data_dir.path().to_path_buf(), objects.clone(), refs.clone(), hlc,
         ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()),
     ).unwrap();
-    let app     = build_app(AppState { objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>, objects_disk: objects.clone(), refs: refs.clone() as Arc<dyn ledge_core::RefStore>, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf(), raft_shards: None, cluster_refs: None, shard_map: None, cluster_gc: None, auth: ledge_server::auth::AuthCtx::disabled(), quota: ledge_server::quota::QuotaCtx::disabled() });
+    let app     = build_app(AppState { objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>, objects_disk: objects.clone(), refs: refs.clone() as Arc<dyn ledge_core::RefStore>, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf(), raft_shards: None, cluster_refs: None, cluster_objects: None, shard_map: None, cluster_gc: None, auth: ledge_server::auth::AuthCtx::disabled(), quota: ledge_server::quota::QuotaCtx::disabled() });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
@@ -178,6 +178,7 @@ async fn appstate_holds_trait_objects() {
         data_dir: p,
         raft_shards: None,
         cluster_refs: None,
+        cluster_objects: None,
         shard_map: None,
         cluster_gc: None,
         auth: ledge_server::auth::AuthCtx::disabled(),
