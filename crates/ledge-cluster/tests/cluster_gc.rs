@@ -99,7 +99,7 @@ async fn build_graph(store: &DiskObjectStore) -> (ObjectId, ObjectId, ObjectId) 
 }
 
 fn lease(id: WorkspaceId, expires_at_ms: u64) -> Lease {
-    Lease { id, source_refs: Vec::new(), created_at_ms: 0, expires_at_ms, hlc: 0, generation: 0 }
+    Lease { id, source_refs: Vec::new(), created_at_ms: 0, expires_at_ms, hlc: 0, generation: 0, tenant_id: "root".to_string() }
 }
 
 // 1 ── Cross-shard liveness: an object reachable from EITHER co-hosted shard's

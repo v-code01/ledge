@@ -427,6 +427,7 @@ mod tests {
                     expires_at_ms: 1000,
                     hlc: 55,
                     generation: 1,
+                    tenant_id: "root".to_string(),
                 },
             },
         ];

@@ -24,3 +24,4 @@ async-trait.workspace = true
 tempfile.workspace = true
 tokio              = { workspace = true, features = ["full", "test-util"] }
 proptest.workspace = true
+serde_json.workspace = true

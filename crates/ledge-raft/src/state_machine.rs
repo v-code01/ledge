@@ -1815,6 +1815,7 @@ mod tests {
             expires_at_ms: 10_000,
             hlc: 5,
             generation: 1,
+            tenant_id: "root".to_string(),
         };
         let put = entry(1, 1, LedgeOp::LeasePut { lease });
         let r = sm.apply([put]).await.unwrap();
@@ -1844,6 +1845,7 @@ mod tests {
             expires_at_ms: 10_000,
             hlc: 5,
             generation: 1,
+            tenant_id: "root".to_string(),
         };
         // Fixed sequence: identical for both replicas, identical hlcs.
         let seq = vec![

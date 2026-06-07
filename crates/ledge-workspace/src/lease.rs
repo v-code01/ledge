@@ -35,6 +35,12 @@ pub struct Lease {
     pub expires_at_ms: u64,
     pub hlc: u64,
     pub generation: u64,
+    /// Owning tenant (Phase 4d-2). `#[serde(default)]` keeps the bincode WAL
+    /// frame-compatible: a pre-4d-2 frame decodes with `tenant_id == ""`, which
+    /// the manager normalizes to `root`/global. New leases always store a
+    /// normalized tenant ("root", "acme", …), never "".
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 /// One WAL record: a lease upsert, a tombstone, or a compaction checkpoint.
@@ -216,6 +222,31 @@ impl LeaseStore {
             .collect())
     }
 
+    /// Live leases (`expires_at_ms > now_ms`) owned by `tenant`, unsorted.
+    ///
+    /// Tenant comparison normalizes the empty string to `root` (a legacy lease
+    /// decoded without `tenant_id` is global/root — see [`Lease`]). Used by
+    /// `WorkspaceManager::list` so a tenant lists ONLY its own workspaces
+    /// (Phase 4d-2 spec §3.2 / §6). The unscoped [`live`](Self::live) is retained
+    /// for GC, which roots every live workspace regardless of tenant.
+    pub async fn live_for_tenant(&self, now_ms: u64, tenant: &str) -> Result<Vec<Lease>> {
+        let want = if tenant.is_empty() { "root" } else { tenant };
+        let idx = self.index.read().unwrap();
+        Ok(idx
+            .values()
+            .filter(|l| l.expires_at_ms > now_ms)
+            .filter(|l| {
+                let have = if l.tenant_id.is_empty() {
+                    "root"
+                } else {
+                    l.tenant_id.as_str()
+                };
+                have == want
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Expired leases (`expires_at_ms <= now_ms`) still present in the index
     /// (i.e. not yet tombstoned), unsorted.
     pub async fn expired(&self, now_ms: u64) -> Result<Vec<Lease>> {
@@ -332,6 +363,7 @@ mod tests {
             expires_at_ms: expires,
             hlc: 1,
             generation: 0,
+            tenant_id: "root".to_string(),
         }
     }
 
@@ -584,5 +616,102 @@ mod tests {
             .map(|l| l.id)
             .collect();
         assert_eq!(reopened, live_ids, "all live leases must survive compaction");
+    }
+
+    /// A lease serialized WITHOUT a `tenant_id` field must decode with
+    /// `tenant_id == ""` via `#[serde(default)]`, proving the field is optional
+    /// on the wire and a legacy/global lease is treated as `root`.
+    ///
+    /// We assert this with a `serde_json` round-trip of a `tenant_id`-less object,
+    /// which unambiguously honors `#[serde(default)]` for the missing trailing
+    /// field. (bincode's positional `standard()` config requires every field to
+    /// be physically present, so the bincode WAL itself never omits the trailing
+    /// field — but the WAL is greenfield, so no legacy frames exist on disk. The
+    /// `#[serde(default)]` attribute is the load-bearing back-compat guarantee.)
+    #[tokio::test]
+    async fn legacy_lease_without_tenant_decodes_as_root_default() {
+        let h = hlc();
+        let id = WorkspaceId::generate(&h);
+        // A legacy JSON object: every field EXCEPT tenant_id.
+        let json = serde_json::json!({
+            "id": id,
+            "source_refs": ["refs/heads/main"],
+            "created_at_ms": 1,
+            "expires_at_ms": 2,
+            "hlc": 3,
+            "generation": 4,
+        })
+        .to_string();
+        let decoded: Lease = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.tenant_id, "",
+            "missing tenant_id defaults to empty (root)"
+        );
+        assert_eq!(decoded.generation, 4, "every other field round-trips");
+        assert_eq!(decoded.id, id);
+    }
+
+    /// `live_for_tenant` partitions live leases by owner; the empty string and
+    /// "root" are the SAME tenant (back-compat).
+    #[tokio::test]
+    async fn live_for_tenant_filters_by_owner() {
+        let dir = tempdir().unwrap();
+        let h = hlc();
+        let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+        let now = 1_000_000u64;
+
+        let mk = |id, tenant: &str| Lease {
+            id,
+            source_refs: vec![],
+            created_at_ms: 0,
+            expires_at_ms: now + 60_000,
+            hlc: 1,
+            generation: 1,
+            tenant_id: tenant.to_string(),
+        };
+        let acme = WorkspaceId::generate(&h);
+        let globex = WorkspaceId::generate(&h);
+        let legacy = WorkspaceId::generate(&h); // tenant_id == "" ⇒ root
+        store.put(mk(acme, "acme")).await.unwrap();
+        store.put(mk(globex, "globex")).await.unwrap();
+        store.put(mk(legacy, "")).await.unwrap();
+
+        let acme_ids: std::collections::HashSet<_> = store
+            .live_for_tenant(now, "acme")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(acme_ids, std::collections::HashSet::from([acme]));
+
+        // "" and "root" name the same tenant ⇒ the legacy lease is rooted.
+        let root_ids: std::collections::HashSet<_> = store
+            .live_for_tenant(now, "root")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(root_ids, std::collections::HashSet::from([legacy]));
+        // The unscoped live() still returns ALL three (GC roots every tenant).
+        assert_eq!(store.live(now).await.unwrap().len(), 3);
+    }
+
+    /// A lease with a real tenant survives a WAL reopen with its tenant intact.
+    #[tokio::test]
+    async fn tenant_id_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let h = hlc();
+        let id = WorkspaceId::generate(&h);
+        {
+            let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+            let mut l = lease(id, now_ms() + 60_000);
+            l.tenant_id = "acme".to_string();
+            store.put(l).await.unwrap();
+        }
+        let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+        let got = store.get(id).await.unwrap().expect("present");
+        assert_eq!(got.tenant_id, "acme", "tenant_id survives WAL replay");
     }
 }

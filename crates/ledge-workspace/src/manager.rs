@@ -155,6 +155,7 @@ impl WorkspaceManager {
             expires_at_ms: expires,
             hlc: self.hlc.tick(),
             generation: 1,
+            tenant_id: "root".to_string(),
         };
         self.leases.put(lease.clone()).await?;
 

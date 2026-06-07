@@ -235,6 +235,7 @@ async fn cluster_lease_put_get_tombstone() {
         expires_at_ms: 10_000,
         hlc: 5,
         generation: 1,
+        tenant_id: "root".to_string(),
     };
 
     leases.put(lease.clone()).await.unwrap();
@@ -271,6 +272,7 @@ async fn cluster_lease_live_and_expired() {
             expires_at_ms: 1_000,
             hlc: 1,
             generation: 1,
+            tenant_id: "root".to_string(),
         })
         .await
         .unwrap();
@@ -282,6 +284,7 @@ async fn cluster_lease_live_and_expired() {
             expires_at_ms: 100,
             hlc: 1,
             generation: 1,
+            tenant_id: "root".to_string(),
         })
         .await
         .unwrap();
