@@ -31,6 +31,29 @@ pub fn tenant_prefix(tenant_id: &str) -> String {
     }
 }
 
+/// The owning tenant of a DURABLE ref name — the inverse of [`tenant_prefix`]
+/// (Phase 4d-3 spec §3.6).
+///
+/// - `refs/tenants/<t>/…` → `<t>` (a real tenant's durable namespace).
+/// - `refs/heads/*`, `refs/tags/*`, and anything else (malformed, or the
+///   workspace namespace that callers must not pass here) → `"root"` (the global
+///   namespace, matching `tenant_prefix("root") == ""`).
+///
+/// Borrows from the input (zero allocation). Used by the GC to group durable
+/// roots per tenant for usage measurement (`ledge_workspace::Gc::run`,
+/// `ledge_cluster::gc::ClusterGc::run`).
+pub fn tenant_of_ref(name: &str) -> &str {
+    // refs/tenants/<t>/… : the tenant is the segment after `refs/tenants/`.
+    if let Some(rest) = name.strip_prefix("refs/tenants/") {
+        if let Some((tenant, _suffix)) = rest.split_once('/') {
+            if !tenant.is_empty() {
+                return tenant;
+            }
+        }
+    }
+    "root"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +83,37 @@ mod tests {
         // Root collapses to the legacy form.
         let r = tenant_prefix("root");
         assert_eq!(format!("refs/{r}heads/main"), "refs/heads/main");
+    }
+
+    #[test]
+    fn tenant_of_ref_extracts_named_tenant() {
+        assert_eq!(tenant_of_ref("refs/tenants/acme/heads/main"), "acme");
+        assert_eq!(tenant_of_ref("refs/tenants/globex/tags/v1"), "globex");
+    }
+
+    #[test]
+    fn tenant_of_ref_root_for_global_and_malformed() {
+        assert_eq!(tenant_of_ref("refs/heads/main"), "root");
+        assert_eq!(tenant_of_ref("refs/tags/v1"), "root");
+        // The workspace namespace is ephemeral, never a durable tenant ⇒ root.
+        assert_eq!(tenant_of_ref("refs/workspaces/abcd/heads/main"), "root");
+        assert_eq!(tenant_of_ref("refs/tenants/"), "root"); // no tenant segment
+        assert_eq!(tenant_of_ref("refs/tenants/acme"), "root"); // no trailing slash ⇒ no suffix
+        assert_eq!(tenant_of_ref("garbage"), "root");
+    }
+
+    #[test]
+    fn tenant_of_ref_inverts_tenant_prefix() {
+        // For any named tenant, of_ref(refs/<prefix>heads/main) == tenant.
+        for t in ["acme", "globex"] {
+            let p = tenant_prefix(t);
+            let name = format!("refs/{p}heads/main");
+            assert_eq!(tenant_of_ref(&name), t);
+        }
+        // Root collapses both directions.
+        assert_eq!(
+            tenant_of_ref(&format!("refs/{}heads/main", tenant_prefix("root"))),
+            "root"
+        );
     }
 }

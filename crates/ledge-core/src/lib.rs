@@ -12,6 +12,6 @@ pub use hlc::HLC;
 pub use object_id::ObjectId;
 pub use ref_entry::RefEntry;
 pub use ref_name::RefName;
-pub use tenant::tenant_prefix;
+pub use tenant::{tenant_of_ref, tenant_prefix};
 pub use traits::{ObjectStore, RefSnapshot, RefStore};
 pub use txn_id::TxnId;

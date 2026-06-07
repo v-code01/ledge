@@ -38,6 +38,16 @@ pub enum LedgeError {
     /// which signals a fatal integrity failure that retrying cannot fix.
     #[error("service unavailable: {0}")]
     Unavailable(String),
+
+    /// A per-tenant quota was exceeded (Phase 4d-3). The message NAMES the
+    /// resource with a stable prefix so the HTTP layer can classify it:
+    /// `"requests: …"` → 429 Too Many Requests (rate limit); every other prefix
+    /// (`"workspaces: …"`, `"durable_bytes: …"`, `"object_count: …"`) → 507
+    /// Insufficient Storage. The body carries the reason; it NEVER names another
+    /// tenant. Distinct from [`Self::Unavailable`] (retryable infra fault): a
+    /// quota denial is a deliberate, client-actionable backpressure signal.
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
 }
 
 /// Shorthand `Result` type alias used throughout the Ledge crates.
@@ -94,6 +104,14 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.starts_with("service unavailable:"), "got: {msg}");
         assert!(msg.contains("no leader elected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_quota_exceeded_display() {
+        let err = LedgeError::QuotaExceeded("workspaces: 2 limit reached".to_string());
+        let msg = err.to_string();
+        assert!(msg.starts_with("quota exceeded:"), "got: {msg}");
+        assert!(msg.contains("workspaces: 2 limit reached"), "got: {msg}");
     }
 
     #[test]

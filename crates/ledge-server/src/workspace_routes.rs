@@ -147,6 +147,16 @@ fn tenant_owns(lease: &ledge_workspace::Lease, tenant: &str) -> bool {
 /// retryable → 503; tombstoned|expired → 410; unknown → 404; everything else
 /// (genuine corruption / I/O) is a non-retryable server fault → 500.
 fn map_lookup_err(e: ledge_core::LedgeError) -> Response {
+    // Quota denials (Phase 4d-3): a `requests:`-prefixed message is a rate-limit
+    // 429; every other quota message (workspaces/durable_bytes/object_count) is a
+    // storage-exhaustion 507. Checked FIRST so a quota message can never be
+    // mis-mapped by the generic substring checks below.
+    if let ledge_core::LedgeError::QuotaExceeded(ref m) = e {
+        if m.starts_with("requests:") {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        return StatusCode::INSUFFICIENT_STORAGE.into_response();
+    }
     // A retryable cluster-availability fault must surface as 503, NOT 500, so
     // clients know to back off and retry rather than treat it as terminal.
     if matches!(e, ledge_core::LedgeError::Unavailable(_)) {
@@ -540,6 +550,29 @@ mod tests {
             map_lookup_err(LedgeError::Corruption("bad crc".into())).status(),
             StatusCode::INTERNAL_SERVER_ERROR,
         );
+    }
+
+    #[test]
+    fn quota_exceeded_status_classification() {
+        use ledge_core::LedgeError;
+        // requests: → 429 Too Many Requests (rate limit).
+        assert_eq!(
+            map_lookup_err(LedgeError::QuotaExceeded("requests: rate limit exceeded".into()))
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+        // every other quota resource → 507 Insufficient Storage.
+        for m in [
+            "workspaces: 2 limit reached",
+            "durable_bytes: limit reached",
+            "object_count: limit reached",
+        ] {
+            assert_eq!(
+                map_lookup_err(LedgeError::QuotaExceeded(m.into())).status(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "message {m:?} must map to 507",
+            );
+        }
     }
 }
 
