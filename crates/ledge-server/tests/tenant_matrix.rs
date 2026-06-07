@@ -270,6 +270,124 @@ async fn two_tenant_quota(dir: &TempDir, max_workspaces: u64) -> (axum::Router, 
     (build_app(state), acme)
 }
 
+/// Like [`two_tenant_quota`] but takes full [`QuotaLimits`] and also returns the
+/// SHARED usage `Arc` so an end-to-end test can simulate a GC measurement and then
+/// drive the manager's SOFT `commit` storage gate through the REST handler.
+async fn two_tenant_quota_limits(
+    dir: &TempDir,
+    limits: ledge_workspace::QuotaLimits,
+) -> (axum::Router, String, Arc<ledge_workspace::UsageMap>) {
+    let p = dir.path().to_path_buf();
+    let hlc = Arc::new(HLC::new());
+    let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+    let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+    let usage = std::sync::Arc::new(ledge_workspace::UsageMap::default());
+    let quota = ledge_server::quota::QuotaCtx {
+        limits,
+        usage: usage.clone(),
+        rate: std::sync::Arc::new(ledge_server::quota::rate::TenantRateLimiter::unlimited()),
+    };
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc.clone(),
+        limits,
+        usage.clone(),
+    )
+    .unwrap();
+    let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
+    let acme = store
+        .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
+        .await
+        .unwrap();
+    let auth = AuthCtx {
+        enabled: true,
+        store,
+        cluster_secret: None,
+    };
+    let state = AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: p,
+        raft_shards: None,
+        cluster_refs: None,
+        shard_map: None,
+        cluster_gc: None,
+        auth,
+        quota,
+    };
+    (build_app(state), acme, usage)
+}
+
+/// Phase 4d-3 Task 6 (end-to-end) — with quotas enabled and a tiny
+/// `max_durable_bytes`, a tenant whose LAST GC measurement is at/over the limit has
+/// its `POST /workspaces/<id>/commit` rejected by the manager's SOFT storage gate
+/// and surfaces as **507 Insufficient Storage** through the REST handler
+/// (`QuotaExceeded("durable_bytes: …")` → `map_lookup_err`). The gate fires before
+/// the mapping/promotion logic, so even an empty-mapping commit trips it.
+#[tokio::test]
+async fn over_quota_commit_is_507_through_rest() {
+    let dir = TempDir::new().unwrap();
+    let limits = ledge_workspace::QuotaLimits {
+        enabled: true,
+        max_durable_bytes: Some(500),
+        ..Default::default()
+    };
+    let (app, acme, usage) = two_tenant_quota_limits(&dir, limits).await;
+
+    // Fork a workspace for acme so the commit ownership check passes.
+    let fork = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/workspaces")
+                .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {acme}"))
+                .body(Body::from(r#"{"source":[],"ttl_seconds":3600}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(fork.status().is_success(), "fork must succeed: {}", fork.status());
+    let body = to_bytes(fork.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Simulate a GC pass measuring acme AT/OVER the byte limit (1000 >= 500).
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "acme".to_string(),
+        ledge_workspace::TenantUsage { bytes: 1000, objects: 1 },
+    );
+    usage.store(Arc::new(m));
+
+    // The commit gate fires before any mapping work ⇒ 507 even with empty mappings.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/workspaces/{id}/commit"))
+                .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {acme}"))
+                .body(Body::from(r#"{"mappings":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INSUFFICIENT_STORAGE,
+        "over-quota commit must surface as 507"
+    );
+}
+
 /// Phase 4d-3 (end-to-end) — with quotas enabled and `max_workspaces=1`, acme's
 /// SECOND `POST /workspaces` is rejected by the manager's `fork` count gate and
 /// surfaces as **507 Insufficient Storage** through the REST handler (the
