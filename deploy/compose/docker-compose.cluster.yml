@@ -20,6 +20,10 @@ x-ledge-common: &ledge-common
   environment: &ledge-env
     LEDGE__AUTH__ENABLED: "true"
     LEDGE__AUTH__CLUSTER_SECRET: "dev-cluster-secret-change-me"
+    # First-boot root admin key (each node mints it locally from this token, so it
+    # authenticates CLIENT requests on every node). Must be a valid token of the
+    # form ledge_<16-hex>_<base64url-no-pad-32-bytes>. Dev only — see deploy/README.md.
+    LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_9b7ee379e0250464_6ixCz0hl7icRM_WuUtzu-uHAVsDqF9teIkUTyR69VZQ"
   restart: unless-stopped
   healthcheck:
     test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]

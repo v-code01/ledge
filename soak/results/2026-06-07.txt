@@ -1,0 +1,51 @@
+
+=== bring up 3-node cluster ===
+  PASS 3 nodes healthy
+  PASS leader elected
+
+=== 1. replicated consensus baseline ===
+     ledge-1: leader=1 commit_index=1 last_applied=1
+     ledge-2: leader=1 commit_index=1 last_applied=1
+     ledge-3: leader=1 commit_index=1 last_applied=1
+  PASS membership entry committed+applied on all 3 nodes
+     baseline leader=1 commit_index=1
+
+=== 2. leader-failover durability ===
+     killing leader ledge-1
+  PASS new leader elected (was 1, now 2)
+     survivor ledge-2: commit_index=2 last_applied=2
+  PASS committed log durable across failover (last_applied>=1, no regression)
+     restart ledge-1
+  PASS killed leader rejoined healthy
+
+=== 3. follower crash + restart recovery ===
+     leader ledge-2 last_applied=2; killing follower ledge-1
+  PASS quorum holds with follower down (leader present)
+     restart follower ledge-1
+  PASS restarted follower caught up from disk (last_applied>=2)
+
+=== 4. minority partition safety + reconvergence ===
+     isolating minority node ledge-1 (leader is ledge-2)
+  PASS majority retains a leader during partition
+  PASS isolated minority has NO leader (no split-brain)
+     heal partition (reconnect ledge-1)
+  PASS healed node reconverged (last_applied>=2)
+
+=== 5. majority loss = no committed progress (safety over liveness) ===
+     isolating ledge-1 ledge-3 — leaving only ledge-2 (commit_index before=3)
+     lone ledge-2 commit_index after isolation=3 (was 3)
+  PASS lone sub-quorum node made NO committed progress (commit_index unchanged) — safety over liveness
+     reconnect ledge-1 ledge-3
+  PASS cluster recovered after majority restored (no corruption)
+
+=== 6. soak (45s sustained polling, leak watch) ===
+     warm-up: cluster serving writes again
+     soak: 1266 health probes, 0 errors; ledge-1 mem 4.367MiB -> 112.1MiB
+  PASS soak: zero health-probe errors over 45s
+  PASS cluster healthy after soak + GC
+
+=== summary ===
+  PASS=15  FAIL=0
+
+=== teardown ===
+HARNESS_EXIT=0
