@@ -9,6 +9,7 @@ pub mod gc;
 pub mod net_http;
 pub mod net_mem;
 pub mod object_store;
+pub mod reconfig;
 pub mod ref_store;
 pub mod router;
 pub mod shard_map;
@@ -22,6 +23,7 @@ pub use forward::{
 };
 pub use gc::ClusterGc;
 pub use object_store::{LocalObjectPeer, ObjectPeer, ReplicatedObjectStore};
+pub use reconfig::{diff_members, reconfigure_shard, MemberDiff, ReconfigOutcome};
 pub use ref_store::{ClusterLeaseStore, ClusterRefStore, ConsistencyMode, ShardHandle};
 pub use router::{ShardId, ShardRouter, ShardSpan};
 pub use shard_map::{Replica, ShardMap, ShardMapError};
