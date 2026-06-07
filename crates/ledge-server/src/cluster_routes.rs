@@ -26,8 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use ledge_cluster::net_http::{handle_rpc, RpcKind};
-use ledge_cluster::{ClusterOp, ShardId};
+use ledge_cluster::net_http::{handle_rpc, HttpObjectPeer, RpcKind};
+use ledge_cluster::{ClusterOp, ObjectPeer, Replica, ShardId, ShardMap};
 use ledge_raft::{Node, NodeId};
 use ledge_workspace::GcStats;
 
@@ -138,6 +138,154 @@ pub async fn cluster_init(State(state): State<AppState>, Json(req): Json<InitReq
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         }
+    }
+}
+
+/// `POST /cluster/{shard}/reconfigure` body: the target voter set for `shard`.
+#[derive(Debug, Deserialize)]
+pub struct ReconfigureRequest {
+    /// Target voter set: `node_id` (string, JSON object keys are strings) → base
+    /// URL. This REPLACES the shard's current voter set (no key reshuffle — the
+    /// cluster's `num_shards` is unchanged, only this shard's membership moves).
+    pub members: BTreeMap<String, String>,
+}
+
+/// `POST /cluster/{shard}/reconfigure` — change a shard's replica set live.
+///
+/// **MUST be sent to the shard LEADER.** An openraft membership change
+/// (`change_membership`) only succeeds on the leader; on a follower openraft
+/// returns a `ForwardToLeader` error which [`ledge_cluster::reconfigure_shard`]
+/// surfaces as `LedgeError::Unavailable`, which this handler maps to `503`. The
+/// operator / live harness is responsible for POSTing to the current leader (read
+/// it from `GET /cluster/status`'s `leader`).
+///
+/// On success it (1) drives openraft (`add_learner` → `ReplaceAllVoters`), then
+/// atomically (2) swaps the live placement map for this shard so client ref
+/// routing + the forwarder follow the new topology, and (3) rebuilds THIS node's
+/// object-replication peer set from the new voters so object writes fan out to the
+/// new members. `num_shards` is unchanged (no key reshuffle). Idempotent: a
+/// reconfigure to the already-current voter set is a no-op diff.
+///
+/// Responses:
+/// - `503` if not clustered (single-node), or if this node is not the leader /
+///   the change is transiently unavailable.
+/// - `404` if the shard is not hosted on this node.
+/// - `400` on a bad node id or an empty target set.
+/// - `200` `{shard, added, removed, voters}` on success.
+pub async fn cluster_reconfigure(
+    State(state): State<AppState>,
+    Path(shard): Path<u32>,
+    Json(req): Json<ReconfigureRequest>,
+) -> Response {
+    let shards = match shards(&state) {
+        Some(s) => s,
+        None => return not_clustered(),
+    };
+    let shard_id = ShardId(shard);
+    let raft = match shards.get(&shard_id) {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND, "shard not hosted on this node").into_response(),
+    };
+
+    // Parse the wire `node_id` (string) → addr into a typed target voter set.
+    let mut target: BTreeMap<NodeId, String> = BTreeMap::new();
+    for (id_str, addr) in req.members {
+        match id_str.parse::<NodeId>() {
+            Ok(id) => {
+                target.insert(id, addr);
+            }
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, format!("bad node id: {id_str}")).into_response()
+            }
+        }
+    }
+    if target.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty target member set").into_response();
+    }
+
+    // 1) Drive the openraft membership change (leader-only). A non-leader /
+    //    transiently-unavailable shard surfaces as `Unavailable` → 503 retryable.
+    let outcome = match ledge_cluster::reconfigure_shard(raft, target.clone()).await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, shard, "reconfigure failed");
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    };
+
+    // 2) Swap the live placement map for this shard so ref routing + the forwarder
+    //    follow the new topology. Rebuild from the current entries, replacing only
+    //    this shard's replica set; all other shards are carried unchanged.
+    if let Some(refs) = &state.cluster_refs {
+        let mut entries: Vec<(ShardId, Vec<Replica>)> = refs
+            .map()
+            .entries()
+            .into_iter()
+            .filter(|(s, _)| *s != shard_id)
+            .collect();
+        entries.push((
+            shard_id,
+            target
+                .iter()
+                .map(|(id, addr)| Replica {
+                    node_id: *id,
+                    addr: addr.clone(),
+                })
+                .collect(),
+        ));
+        match ShardMap::from_entries(entries) {
+            Ok(new_map) => refs.swap_placement(new_map),
+            Err(e) => warn!(error = %e, shard, "rebuilt placement map invalid; map not swapped"),
+        }
+    }
+
+    // 3) Rebuild THIS node's object-replication peer set from the new voters (skip
+    //    self; carry the cluster_secret bearer so peers' `/objects/*` INTERNAL auth
+    //    passes). New voters also obtain existing objects via on-demand
+    //    anti-entropy pull, so object availability does not depend on this push set.
+    if let Some(objs) = &state.cluster_objects {
+        let self_node = state.cluster_refs.as_ref().map(|r| r.node_id()).unwrap_or(0);
+        let client = build_internal_client(state.auth.cluster_secret.as_deref());
+        let peers: Vec<std::sync::Arc<dyn ObjectPeer>> = target
+            .iter()
+            .filter(|(id, _)| **id != self_node)
+            .map(|(_, addr)| {
+                std::sync::Arc::new(HttpObjectPeer::with_client(
+                    addr.clone(),
+                    shard_id,
+                    client.clone(),
+                )) as std::sync::Arc<dyn ObjectPeer>
+            })
+            .collect();
+        objs.set_peers(peers);
+    }
+
+    Json(serde_json::json!({
+        "shard": shard,
+        "added": outcome.added,
+        "removed": outcome.removed,
+        "voters": outcome.final_voters,
+    }))
+    .into_response()
+}
+
+/// A reqwest client carrying the `cluster_secret` bearer for INTERNAL peer calls
+/// (object replication). NOTE (v1 limitation): does NOT carry the per-node TLS
+/// client config — reconfigure-rebuilt object peers work for non-TLS clusters; a
+/// TLS cluster re-derives full TLS peers on restart (threading the boot client is
+/// a documented follow-on). New voters also obtain existing objects via on-demand
+/// anti-entropy pull, so object availability does not depend on this push set.
+fn build_internal_client(secret: Option<&str>) -> reqwest::Client {
+    match secret {
+        Some(s) => reqwest::header::HeaderValue::from_str(&format!("Bearer {s}"))
+            .ok()
+            .and_then(|val| {
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(reqwest::header::AUTHORIZATION, val);
+                reqwest::Client::builder().default_headers(h).build().ok()
+            })
+            .unwrap_or_default(),
+        None => reqwest::Client::new(),
     }
 }
 
@@ -255,6 +403,13 @@ pub struct ShardStatus {
     /// node's state machine (openraft has no separate public `commit_index` on
     /// `RaftMetrics`; applied is the committed-and-applied marker we expose).
     pub commit_index: Option<u64>,
+    /// The LIVE openraft voter set for this shard (sorted ascending), read from
+    /// `membership_config.membership().voter_ids()`. Distinct from `members`
+    /// (the *declared* placement): after a `/cluster/{shard}/reconfigure` these
+    /// reflect the actual committed membership change. Empty for shards this node
+    /// does not host (we have no Raft handle to read live membership from).
+    #[serde(default)]
+    pub voters: Vec<u64>,
 }
 
 /// `GET /cluster/status` response shape.
@@ -274,6 +429,10 @@ fn hosted_status(
     // `metrics()` returns a `watch::Receiver`; `borrow()` is a cheap, lock-free
     // read of the latest published metrics snapshot.
     let m = raft.metrics().borrow().clone();
+    // Live committed voter set (distinct from the declared placement `members`):
+    // reflects the actual openraft membership after any reconfigure.
+    let mut voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+    voters.sort_unstable();
     ShardStatus {
         shard,
         members,
@@ -282,6 +441,7 @@ fn hosted_status(
         term: m.current_term,
         last_applied: m.last_applied.map(|l| l.index),
         commit_index: m.last_applied.map(|l| l.index),
+        voters,
     }
 }
 
@@ -319,6 +479,8 @@ pub async fn cluster_status(State(state): State<AppState>) -> Response {
                         term: 0,
                         last_applied: None,
                         commit_index: None,
+                        // No Raft handle for an unhosted shard ⇒ no live voters.
+                        voters: Vec::new(),
                     }),
                 }
             }
@@ -486,6 +648,7 @@ mod tests {
                 term: 2,
                 last_applied: Some(5),
                 commit_index: Some(5),
+                voters: vec![1],
             }],
         };
         let j = serde_json::to_string(&s).unwrap();
@@ -505,6 +668,7 @@ mod tests {
                     term: 4,
                     last_applied: Some(9),
                     commit_index: Some(9),
+                    voters: vec![1, 2, 3],
                 },
                 // A shard this node does NOT host: declared members, no leader.
                 ShardStatus {
@@ -515,6 +679,7 @@ mod tests {
                     term: 0,
                     last_applied: None,
                     commit_index: None,
+                    voters: Vec::new(),
                 },
             ],
         };

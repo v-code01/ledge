@@ -100,6 +100,7 @@ async fn cluster_routes_503_when_disabled() {
     );
 
     let vote = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -113,6 +114,26 @@ async fn cluster_routes_503_when_disabled() {
         vote.status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "single-node /raft/*/vote must be 503 (not clustered)"
+    );
+
+    // Live shard-membership reconfiguration is also inert single-node: a
+    // `POST /cluster/{shard}/reconfigure` against a `raft_shards = None` state
+    // short-circuits to 503 before any openraft membership change is attempted.
+    let reconfigure = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/0/reconfigure")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"members":{"1":"http://a:3000"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reconfigure.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "single-node /cluster/*/reconfigure must be 503 (not clustered)"
     );
 }
 

@@ -342,6 +342,10 @@ pub fn build_app(state: AppState) -> Router {
             axum::routing::post(cluster_routes::cluster_init),
         )
         .route(
+            "/cluster/{shard}/reconfigure",
+            axum::routing::post(cluster_routes::cluster_reconfigure),
+        )
+        .route(
             "/cluster/status",
             axum::routing::get(cluster_routes::cluster_status),
         )

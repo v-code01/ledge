@@ -114,6 +114,16 @@ impl ShardMap {
             .collect()
     }
 
+    /// All `(shard, replica-set)` entries in ascending shard order. Round-trips
+    /// [`Self::from_entries`] — used to rebuild a map on live reconfiguration
+    /// (swap one shard's replica set, keep the rest).
+    pub fn entries(&self) -> Vec<(ShardId, Vec<Replica>)> {
+        self.shards
+            .iter()
+            .map(|(s, reps)| (*s, reps.clone()))
+            .collect()
+    }
+
     /// The address of `node_id` within `shard`, or `None` if it is not a member.
     pub fn replica_addr(&self, shard: ShardId, node_id: u64) -> Option<&str> {
         self.members(shard)
@@ -205,6 +215,21 @@ mod tests {
         assert_eq!(m.shards_hosted_by(3), vec![ShardId(0), ShardId(1)]);
         assert_eq!(m.shards_hosted_by(5), vec![ShardId(1)]);
         assert!(m.shards_hosted_by(99).is_empty());
+    }
+
+    #[test]
+    fn entries_round_trips_from_entries() {
+        let m = map_5n2s();
+        // `entries()` reproduces exactly what `from_entries` accepts, so feeding
+        // its output back yields an identical map (same shards, same members).
+        let rebuilt = ShardMap::from_entries(m.entries()).expect("entries round-trip");
+        assert_eq!(rebuilt.num_shards(), m.num_shards());
+        for s in 0..m.num_shards() {
+            assert_eq!(rebuilt.members(ShardId(s)), m.members(ShardId(s)));
+        }
+        // And entries are in ascending shard order.
+        let shards: Vec<u32> = m.entries().iter().map(|(s, _)| s.0).collect();
+        assert_eq!(shards, vec![0, 1]);
     }
 
     #[test]
