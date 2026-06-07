@@ -179,6 +179,24 @@ async fn main() -> anyhow::Result<()> {
                 hosted = map.shards_hosted_by(cfg.cluster.node_id).len(),
                 "cluster mode enabled: assembling per-shard Raft groups for hosted shards"
             );
+            // Phase 4d-4: outbound cluster clients verify peers against tls.ca_path and
+            // (under mTLS) present this node's client identity. None ⇒ today's behavior.
+            let tls_client_cfg: Option<rustls::ClientConfig> = if cfg.tls.enabled {
+                if let Some(ca) = cfg.tls.ca_path.as_deref() {
+                    let id = match (
+                        cfg.tls.client_cert_path.as_deref(),
+                        cfg.tls.client_key_path.as_deref(),
+                    ) {
+                        (Some(c), Some(k)) if cfg.tls.mtls => Some((c, k)),
+                        _ => None,
+                    };
+                    Some(ledge_server::tls::client_config(ca, id)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let stack = ledge_server::build_cluster_stack(
                 data_dir.clone(),
                 objects.clone(),
@@ -187,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 map,
                 raft_config,
                 if cfg.auth.enabled { cfg.auth.cluster_secret.clone() } else { None },
+                tls_client_cfg,
             )
             .await?;
 

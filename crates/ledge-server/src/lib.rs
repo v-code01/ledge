@@ -153,6 +153,11 @@ pub struct ClusterStack {
 /// `Authorization` default header so the receiving node's INTERNAL classifier
 /// accepts the call (spec section 4.5); `None` yields bare clients, byte-identical
 /// to the pre-4d-1 behavior.
+// The cluster stack genuinely needs each of these collaborators (storage dirs,
+// stores, clock, identity, placement, raft tuning, auth secret, TLS identity);
+// bundling them into a struct would only move the argument list, not reduce the
+// surface, so the lint is allowed here rather than worked around.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_cluster_stack(
     data_dir: std::path::PathBuf,
     objects_disk: Arc<DiskObjectStore>,
@@ -161,6 +166,7 @@ pub async fn build_cluster_stack(
     map: ShardMap,
     raft_config: Arc<openraft::Config>,
     cluster_secret: Option<String>,
+    tls_client_cfg: Option<rustls::ClientConfig>,
 ) -> ledge_core::Result<ClusterStack> {
     // Router's shard count comes from the map so routing & placement agree.
     let router = ShardRouter::new(map.num_shards());
@@ -187,7 +193,8 @@ pub async fn build_cluster_stack(
         // Per-shard Raft RPCs (`/raft/*`) also carry the Bearer cluster secret as
         // a default header when auth is enabled (spec §4.5), so a peer's INTERNAL
         // classifier accepts them; `None` ⇒ bare client, byte-identical to before.
-        let net = HttpRaftNetworkFactory::with_secret(shard, peers, cluster_secret.clone());
+        let raft_client = cluster_client(cluster_secret.clone(), tls_client_cfg.clone())?;
+        let net = HttpRaftNetworkFactory::with_client(shard, peers, raft_client);
         let raft = openraft::Raft::<TypeConfig>::new(node_id, raft_config.clone(), net, log, sm)
             .await
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -209,7 +216,7 @@ pub async fn build_cluster_stack(
 
     // The ref store gets the map + an HTTP forwarder so a ref routed to a shard
     // this node does NOT host is forwarded to a hosting member (spec §3.4/§4.3).
-    let forward_client = auth_client(cluster_secret.clone())?;
+    let forward_client = cluster_client(cluster_secret.clone(), tls_client_cfg.clone())?;
     let forwarder: Arc<dyn ledge_cluster::RefOpForwarder> =
         Arc::new(HttpForwarder::new(map.clone(), forward_client));
     let cluster_refs = Arc::new(ClusterRefStore::with_placement(
@@ -234,7 +241,7 @@ pub async fn build_cluster_stack(
     // The `shard` segment passed to each `HttpObjectPeer` is the shard under
     // which we first met that addr — content addressing makes the segment
     // non-load-bearing for correctness, so deduping across shards is safe.
-    let object_client = auth_client(cluster_secret.clone())?;
+    let object_client = cluster_client(cluster_secret.clone(), tls_client_cfg.clone())?;
     let mut seen_addrs: std::collections::HashSet<String> = Default::default();
     let mut object_peers: Vec<Arc<dyn ledge_cluster::ObjectPeer>> = Vec::new();
     for shard in map.shards_hosted_by(node_id) {
@@ -263,11 +270,14 @@ pub async fn build_cluster_stack(
     })
 }
 
-/// Build an outbound `reqwest::Client` whose default `Authorization` header is
-/// the Bearer cluster secret, applied to EVERY request so node-to-node calls
-/// satisfy the receiving node's INTERNAL classifier (spec section 4.5). `None`
-/// yields a bare client, byte-identical to the pre-4d-1 behavior.
-fn auth_client(cluster_secret: Option<String>) -> ledge_core::Result<reqwest::Client> {
+/// Build the node↔node reqwest client: the bearer `cluster_secret` default
+/// header (4d-1) PLUS a preconfigured rustls TLS config (4d-4) when `tls = Some`
+/// (CA roots verify peers; a client identity is presented under mTLS). `tls =
+/// None` ⇒ today's plaintext/default-TLS behavior (byte-identical to auth_client).
+fn cluster_client(
+    cluster_secret: Option<String>,
+    tls: Option<rustls::ClientConfig>,
+) -> ledge_core::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Some(secret) = cluster_secret {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -275,6 +285,9 @@ fn auth_client(cluster_secret: Option<String>) -> ledge_core::Result<reqwest::Cl
             .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))?;
         headers.insert(reqwest::header::AUTHORIZATION, val);
         builder = builder.default_headers(headers);
+    }
+    if let Some(tls_cfg) = tls {
+        builder = builder.use_preconfigured_tls(tls_cfg);
     }
     builder
         .build()
@@ -411,9 +424,9 @@ mod build_cluster_stack_tests {
         // The helper used by build_cluster_stack to build outbound clients must
         // attach `Authorization: Bearer <secret>` as a default header when the
         // secret is Some, and build a bare client when None.
-        let with = super::auth_client(Some("svc-secret".to_string()));
+        let with = super::cluster_client(Some("svc-secret".to_string()), None);
         assert!(with.is_ok(), "client builds with default header");
-        let without = super::auth_client(None);
+        let without = super::cluster_client(None, None);
         assert!(without.is_ok(), "bare client builds");
         // A direct header assertion: the default-headers map is private to reqwest,
         // so we assert construction succeeds and rely on the in-process classifier
@@ -455,6 +468,7 @@ mod build_cluster_stack_tests {
             map,
             raft_cfg(),
             None, // no cluster secret in this placement test
+            None, // no TLS in this placement test
         )
         .await
         .unwrap();
@@ -471,5 +485,30 @@ mod build_cluster_stack_tests {
         for raft in stack.shards.values() {
             raft.shutdown().await.ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_client_tests {
+    use super::*;
+
+    #[test]
+    fn cluster_client_builds_with_and_without_tls() {
+        // No TLS, no secret ⇒ Ok (today's behavior).
+        assert!(cluster_client(None, None).is_ok());
+        // With a secret, no TLS ⇒ Ok.
+        assert!(cluster_client(Some("s3cr3t".to_string()), None).is_ok());
+        // With a valid preconfigured rustls client config ⇒ Ok.
+        crate::tls::install_crypto_provider();
+        let d = tempfile::TempDir::new().unwrap();
+        let (ca, _sc, _sk, cc, ck) = crate::tls::tests_support::mint();
+        let ca_p = d.path().join("ca.pem"); std::fs::write(&ca_p, ca).unwrap();
+        let cc_p = d.path().join("c.pem"); std::fs::write(&cc_p, cc).unwrap();
+        let ck_p = d.path().join("k.pem"); std::fs::write(&ck_p, ck).unwrap();
+        let cfg = crate::tls::client_config(
+            ca_p.to_str().unwrap(),
+            Some((cc_p.to_str().unwrap(), ck_p.to_str().unwrap())),
+        ).unwrap();
+        assert!(cluster_client(Some("s3cr3t".to_string()), Some(cfg)).is_ok());
     }
 }
