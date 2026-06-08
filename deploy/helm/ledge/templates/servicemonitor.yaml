@@ -14,7 +14,7 @@ spec:
       {{- include "ledge.selectorLabels" . | nindent 6 }}
   endpoints:
     # /metrics is served on the client port (no separate metrics listener).
-    - port: client
+    - port: metrics
       path: /metrics
       {{- with .Values.metrics.serviceMonitor.interval }}
       interval: {{ . }}

@@ -4,20 +4,24 @@ Ledge is a single self-contained binary (`ledge`) with **no external dependencie
 (no database, cache, or object store). All state is on local disk; in cluster mode
 it is replicated via Raft. This directory ships verified deployment artifacts.
 
-## The single-port model (read this first)
+## The listener model (read this first)
 
-The server serves **everything on one port** — `[server].addr` (default `:3000`):
-git wire / REST / RPC / admin **and** `/healthz`, `/metrics`, `/raft/*`,
-`/cluster/*`. `[metrics].addr` and `[cluster].raft_bind` are parsed but are **not**
-currently separate listeners. So:
+- **Client port** (`[server].addr`, default `:3000`): git wire / REST / RPC / admin
+  + `/raft/*` + `/cluster/*` (+ `/healthz` + `/metrics` for back-compat). HTTP, or
+  HTTPS when `[tls].enabled`.
+- **Metrics/health port** (`[metrics].addr`, default `:9090`): a dedicated
+  **plain-HTTP** listener serving `/metrics` + `/healthz`, bound when
+  `[metrics].enabled` (default true). Scrape Prometheus + run health probes here —
+  it is TLS-agnostic, so it works even when the client port is HTTPS.
+- **mTLS peer port** (`[tls].peer_addr`): a mutual-TLS listener bound only when
+  `[tls].mtls = true` (cluster peer traffic).
 
-- Prometheus scrapes `/metrics` on the **client port**.
+Notes:
+- `/healthz` and `/metrics` are **public** (no auth) on both ports, even when
+  `[auth]` is on.
 - Cluster peers reach each other's `/raft` on the **client port** (or the
-  `[tls].peer_addr` port under mTLS).
-- `/healthz` and `/metrics` are **public** (no auth), even when `[auth]` is on.
-
-The only second listener is the **mTLS peer listener** on `[tls].peer_addr`, bound
-only when `[tls].mtls = true`.
+  `[tls].peer_addr` port under mTLS). `[cluster].raft_bind` is parsed but is **not**
+  a separate listener (`/raft` rides the client port — documented).
 
 ## Quickstart
 
@@ -71,10 +75,11 @@ systemctl daemon-reload && systemctl enable --now ledge
 
 | Port | Purpose | Notes |
 |------|---------|-------|
-| 3000 | client: git/REST/RPC/admin + `/healthz` + `/metrics` + `/raft` + `/cluster` | HTTP, or HTTPS when `[tls].enabled` |
+| 3000 | client: git/REST/RPC/admin + `/raft` + `/cluster` (+ `/healthz`/`/metrics` back-compat) | HTTP, or HTTPS when `[tls].enabled` |
+| 9090 | dedicated metrics/health: `/metrics` + `/healthz` | plain HTTP, bound when `[metrics].enabled` (default); scrape + probe here (TLS-agnostic) |
 | `[tls].peer_addr` (e.g. 4443) | mTLS peer listener | only when `[tls].mtls=true`; put on a private network |
 
-(`9090` and `4001` from `[metrics].addr` / `[cluster].raft_bind` are **not** bound.)
+(`4001` from `[cluster].raft_bind` is **not** bound — `/raft` rides the client port.)
 
 ## Configuration (env / TOML)
 

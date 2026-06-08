@@ -53,27 +53,37 @@ spec:
             {{- end }}
             {{- end }}
           ports:
-            # The client port carries git/REST/RPC + /healthz + /metrics AND
-            # /raft + /cluster (no separate raft listener). Under mTLS a second
-            # listener serves the peer port.
+            # client: git/REST/RPC (+ /healthz + /metrics back-compat) + /raft +
+            # /cluster (no separate raft listener). metrics: dedicated plain-HTTP
+            # /metrics + /healthz. Under mTLS a second listener serves the peer port.
             - name: client
               containerPort: {{ .Values.service.port }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
             {{- if and .Values.tls.enabled .Values.tls.mtls }}
             - name: peer
               containerPort: {{ .Values.tls.peerPort }}
             {{- end }}
+          # Probe the dedicated metrics/health port (plain HTTP, TLS-agnostic) when
+          # metrics is enabled; else fall back to the client port (HTTPS under TLS).
           readinessProbe:
             httpGet:
               path: /healthz
-              port: client
-              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+              port: {{ if .Values.metrics.enabled }}metrics{{ else }}client{{ end }}
+              {{- if and (not .Values.metrics.enabled) .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: client
-              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+              port: {{ if .Values.metrics.enabled }}metrics{{ else }}client{{ end }}
+              {{- if and (not .Values.metrics.enabled) .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 20
           resources:

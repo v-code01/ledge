@@ -12,9 +12,8 @@ services:
     image: ledge:latest
     command: ["start"]
     ports:
-      # client port: git wire / REST / RPC / admin + /healthz + /metrics. The
-      # server serves /metrics on THIS port (no separate metrics listener).
-      - "3000:3000"
+      - "3000:3000"   # client: git wire / REST / RPC / admin
+      - "9090:9090"   # dedicated metrics/health (Prometheus scrape, plain HTTP)
     volumes:
       - ledge-data:/var/lib/ledge
     environment:
@@ -22,7 +21,7 @@ services:
       LEDGE__SERVER__DATA_DIR: "/var/lib/ledge"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9090/healthz"]
       interval: 15s
       timeout: 3s
       retries: 3

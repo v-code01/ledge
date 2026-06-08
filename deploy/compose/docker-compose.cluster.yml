@@ -26,7 +26,7 @@ x-ledge-common: &ledge-common
     LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_9b7ee379e0250464_6ixCz0hl7icRM_WuUtzu-uHAVsDqF9teIkUTyR69VZQ"
   restart: unless-stopped
   healthcheck:
-    test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+    test: ["CMD", "curl", "-fsS", "http://localhost:9090/healthz"]
     interval: 15s
     timeout: 3s
     retries: 5

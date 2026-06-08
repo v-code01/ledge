@@ -10,12 +10,17 @@ spec:
   selector:
     {{- include "ledge.selectorLabels" . | nindent 4 }}
   ports:
-    # The client port carries git/REST/RPC + /healthz + /metrics AND peer /raft
-    # (no separate metrics or raft listener). Peer DNS (ledge-N.headless) resolves
-    # here for Raft. Under mTLS the peer port is also published.
+    # client carries git/REST/RPC (+ /healthz + /metrics back-compat) AND peer
+    # /raft (no separate raft listener). Peer DNS (ledge-N.headless) resolves here
+    # for Raft. metrics is the dedicated plain scrape port; peer is published under mTLS.
     - name: client
       port: {{ .Values.service.port }}
       targetPort: client
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+    {{- end }}
     {{- if and .Values.tls.enabled .Values.tls.mtls }}
     - name: peer
       port: {{ .Values.tls.peerPort }}

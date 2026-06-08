@@ -46,19 +46,19 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 USER ledge
 WORKDIR /var/lib/ledge
 
-# 3000 = the single client port: git/REST/RPC/admin + /healthz + /metrics + /raft
-# + /cluster (HTTP, or HTTPS under TLS). NOTE: the server serves EVERYTHING on the
-# client port — config.metrics.addr and config.cluster.raft_bind are currently NOT
-# separate listeners, so peers reach /raft on the client port. Under mTLS a second
-# listener is bound on tls.peer_addr (publish that port too). See deploy/README.md.
-EXPOSE 3000
+# 3000 = client port: git/REST/RPC/admin (+ /healthz + /metrics for back-compat) +
+# /raft + /cluster (HTTP, or HTTPS under TLS). 9090 = dedicated plain-HTTP
+# metrics/health listener ([metrics].addr) — Prometheus + probes scrape here
+# TLS-agnostically even when the client port is TLS. NOTE: [cluster].raft_bind is
+# NOT a separate listener — peers reach /raft on the client port (mTLS peers via
+# tls.peer_addr; publish that port too). See deploy/README.md.
+EXPOSE 3000 9090
 VOLUME ["/var/lib/ledge"]
 
-# /healthz is on the client port. This default healthcheck assumes plaintext
-# (TLS disabled). For a TLS deployment, override with an https + CA healthcheck
-# (e.g. `curl -fsS --cacert /etc/ledge/tls/ca.crt https://localhost:3000/healthz`).
+# Healthcheck the dedicated metrics/health port (plain HTTP, always, regardless of
+# client TLS). Requires metrics.enabled=true (default); if disabled, override.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:3000/healthz >/dev/null || exit 1
+    CMD curl -fsS http://localhost:9090/healthz >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["start"]

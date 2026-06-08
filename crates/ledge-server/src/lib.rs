@@ -299,6 +299,16 @@ fn cluster_client(
         .map_err(|e| ledge_core::LedgeError::Io(std::io::Error::other(e.to_string())))
 }
 
+/// The dedicated metrics/health router (plain HTTP, no state, no auth) served on
+/// `[metrics].addr` so Prometheus + health probes have a TLS-agnostic scrape port
+/// even when the client listener is TLS. `/metrics` + `/healthz` ALSO remain on
+/// the client router (`build_app`) for back-compat.
+pub fn build_metrics_app() -> Router {
+    Router::new()
+        .route("/metrics", axum::routing::get(routes::metrics_handler))
+        .route("/healthz", axum::routing::get(routes::healthz))
+}
+
 pub fn build_app(state: AppState) -> Router {
     // The auth middleware needs its own clone of the state (`with_state` below
     // consumes `state` into the router's handler state).

@@ -464,6 +464,29 @@ async fn main() -> anyhow::Result<()> {
         // ⇒ every gate is a no-op (R Q15).
         quota,
     });
+
+    // Dedicated plain-HTTP metrics/health listener on [metrics].addr (default
+    // :9090) so Prometheus + health probes have a TLS-agnostic scrape port even
+    // when the client listener is TLS. /metrics + /healthz ALSO stay on the client
+    // router (back-compat). Bind is awaited (fail-fast on a bad metrics.addr); the
+    // serve runs for the process lifetime alongside the client/peer listeners.
+    if cfg.metrics.enabled {
+        let metrics_addr: SocketAddr = cfg
+            .metrics
+            .addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid metrics.addr {}: {}", cfg.metrics.addr, e))?;
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+        info!(bound_addr = %metrics_listener.local_addr()?, "ledge metrics/health listener");
+        tokio::spawn(async move {
+            if let Err(e) =
+                axum::serve(metrics_listener, ledge_server::build_metrics_app()).await
+            {
+                tracing::warn!(error = %e, "metrics listener exited");
+            }
+        });
+    }
+
     let addr: SocketAddr = cfg
         .server
         .addr
