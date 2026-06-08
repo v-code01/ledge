@@ -434,6 +434,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Webhooks (default off): a WAL-backed registry + async signed dispatcher.
+    let webhooks = if cfg.webhooks.enabled {
+        let store = Arc::new(ledge_server::webhook::store::WebhookStore::open(
+            data_dir.clone(),
+            hlc.clone(),
+        )?);
+        store.spawn_compaction_task(8 * 1024 * 1024);
+        ledge_server::metrics::set_webhooks_registered(store.count() as f64);
+        Some(Arc::new(ledge_server::webhook::dispatch::WebhookDispatcher::new(store)))
+    } else {
+        None
+    };
+
     let app = build_app(AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
         // concrete local stores up-cast in single-node mode (byte-identical to
@@ -451,9 +464,9 @@ async fn main() -> anyhow::Result<()> {
         raft_shards,
         cluster_refs,
         cluster_objects,
-        // Webhooks: wired in Task 6 ([webhooks].enabled ⇒ Some). None for now ⇒
-        // no events emitted + /webhooks routes report 503.
-        webhooks: None,
+        // Webhooks: built above ([webhooks].enabled ⇒ Some WAL-backed dispatcher,
+        // else None ⇒ no events emitted + /webhooks routes report 503).
+        webhooks,
         shard_map,
         cluster_gc,
         // Auth (Phase 4d-1): the ctx assembled above — a real WAL-backed store

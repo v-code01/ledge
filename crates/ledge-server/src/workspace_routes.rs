@@ -408,6 +408,25 @@ pub async fn commit_workspace(
                     },
                 })
                 .collect();
+            if let Some(d) = &state.webhooks {
+                let ts = wall_now_ms();
+                for o in &outcomes {
+                    if let CommitOutcome::Ok { target, entry } = o {
+                        d.dispatch(
+                            &principal.tenant_id,
+                            crate::webhook::EventKind::RefCommitted,
+                            serde_json::json!({
+                                "event": "ref.committed",
+                                "tenant": principal.tenant_id,
+                                "workspace_id": id,
+                                "ref": target,
+                                "new_target": entry.target.to_hex(),
+                                "ts_ms": ts,
+                            }),
+                        );
+                    }
+                }
+            }
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => map_lookup_err_counting_denials(e),
