@@ -30,6 +30,14 @@ enabled = false
 # cluster_secret = "change-me-to-a-long-random-secret"
 # bootstrap_admin_token = "ledge_admin_<random>"   # minted as a root admin key on first boot if the store is empty
 
+# ── Webhooks (event surface) ─────────────────────────────────────────────────
+# Disabled by default. When enabled, tenants register signed `ref.committed`
+# webhooks via POST /webhooks (the routes return 503 while disabled). Delivery is
+# best-effort (in-process retry, NOT a durable outbox); URLs are tenant-controlled
+# (SSRF caveat — gate target hosts for untrusted tenants). See README "Webhooks".
+[webhooks]
+enabled = false
+
 # ── Per-tenant quotas (Phase 4d-3) ───────────────────────────────────────────
 # Disabled by default; root tenant is always exempt. None = unlimited.
 [quotas]

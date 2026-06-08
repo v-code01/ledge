@@ -164,6 +164,56 @@ handles it; prefer reconfiguring from a node that stays a voter). Changing the
 redesign (see the design spec). Reconfigure-rebuilt object peers carry the bearer
 but not per-node TLS config; a rolling restart re-derives full TLS peers.
 
+## Webhooks (event surface)
+
+Ledge can POST a signed event to a tenant-registered URL whenever a durable ref
+advances. Disabled by default; enable with:
+
+```toml
+[webhooks]
+enabled = true
+```
+
+When enabled, each tenant manages its own webhooks (tenant-scoped via the caller's
+principal; disabled ⇒ all `/webhooks` routes return 503):
+
+```sh
+# register — the secret is returned ONCE (store it now; it is never shown again)
+curl -X POST http://<node>:3000/webhooks \
+  -H "Authorization: Bearer <token>" -H "content-type: application/json" \
+  -d '{"url":"https://my-sink.example/hook"}'        # optional: "events":["ref_committed"] (empty ⇒ all)
+# → 201 {"id":"<hex>","secret":"<64-hex>","url":...,"events":[...],"created_at_ms":...}
+
+curl http://<node>:3000/webhooks   -H "Authorization: Bearer <token>"   # list (NO secret)
+curl -X DELETE http://<node>:3000/webhooks/<id> -H "Authorization: Bearer <token>"   # → 204
+```
+
+**Delivery & verification.** On a successful commit, Ledge POSTs a JSON body
+(`{"event":"ref.committed","tenant":...,"workspace_id":...,"ref":...,"new_target":...,"ts_ms":...}`)
+with headers `X-Ledge-Event: ref.committed`, `X-Ledge-Delivery: <id>`, and
+`X-Ledge-Signature: blake3=<hex>`. Verify authenticity by recomputing the keyed
+hash over the **raw request body** and constant-time comparing:
+
+```
+expected = "blake3=" + hex(blake3_keyed_hash(secret_bytes, raw_body))
+assert expected == X-Ledge-Signature
+```
+
+where `secret_bytes` is the 32 bytes decoded from the hex `secret` returned at
+registration.
+
+**Caveats.**
+- **Best-effort, not a durable outbox.** Delivery is an in-process spawned task
+  with bounded retry (3 attempts, exponential backoff). If the node crashes
+  mid-delivery, that event is lost — there is no persistent replay queue. The
+  commit itself is unaffected: a dead or slow sink never fails or blocks a commit.
+- **SSRF.** Webhook target URLs are tenant-controlled. A malicious tenant can aim
+  a webhook at internal addresses (link-local, cloud metadata, RFC1918). For
+  untrusted multi-tenant deployments, gate target hosts (allowlist/denylist,
+  egress proxy) before enabling.
+- **Only `ref.committed` is emitted today** (other event kinds are reserved in the
+  type but not yet produced).
+
 ## Honest limitations
 
 - **systemd unit is authored but not machine-verified here** (built on macOS, no
