@@ -1,6 +1,8 @@
 //! Webhooks / event surface: types + signing. Store, dispatcher, and routes live
 //! in sibling modules (added by later tasks).
 
+pub mod store;
+
 use serde::{Deserialize, Serialize};
 
 /// 128-bit webhook id (hex in the API).
