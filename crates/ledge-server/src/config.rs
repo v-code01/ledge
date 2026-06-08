@@ -14,6 +14,8 @@ pub struct LedgeConfig {
     pub quotas: QuotaConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -168,6 +170,13 @@ pub struct TlsConfig {
     #[serde(default)] pub client_key_path: Option<String>,
 }
 
+/// Webhooks / event surface configuration. Disabled by default (byte-identical
+/// when off): no dispatcher, no events, the /webhooks routes report 503.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct WebhooksConfig {
+    pub enabled: bool,
+}
+
 impl QuotaConfig {
     /// Project the manager-relevant durable limits into a [`ledge_workspace::QuotaLimits`]
     /// (Copy). The rate/burst are NOT included — they build the `TenantRateLimiter`
@@ -220,7 +229,8 @@ impl LedgeConfig {
             .set_default("auth.enabled",                       false).map_err(map_cfg)?
             .set_default("quotas.enabled",                     false).map_err(map_cfg)?
             .set_default("tls.enabled", false).map_err(map_cfg)?
-            .set_default("tls.mtls",    false).map_err(map_cfg)?;
+            .set_default("tls.mtls",    false).map_err(map_cfg)?
+            .set_default("webhooks.enabled", false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -519,6 +529,22 @@ mod tests {
         )
         .unwrap();
         assert!(LedgeConfig::load(Some(&f.path().to_path_buf())).is_ok());
+    }
+
+    #[test]
+    fn webhooks_disabled_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config");
+        assert!(!cfg.webhooks.enabled);
+    }
+
+    #[test]
+    fn webhooks_toml_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[webhooks]\nenabled=true").unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.webhooks.enabled);
     }
 
     #[test]
