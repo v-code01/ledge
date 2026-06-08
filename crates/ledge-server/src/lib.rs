@@ -10,6 +10,7 @@ pub mod routes;
 pub mod rpc_routes;
 pub mod tls;
 pub mod webhook;
+pub mod webhook_routes;
 pub mod workspace_routes;
 
 pub use auth::{Principal, Scopes};
@@ -335,6 +336,15 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/workspaces/{id}/commit",
             axum::routing::post(workspace_routes::commit_workspace),
+        )
+        // ── Outbound webhooks (tenant-scoped CRUD) — 503 when disabled ─────────
+        .route(
+            "/webhooks",
+            axum::routing::post(webhook_routes::register).get(webhook_routes::list),
+        )
+        .route(
+            "/webhooks/{id}",
+            axum::routing::delete(webhook_routes::delete),
         )
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
         // ── Binary control plane (Cap'n Proto, spec §2) ────────────────────

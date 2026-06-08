@@ -45,6 +45,7 @@ async fn start_server() -> (String, TempDir) {
         raft_shards: None,
         cluster_refs: None,
         cluster_objects: None,
+        webhooks: None,
         shard_map: None,
         cluster_gc: None,
         auth: ledge_server::auth::AuthCtx::disabled(),

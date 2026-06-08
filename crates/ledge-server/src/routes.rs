@@ -61,6 +61,9 @@ pub struct AppState {
     /// The concrete `ReplicatedObjectStore` in cluster mode — held so the Phase 4g
     /// reconfigure route can swap its replication peer set. `None` single-node.
     pub cluster_objects: Option<std::sync::Arc<ledge_cluster::ReplicatedObjectStore>>,
+    /// Outbound webhook dispatcher (Some only when [webhooks].enabled). None ⇒
+    /// no events emitted + the /webhooks routes report 503.
+    pub webhooks: Option<std::sync::Arc<crate::webhook::dispatch::WebhookDispatcher>>,
     /// The node-local distributed-GC driver, when `cluster.enabled`. `POST
     /// /admin/gc` runs THIS via `ClusterGc::run` in cluster mode; `POST
     /// /cluster/gc` fans out and aggregates. `None` single-node ⇒ `/admin/gc`
@@ -431,6 +434,7 @@ mod tenant_git_tests {
             raft_shards: None,
             cluster_refs: None,
             cluster_objects: None,
+            webhooks: None,
             shard_map: None,
             cluster_gc: None,
             auth,

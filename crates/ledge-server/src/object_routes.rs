@@ -129,6 +129,7 @@ mod tests {
             raft_shards: None,
             cluster_refs: None,
             cluster_objects: None,
+            webhooks: None,
             shard_map: None,
             cluster_gc: None,
             auth: crate::auth::AuthCtx::disabled(),

@@ -451,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
         raft_shards,
         cluster_refs,
         cluster_objects,
+        // Webhooks: wired in Task 6 ([webhooks].enabled ⇒ Some). None for now ⇒
+        // no events emitted + /webhooks routes report 503.
+        webhooks: None,
         shard_map,
         cluster_gc,
         // Auth (Phase 4d-1): the ctx assembled above — a real WAL-backed store
