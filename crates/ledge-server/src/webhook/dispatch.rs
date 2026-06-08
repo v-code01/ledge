@@ -1,0 +1,87 @@
+//! Async, signed, best-effort webhook delivery (Phase: webhooks). Never blocks
+//! the caller — each delivery is a spawned task with bounded retry.
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::{sign, store::WebhookStore, EventKind, WebhookConfig};
+
+pub struct WebhookDispatcher {
+    store: Arc<WebhookStore>,
+    client: reqwest::Client,
+}
+
+impl WebhookDispatcher {
+    pub fn new(store: Arc<WebhookStore>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        Self { store, client }
+    }
+
+    pub fn store(&self) -> &Arc<WebhookStore> {
+        &self.store
+    }
+
+    /// Deliver `payload` to every tenant webhook handling `kind`. Spawns each
+    /// delivery — returns immediately; never blocks the commit path.
+    pub fn dispatch(&self, tenant: &str, kind: EventKind, payload: serde_json::Value) {
+        let body = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        for wh in self.store.for_event(tenant, kind) {
+            let client = self.client.clone();
+            let body = body.clone();
+            let evt = kind.wire();
+            tokio::spawn(async move { deliver(client, wh, evt, body).await });
+        }
+    }
+}
+
+async fn deliver(client: reqwest::Client, wh: WebhookConfig, evt: &'static str, body: Vec<u8>) {
+    let sig = sign(&wh.secret, &body);
+    let delivery_id = blake3::hash(&body).to_hex().to_string();
+    let start = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        let res = client
+            .post(&wh.url)
+            .header("content-type", "application/json")
+            .header("x-ledge-event", evt)
+            .header("x-ledge-delivery", &delivery_id[..32])
+            .header("x-ledge-signature", &sig)
+            .body(body.clone())
+            .send()
+            .await;
+        let ok = matches!(&res, Ok(r) if r.status().is_success());
+        if ok {
+            crate::metrics::record_webhook_delivery("ok");
+            crate::metrics::record_webhook_delivery_duration(start.elapsed());
+            return;
+        }
+        attempt += 1;
+        if attempt >= 3 {
+            crate::metrics::record_webhook_delivery("failed");
+            crate::metrics::record_webhook_delivery_duration(start.elapsed());
+            tracing::warn!(webhook = %wh.id.to_hex(), url = %wh.url, "webhook delivery failed after retries");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500 * (1u64 << attempt))).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webhook::{store::WebhookStore, EventKind};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dispatch_empty_store_is_noop() {
+        let d = WebhookDispatcher::new(Arc::new(WebhookStore::in_memory()));
+        // No webhooks registered ⇒ no delivery spawned, no panic.
+        d.dispatch("acme", EventKind::RefCommitted, serde_json::json!({"event":"ref.committed"}));
+        assert_eq!(d.store().count(), 0);
+    }
+}

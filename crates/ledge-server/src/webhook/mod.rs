@@ -1,6 +1,7 @@
 //! Webhooks / event surface: types + signing. Store, dispatcher, and routes live
 //! in sibling modules (added by later tasks).
 
+pub mod dispatch;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

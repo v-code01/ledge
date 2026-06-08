@@ -200,6 +200,27 @@ pub fn set_quota_workspaces(tenant: &str, n: u64) {
     metrics::gauge!(QUOTA_WORKSPACES, "tenant" => tenant.to_string()).set(n as f64);
 }
 
+// ── Webhook delivery metrics (Phase: webhooks, Task 4). The deliveries counter
+//    is labeled only by `result` ∈ ok|failed (low cardinality; never the tenant,
+//    url, or secret — no leakage on the metrics surface). The duration histogram
+//    measures end-to-end delivery wall time; the gauge tracks the registered
+//    webhook count, set from the store after register/delete. ──────────────────
+pub const WEBHOOK_DELIVERIES_TOTAL: &str = "ledge_webhook_deliveries_total";
+pub const WEBHOOK_DELIVERY_DURATION: &str = "ledge_webhook_delivery_duration_seconds";
+pub const WEBHOOKS_REGISTERED: &str = "ledge_webhooks_registered";
+
+/// Count a webhook delivery outcome. `result` ∈ ok|failed. No tenant/url/secret label.
+pub fn record_webhook_delivery(result: &'static str) {
+    metrics::counter!(WEBHOOK_DELIVERIES_TOTAL, "result" => result).increment(1);
+}
+pub fn record_webhook_delivery_duration(d: std::time::Duration) {
+    metrics::histogram!(WEBHOOK_DELIVERY_DURATION).record(d.as_secs_f64());
+}
+/// Gauge: count of registered webhooks (set from the store after register/delete).
+pub fn set_webhooks_registered(n: f64) {
+    metrics::gauge!(WEBHOOKS_REGISTERED).set(n);
+}
+
 /// Transport-posture gauges (Phase 4d-4): set ONCE at boot so /metrics reflects
 /// whether TLS / mTLS is active. Zero label cardinality.
 pub const TLS_ENABLED: &str = "ledge_tls_enabled";
@@ -442,6 +463,20 @@ mod tests {
         record_quota_denied("requests");
         set_quota_usage("acme", 4096, 7);
         set_quota_workspaces("acme", 3);
+    }
+
+    #[test]
+    fn webhook_metric_constants_correct() {
+        assert_eq!(WEBHOOK_DELIVERIES_TOTAL, "ledge_webhook_deliveries_total");
+        assert_eq!(WEBHOOK_DELIVERY_DURATION, "ledge_webhook_delivery_duration_seconds");
+        assert_eq!(WEBHOOKS_REGISTERED, "ledge_webhooks_registered");
+    }
+    #[test]
+    fn webhook_record_helpers_no_panic_without_recorder() {
+        record_webhook_delivery("ok");
+        record_webhook_delivery("failed");
+        record_webhook_delivery_duration(std::time::Duration::from_millis(5));
+        set_webhooks_registered(3.0);
     }
 
     #[test]
