@@ -9,6 +9,7 @@ pub mod quota;
 pub mod routes;
 pub mod rpc_routes;
 pub mod tls;
+pub mod webhook;
 pub mod workspace_routes;
 
 pub use auth::{Principal, Scopes};
