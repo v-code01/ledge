@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ledge_core::{LedgeError, RefName, RefStore, Result};
+use ledge_core::{LedgeError, ObjectId, ObjectStore, RefName, RefStore, Result};
 use ledge_object_store::DiskObjectStore;
-use ledge_workspace::WorkspaceManager;
+use ledge_workspace::{WorkspaceId, WorkspaceManager};
 
 /// One upstream ref that was mirrored into the workspace namespace.
 pub struct ImportedRef {
@@ -24,6 +24,33 @@ pub struct ImportResult {
     pub default_branch: Option<String>,
     /// Every `refs/heads/*` and `refs/tags/*` that was mirrored.
     pub refs: Vec<ImportedRef>,
+}
+
+/// One workspace head successfully pushed upstream by [`SyncEngine::export`].
+#[derive(Debug)]
+pub struct PushedRef {
+    /// Upstream ref name written, e.g. `refs/heads/main`.
+    pub reference: String,
+    /// Hex SHA-1 of the git object the head points at (the canonical commit id).
+    pub sha1: String,
+}
+
+/// One workspace head the upstream rejected (e.g. non-fast-forward, no `force`).
+#[derive(Debug)]
+pub struct RejectedRef {
+    /// Upstream ref name that was rejected.
+    pub reference: String,
+    /// Git's porcelain summary for the rejection (e.g. `[rejected] (non-fast-forward)`).
+    pub reason: String,
+}
+
+/// Outcome of [`SyncEngine::export`].
+#[derive(Debug)]
+pub struct ExportResult {
+    /// Heads accepted upstream.
+    pub pushed: Vec<PushedRef>,
+    /// Heads the upstream rejected.
+    pub rejected: Vec<RejectedRef>,
 }
 
 /// Orchestrates upstream git remote sync into Ledge workspaces.
@@ -151,6 +178,100 @@ impl SyncEngine {
             refs: out_refs,
         })
     }
+
+    /// Push a workspace's heads back to `upstream_url`. Ownership-checked (foreign
+    /// workspace ⇒ NotFound). Materializes reachable objects as loose git objects
+    /// in a temp bare repo, then `git push`. `refs` (client `refs/heads/<b>` or
+    /// `<b>` names) selects a subset; None ⇒ all the workspace's heads. `force`
+    /// allows non-fast-forward.
+    pub async fn export(
+        &self,
+        tenant: &str,
+        workspace_id: &str,
+        upstream_url: &str,
+        auth: Option<&str>,
+        refs: Option<Vec<String>>,
+        force: bool,
+    ) -> Result<ExportResult> {
+        if !self.host_allowed(upstream_url) {
+            return Err(LedgeError::Unavailable("upstream host not allowed".into()));
+        }
+        // A malformed id, or a foreign/absent workspace, is a uniform NotFound —
+        // no existence leak across tenants. NotFound carries an ObjectId, so we
+        // use the project's zero-sentinel (cf. workspace_routes), which maps to a
+        // 404 at the HTTP layer.
+        let wid = WorkspaceId::from_hex(workspace_id)
+            .map_err(|_| LedgeError::NotFound(ObjectId::from_bytes([0u8; 32])))?;
+        if self.workspaces.get(wid, tenant).await?.is_none() {
+            return Err(LedgeError::NotFound(ObjectId::from_bytes([0u8; 32])));
+        }
+        let prefix = format!("refs/workspaces/{workspace_id}/heads/");
+        let all = self.refs.list(&prefix).await?;
+        let want: Option<std::collections::HashSet<String>> = refs.map(|v| {
+            v.into_iter()
+                .map(|r| r.strip_prefix("refs/heads/").unwrap_or(&r).to_string())
+                .collect()
+        });
+        let mut tips: Vec<(String, ObjectId)> = Vec::new();
+        for (name, entry) in all {
+            let branch = name.as_str().strip_prefix(&prefix).unwrap_or("").to_string();
+            if branch.is_empty() {
+                continue;
+            }
+            if want.as_ref().is_some_and(|w| !w.contains(&branch)) {
+                continue;
+            }
+            tips.push((branch, entry.target));
+        }
+        if tips.is_empty() {
+            // No selected branch resolved to a head in this workspace.
+            return Err(LedgeError::NotFound(ObjectId::from_bytes([0u8; 32])));
+        }
+        let tmp = tempfile::TempDir::new()
+            .map_err(|e| LedgeError::Io(std::io::Error::other(e.to_string())))?;
+        let repo = tmp.path().join("out.git");
+        git_cli::init_bare(&repo).await?;
+        let roots: Vec<ObjectId> = tips.iter().map(|(_, oid)| *oid).collect();
+        let reachable = ledge_object_store::graph::reachable_from(&self.objects, roots).await?;
+        let mut n = 0u64;
+        for oid in &reachable {
+            let sha1 = self.objects.sha1_of(*oid).await?;
+            let ty = self.objects.git_type_of(*oid).await?;
+            let content = self.objects.read(*oid).await?;
+            git_cli::write_loose_object(&repo, &sha1, ty, &content)?;
+            n += 1;
+        }
+        crate::metrics::record_sync_objects("export", n);
+        let mut refspecs = Vec::new();
+        let mut tip_sha: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (branch, oid) in &tips {
+            let sha = hex20(&self.objects.sha1_of(*oid).await?);
+            git_cli::update_ref(&repo, &format!("refs/heads/{branch}"), &sha).await?;
+            refspecs.push(format!("refs/heads/{branch}:refs/heads/{branch}"));
+            tip_sha.insert(branch.clone(), sha);
+        }
+        let results = git_cli::push(&repo, upstream_url, auth, &refspecs, force).await?;
+        let (mut pushed, mut rejected) = (Vec::new(), Vec::new());
+        for r in results {
+            let branch = r
+                .reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&r.reference)
+                .to_string();
+            if r.status == "rejected" {
+                rejected.push(RejectedRef {
+                    reference: r.reference,
+                    reason: r.summary,
+                });
+            } else {
+                pushed.push(PushedRef {
+                    reference: r.reference.clone(),
+                    sha1: tip_sha.get(&branch).cloned().unwrap_or_default(),
+                });
+            }
+        }
+        Ok(ExportResult { pushed, rejected })
+    }
 }
 
 /// Lowercase hex-encode a 20-byte git SHA-1.
@@ -216,6 +337,126 @@ mod tests {
         )
         .await;
         (bare, sha)
+    }
+
+    /// Same as `make_upstream` — a single-commit `main` in a bare repo, returning
+    /// the bare TempDir plus the hex SHA-1 of `main` for round-trip assertions.
+    async fn make_upstream_with_sha() -> (tempfile::TempDir, String) {
+        make_upstream().await
+    }
+
+    #[tokio::test]
+    async fn export_roundtrips_sha1() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hlc = std::sync::Arc::new(ledge_core::HLC::new());
+        let objects = std::sync::Arc::new(
+            ledge_object_store::DiskObjectStore::new(dir.path().to_path_buf()).unwrap(),
+        );
+        let refs = std::sync::Arc::new(
+            ledge_ref_store::RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone()).unwrap(),
+        );
+        let (workspaces, _l, _g) = crate::build_workspace_stack(
+            dir.path().to_path_buf(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
+        let refs_dyn: std::sync::Arc<dyn ledge_core::RefStore> = refs.clone();
+        let engine = SyncEngine::new(objects.clone(), refs_dyn, workspaces, vec![]);
+
+        let (bare_a, main_a) = make_upstream_with_sha().await;
+        let url_a = format!("file://{}", bare_a.path().display());
+        let imp = engine.import("root", &url_a, None, 3600).await.unwrap();
+
+        let bare_b = tempfile::TempDir::new().unwrap();
+        super::git_cli::init_bare(bare_b.path()).await.unwrap();
+        let url_b = format!("file://{}", bare_b.path().display());
+        let res = engine
+            .export("root", &imp.workspace_id, &url_b, None, None, false)
+            .await
+            .unwrap();
+        assert!(
+            res.pushed.iter().any(|r| r.reference == "refs/heads/main"),
+            "pushed main: {res:?}"
+        );
+
+        let out = tempfile::TempDir::new().unwrap();
+        let g = tokio::process::Command::new("git")
+            .args(["clone", "--quiet", &url_b, out.path().to_str().unwrap()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            g.status.success(),
+            "clone B: {}",
+            String::from_utf8_lossy(&g.stderr)
+        );
+        let got = String::from_utf8(
+            tokio::process::Command::new("git")
+                .args(["rev-parse", "main"])
+                .current_dir(out.path())
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(got, main_a, "round-trip A→Ledge→B preserves the commit SHA-1");
+    }
+
+    #[tokio::test]
+    async fn export_foreign_workspace_is_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hlc = std::sync::Arc::new(ledge_core::HLC::new());
+        let objects = std::sync::Arc::new(
+            ledge_object_store::DiskObjectStore::new(dir.path().to_path_buf()).unwrap(),
+        );
+        let refs = std::sync::Arc::new(
+            ledge_ref_store::RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone()).unwrap(),
+        );
+        let (workspaces, _l, _g) = crate::build_workspace_stack(
+            dir.path().to_path_buf(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
+        let engine = SyncEngine::new(
+            objects.clone(),
+            refs.clone() as std::sync::Arc<dyn ledge_core::RefStore>,
+            workspaces,
+            vec![],
+        );
+        let (bare_a, _) = make_upstream_with_sha().await;
+        let imp = engine
+            .import("acme", &format!("file://{}", bare_a.path().display()), None, 3600)
+            .await
+            .unwrap();
+        let bare_b = tempfile::TempDir::new().unwrap();
+        super::git_cli::init_bare(bare_b.path()).await.unwrap();
+        // export as a DIFFERENT tenant ⇒ NotFound
+        let r = engine
+            .export(
+                "globex",
+                &imp.workspace_id,
+                &format!("file://{}", bare_b.path().display()),
+                None,
+                None,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(r, Err(ledge_core::LedgeError::NotFound(_))),
+            "foreign export ⇒ NotFound, got {r:?}"
+        );
     }
 
     #[tokio::test]

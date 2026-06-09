@@ -149,10 +149,15 @@ pub async fn default_branch(repo: &Path) -> Option<String> {
 
 use std::io::Write;
 
-/// `git init --bare <dir>`.
+/// `git init --bare --initial-branch=main <dir>`.
+///
+/// HEAD is pinned to `refs/heads/main` (rather than git's build-time default,
+/// historically `master`) so that a repo which subsequently receives a `main`
+/// push has a HEAD that resolves: a later `git clone` follows the remote HEAD
+/// and checks `main` out instead of warning about a nonexistent ref.
 pub async fn init_bare(dir: &std::path::Path) -> Result<()> {
-    run(&["init", "--bare", "--quiet", dir.to_str().unwrap()], std::path::Path::new("/"),
-        Duration::from_secs(30), "init").await.map(|_| ())
+    run(&["init", "--bare", "--quiet", "--initial-branch=main", dir.to_str().unwrap()],
+        std::path::Path::new("/"), Duration::from_secs(30), "init").await.map(|_| ())
 }
 
 /// `git -C <repo> update-ref <refname> <sha1hex>`.
