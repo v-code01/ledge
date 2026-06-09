@@ -10,9 +10,10 @@ This (1) deploys a **persistent self-hosted Ledge** instance, (2) makes Ledge **
 own source** (via the git-sync feature), (3) **clones that source back out of Ledge** and
 asserts the HEAD commit SHA-1 is byte-identical, then leaves the instance running.
 
-Latest verified run — **5 PASS / 0 FAIL** ([`results/2026-06-09.txt`](results/2026-06-09.txt)):
-the cloned-back HEAD (`bf3f7e4e…`) equaled the host source HEAD exactly. Ledge is serving
-its own 244-commit source over the git wire protocol.
+Latest verified run — **6 PASS / 0 FAIL** ([`results/2026-06-09-delta.txt`](results/2026-06-09-delta.txt)):
+a raw `git push` of the full source into Ledge succeeded (delta-capable receive-pack) and the
+cloned-back HEAD equaled the host source HEAD exactly. Ledge is serving its own source over the
+git wire protocol.
 
 ## What it dogfoods
 
@@ -35,20 +36,23 @@ gone. True durability needs a deploy on a *separate* host (the artifacts support
 scope here). This dogfood proves "Ledge can host its own source persistently," not "your code
 survives this laptop dying."
 
-## A real limitation this surfaced (honest)
+## A gap this surfaced, now fixed: raw `git push` works
 
-The script probes a raw `git push` of the source into Ledge — it **fails with HTTP 500**.
-Ledge's `receive-pack` decoder (`ledge_git::push::decode_pack_objects`) handles only non-delta
-objects, but a real `git push` of a multi-commit repo sends a *delta-compressed* pack. That's
-why we ingest via **sync-import** (which delta-expands with `git cat-file`) rather than a raw
-push. Making `receive-pack` accept delta packs (OFS/REF delta resolution) is a documented
-follow-on — it would let you `git push` straight into Ledge and enable continuous self-hosting.
+This dogfood originally surfaced a real limitation — a raw `git push` of the source into Ledge
+**failed with HTTP 500**, because the `receive-pack` decoder handled only non-delta objects
+while a real multi-commit push sends a *delta-compressed* pack. **That is now fixed.**
+`ledge_git::push::decode_pack_objects` resolves OFS_DELTA and REF_DELTA (including thin-pack
+bases looked up from the object store), so the delta-capable `receive-pack` accepts real packs.
+Step 2 of this script now pushes the full Ledge source straight into the instance as a hard
+**PASS** assertion. `sync-import` remains the in-process bridge for mirroring upstreams, but
+`git push http://localhost:3030/ws/<id>/ HEAD:refs/heads/main` is now a first-class path —
+which makes **continuous self-hosting via push** possible.
 
 ## Other honest notes
 
-- **Snapshot, not continuous:** Ledge holds the source as of the import. Re-run to re-import a
-  fresh snapshot; continuous self-hosting needs delta-receive-pack or a sync-on-commit hook
-  (which could ride the webhook surface).
+- **Snapshot today, continuous now possible:** the sync-import step holds the source as of the
+  import. With delta-capable `receive-pack` shipped, a `git push` post-commit hook (or the
+  webhook surface) can now drive continuous self-hosting straight into Ledge.
 - **Workspace-hosted:** the source lives in a workspace with a 1-year lease (Ledge has no root
   durable git surface; the workspace is the unit). Renew/long-TTL keeps it alive.
 - The bootstrap auth token in `docker-compose.yml` is a dev token — fine for a local dogfood,

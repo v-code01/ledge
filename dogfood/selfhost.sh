@@ -41,18 +41,17 @@ NREFS="$(echo "$IMP" | jq -r '.refs | length' 2>/dev/null || echo 0)"
 echo "     imported: workspace=$WS default_branch=$DEF refs=$NREFS"
 if [ -n "$WS" ]; then ok "Ledge ingested its own source ($NREFS refs)"; else bad "import failed: $IMP"; "${COMPOSE[@]}" logs --tail 20 ledge; exit 1; fi
 
-note "2. (probe) raw git push of the source into Ledge — documents the receive-pack delta limit"
+note "2. raw git push of the source into Ledge — delta-capable receive-pack"
 WS2="$(curl -fsS -X POST "$CLIENT/workspaces" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"source":[],"ttl_seconds":3600}' 2>/dev/null | jq -r '.id // empty' || true)"
 if [ -n "$WS2" ]; then
   if GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" -c http.extraHeader="Authorization: Bearer $TOKEN" push --quiet "http://localhost:3030/ws/$WS2/" "HEAD:refs/heads/main" >/tmp/dogfood_push.log 2>&1; then
-    echo "     raw push SUCCEEDED (receive-pack accepted the pack)"; ok "bonus: raw git push works"
+    ok "raw git push into Ledge works (delta packs accepted)"
   else
-    echo "     raw push failed (expected — receive-pack is non-delta; sync-import is the delta-safe path):"
-    sed 's/^/       /' /tmp/dogfood_push.log | tail -4
-    echo "     [documented limitation, not a harness failure]"
+    bad "raw git push failed"
+    sed 's/^/       /' /tmp/dogfood_push.log | tail -6
   fi
 else
-  echo "     (skipped push probe — could not fork a probe workspace)"
+  bad "could not fork a probe workspace for the push test"
 fi
 
 note "3. clone Ledge's copy of the source BACK OUT + verify HEAD SHA-1"
