@@ -16,6 +16,8 @@ pub struct LedgeConfig {
     pub tls: TlsConfig,
     #[serde(default)]
     pub webhooks: WebhooksConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -177,6 +179,16 @@ pub struct WebhooksConfig {
     pub enabled: bool,
 }
 
+/// Git remote sync configuration. Disabled by default (byte-identical when off:
+/// no engine, the /sync routes return 503, no `git` subprocess is ever spawned).
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct SyncConfig {
+    pub enabled: bool,
+    /// Allowed upstream hosts (empty ⇒ any — dev only; set in prod to gate SSRF).
+    #[serde(default)]
+    pub allowed_upstream_hosts: Vec<String>,
+}
+
 impl QuotaConfig {
     /// Project the manager-relevant durable limits into a [`ledge_workspace::QuotaLimits`]
     /// (Copy). The rate/burst are NOT included — they build the `TenantRateLimiter`
@@ -230,7 +242,8 @@ impl LedgeConfig {
             .set_default("quotas.enabled",                     false).map_err(map_cfg)?
             .set_default("tls.enabled", false).map_err(map_cfg)?
             .set_default("tls.mtls",    false).map_err(map_cfg)?
-            .set_default("webhooks.enabled", false).map_err(map_cfg)?;
+            .set_default("webhooks.enabled", false).map_err(map_cfg)?
+            .set_default("sync.enabled", false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -529,6 +542,24 @@ mod tests {
         )
         .unwrap();
         assert!(LedgeConfig::load(Some(&f.path().to_path_buf())).is_ok());
+    }
+
+    #[test]
+    fn sync_disabled_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let cfg = LedgeConfig::load(None).expect("default config");
+        assert!(!cfg.sync.enabled);
+        assert!(cfg.sync.allowed_upstream_hosts.is_empty());
+    }
+
+    #[test]
+    fn sync_toml_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[sync]\nenabled=true\nallowed_upstream_hosts=[\"github.com\"]").unwrap();
+        let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(cfg.sync.enabled);
+        assert_eq!(cfg.sync.allowed_upstream_hosts, vec!["github.com".to_string()]);
     }
 
     #[test]
