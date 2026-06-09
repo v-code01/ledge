@@ -1,0 +1,25 @@
+
+=== 0. deploy a persistent self-hosted Ledge (sync+auth, named volume, restart) ===
+     healthy after ~1s
+  PASS instance up + healthy on http://localhost:3030 (metrics http://localhost:9091)
+     host source: branch=main HEAD=bf3f7e4ee0859c86acfdc41c08cce1fbd089f1f3
+
+=== 1. Ledge imports its OWN source (POST /sync/import file:///srv/ledge-src) ===
+     imported: workspace=19eae557e1e000000000000000000002 default_branch=main refs=1
+  PASS Ledge ingested its own source (1 refs)
+
+=== 2. (probe) raw git push of the source into Ledge — documents the receive-pack delta limit ===
+     raw push failed (expected — receive-pack is non-delta; sync-import is the delta-safe path):
+       error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500
+       fatal: the remote end hung up unexpectedly
+     [documented limitation, not a harness failure]
+
+=== 3. clone Ledge's copy of the source BACK OUT + verify HEAD SHA-1 ===
+  PASS cloned the source back out of Ledge (http://.../ws/19eae557e1e000000000000000000002)
+     cloned HEAD=bf3f7e4ee0859c86acfdc41c08cce1fbd089f1f3  vs host HEAD=bf3f7e4ee0859c86acfdc41c08cce1fbd089f1f3
+  PASS HEAD SHA-1 byte-identical — Ledge is serving its own source
+  PASS working tree intact (Cargo.toml + ledge-server member present)
+
+=== summary ===
+  PASS=5  FAIL=0
+  Ledge is now self-hosting its source at: http://localhost:3030/ws/19eae557e1e000000000000000000002 (instance left RUNNING; `docker compose -f /Users/vanshverma/ledge/dogfood/docker-compose.yml down` to stop, add -v to wipe the volume)

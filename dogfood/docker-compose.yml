@@ -1,0 +1,36 @@
+# Dogfood: a PERSISTENT, self-hosted Ledge instance that hosts the Ledge source.
+# Named volume + restart:unless-stopped ⇒ survives container/daemon restart + reboot
+# (same SSD — NOT off-machine durable; see dogfood/README.md). Auth + sync ON. The
+# host repo is mounted read-only so Ledge can `file://`-import its own source.
+#
+#   bash dogfood/selfhost.sh     # deploy + import-self + clone-back-verify, leaves it running
+services:
+  ledge:
+    image: ledge:latest
+    restart: unless-stopped
+    command: ["start"]
+    ports:
+      - "3030:3000"   # client (git wire / REST / sync)
+      - "9091:9090"   # metrics/health (plain HTTP)
+    volumes:
+      - ledge-selfhost-data:/var/lib/ledge          # persistent state
+      - ../:/srv/ledge-src:ro                        # the Ledge source repo (read-only)
+    environment:
+      LEDGE__AUTH__ENABLED: "true"
+      LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_60f65c9f1fc03bc2_De4xeFuCPjWQUU5GKkGpuBPJykCo6e7IjlK2X__1HIY"
+      LEDGE__SYNC__ENABLED: "true"
+      # git inside the container runs as uid 10001, but the mounted source repo is
+      # owned by the host user — whitelist it so git's dubious-ownership check allows
+      # the file:// import.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "*"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  ledge-selfhost-data:
