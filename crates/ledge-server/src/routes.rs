@@ -64,6 +64,8 @@ pub struct AppState {
     /// Outbound webhook dispatcher (Some only when [webhooks].enabled). None ⇒
     /// no events emitted + the /webhooks routes report 503.
     pub webhooks: Option<std::sync::Arc<crate::webhook::dispatch::WebhookDispatcher>>,
+    /// Git remote sync engine (Some only when [sync].enabled). None ⇒ /sync routes 503.
+    pub sync: Option<std::sync::Arc<crate::sync::SyncEngine>>,
     /// The node-local distributed-GC driver, when `cluster.enabled`. `POST
     /// /admin/gc` runs THIS via `ClusterGc::run` in cluster mode; `POST
     /// /cluster/gc` fans out and aggregates. `None` single-node ⇒ `/admin/gc`
@@ -435,6 +437,7 @@ mod tenant_git_tests {
             cluster_refs: None,
             cluster_objects: None,
             webhooks: None,
+            sync: None,
             shard_map: None,
             cluster_gc: None,
             auth,

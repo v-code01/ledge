@@ -9,6 +9,7 @@ pub mod quota;
 pub mod routes;
 pub mod rpc_routes;
 pub mod sync;
+pub mod sync_routes;
 pub mod tls;
 pub mod webhook;
 pub mod webhook_routes;
@@ -347,6 +348,8 @@ pub fn build_app(state: AppState) -> Router {
             "/webhooks/{id}",
             axum::routing::delete(webhook_routes::delete),
         )
+        // ── Git remote sync (import upstream) — 503 when [sync] disabled ───────
+        .route("/sync/import", axum::routing::post(sync_routes::import))
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
         // ── Binary control plane (Cap'n Proto, spec §2) ────────────────────
         .route("/rpc", axum::routing::post(rpc_routes::rpc))

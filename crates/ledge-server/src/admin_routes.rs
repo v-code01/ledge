@@ -166,6 +166,7 @@ mod route_tests {
             cluster_refs: None,
             cluster_objects: None,
             webhooks: None,
+            sync: None,
             shard_map: None,
             cluster_gc: None,
             auth: crate::auth::AuthCtx::disabled(),

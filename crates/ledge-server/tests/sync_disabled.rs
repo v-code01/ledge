@@ -1,6 +1,7 @@
-//! Webhooks-disabled invariant: with `AppState.webhooks == None` the tenant-scoped
-//! `/webhooks` CRUD routes are mounted but fail closed with 503. Mirrors the
-//! auth-disabled single-node `AppState` literal used by `tests/integration.rs`.
+//! Sync-disabled invariant: with `AppState.sync == None` the `POST /sync/import`
+//! route is mounted but fails closed with 503. Mirrors the auth-disabled,
+//! webhooks-disabled single-node `AppState` literal used by `tests/integration.rs`
+//! and `tests/webhooks_disabled.rs`.
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -13,7 +14,7 @@ use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_server::{build_app, AppState};
 
-/// Build a single-node, auth-disabled, webhooks-disabled app router.
+/// Build a single-node, auth-disabled, webhooks-disabled, sync-disabled app router.
 fn disabled_app() -> (axum::Router, TempDir) {
     let data_dir = TempDir::new().unwrap();
     let hlc = Arc::new(HLC::new());
@@ -41,41 +42,25 @@ fn disabled_app() -> (axum::Router, TempDir) {
         cluster_refs: None,
         cluster_objects: None,
         webhooks: None,
-        sync: None,
         shard_map: None,
         cluster_gc: None,
         auth: ledge_server::auth::AuthCtx::disabled(),
         quota: ledge_server::quota::QuotaCtx::disabled(),
+        sync: None,
     };
     (build_app(state), data_dir)
 }
 
 #[tokio::test]
-async fn webhooks_disabled_post_returns_503() {
+async fn sync_disabled_returns_503() {
     let (app, _dir) = disabled_app();
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/webhooks")
+                .uri("/sync/import")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"url":"http://x"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn webhooks_disabled_get_returns_503() {
-    let (app, _dir) = disabled_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/webhooks")
-                .body(Body::empty())
+                .body(Body::from(r#"{"upstream_url":"file:///x"}"#))
                 .unwrap(),
         )
         .await

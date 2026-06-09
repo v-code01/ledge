@@ -447,6 +447,23 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // ── Git remote sync (Phase: git-sync) ────────────────────────────────────
+    //    Built only when [sync].enabled. The engine clones an upstream bare mirror
+    //    and ingests it into a fresh workspace, so it needs the CONCRETE node-local
+    //    `Arc<DiskObjectStore>` (`objects`) for git-faithful object writes — NOT the
+    //    `dyn ObjectStore` seam — plus the `dyn RefStore` seam (`refs_dyn`) and the
+    //    workspace manager. `None` (default) ⇒ `POST /sync/import` reports 503.
+    let sync = if cfg.sync.enabled {
+        Some(std::sync::Arc::new(ledge_server::sync::SyncEngine::new(
+            objects.clone(),
+            refs_dyn.clone(),
+            workspaces.clone(),
+            cfg.sync.allowed_upstream_hosts.clone(),
+        )))
+    } else {
+        None
+    };
+
     let app = build_app(AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
         // concrete local stores up-cast in single-node mode (byte-identical to
@@ -467,6 +484,9 @@ async fn main() -> anyhow::Result<()> {
         // Webhooks: built above ([webhooks].enabled ⇒ Some WAL-backed dispatcher,
         // else None ⇒ no events emitted + /webhooks routes report 503).
         webhooks,
+        // Git remote sync engine (built above): Some only when [sync].enabled,
+        // else None ⇒ /sync/import reports 503.
+        sync,
         shard_map,
         cluster_gc,
         // Auth (Phase 4d-1): the ctx assembled above — a real WAL-backed store

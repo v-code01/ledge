@@ -109,6 +109,7 @@ async fn app_with_webhooks(dir: &TempDir) -> (axum::Router, Arc<RefStoreImpl>, S
         cluster_refs: None,
         cluster_objects: None,
         webhooks,
+        sync: None,
         shard_map: None,
         cluster_gc: None,
         auth,
