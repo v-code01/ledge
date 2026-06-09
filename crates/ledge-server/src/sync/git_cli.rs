@@ -147,6 +147,101 @@ pub async fn default_branch(repo: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+use std::io::Write;
+
+/// `git init --bare <dir>`.
+pub async fn init_bare(dir: &std::path::Path) -> Result<()> {
+    run(&["init", "--bare", "--quiet", dir.to_str().unwrap()], std::path::Path::new("/"),
+        Duration::from_secs(30), "init").await.map(|_| ())
+}
+
+/// `git -C <repo> update-ref <refname> <sha1hex>`.
+pub async fn update_ref(repo: &std::path::Path, refname: &str, sha1_hex: &str) -> Result<()> {
+    run(&["-C", repo.to_str().unwrap(), "update-ref", refname, sha1_hex],
+        std::path::Path::new("/"), Duration::from_secs(30), "update-ref").await.map(|_| ())
+}
+
+/// Write a loose git object (zlib of "<type> <len>\0"+content) into <repo>/objects.
+/// Content-addressed ⇒ idempotent if the object already exists.
+pub fn write_loose_object(repo: &std::path::Path, sha1: &[u8; 20], git_type: u8, content: &[u8]) -> Result<()> {
+    let type_name = match git_type {
+        1 => "commit", 2 => "tree", 3 => "blob", 4 => "tag",
+        other => return Err(LedgeError::Corruption(format!("loose: bad type {other}"))),
+    };
+    let mut framed = format!("{type_name} {}\0", content.len()).into_bytes();
+    framed.extend_from_slice(content);
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&framed).map_err(|e| LedgeError::Io(std::io::Error::other(e.to_string())))?;
+    let compressed = enc.finish().map_err(|e| LedgeError::Io(std::io::Error::other(e.to_string())))?;
+    let hex: String = sha1.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = repo.join("objects").join(&hex[0..2]);
+    std::fs::create_dir_all(&dir).map_err(|e| LedgeError::Io(std::io::Error::other(e.to_string())))?;
+    let path = dir.join(&hex[2..]);
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, compressed).map_err(|e| LedgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct PushRef {
+    pub reference: String,
+    pub status: String, // "ok" | "rejected"
+    pub summary: String,
+}
+
+/// `git -C <repo> push [--force] --porcelain <url> <refspecs...>`, parsed per-ref.
+/// A connection/auth failure (no porcelain ref lines + nonzero exit) ⇒ Err; a
+/// per-ref rejection is reported in the returned Vec (status="rejected").
+pub async fn push(repo: &std::path::Path, url: &str, auth: Option<&str>, refspecs: &[String], force: bool) -> Result<Vec<PushRef>> {
+    let full = with_auth(url, auth);
+    let mut args: Vec<String> = vec![
+        "-C".into(), repo.to_str().unwrap().into(), "push".into(), "--porcelain".into(),
+    ];
+    if force {
+        args.push("--force".into());
+    }
+    args.push(full);
+    args.extend(refspecs.iter().cloned());
+    let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = tokio::time::timeout(
+        Duration::from_secs(120),
+        Command::new("git").args(&argref).env("GIT_TERMINAL_PROMPT", "0").output(),
+    )
+    .await
+    .map_err(|_| LedgeError::Unavailable("git push: timed out".into()))?
+    .map_err(|e| LedgeError::Unavailable(format!("git push: spawn: {e}")))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let refs = parse_porcelain_push(&stdout);
+    if refs.is_empty() && !out.status.success() {
+        return Err(err("push", &out.stderr));
+    }
+    Ok(refs)
+}
+
+/// Parse `git push --porcelain` lines: "<flag>\t<src>:<dst>\t<summary>". The "To
+/// <url>" header + "Done" trailer have no single-char flag field and are skipped.
+fn parse_porcelain_push(stdout: &str) -> Vec<PushRef> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let mut it = line.splitn(3, '\t');
+        let Some(flag_field) = it.next() else { continue };
+        let Some(refpair) = it.next() else { continue };
+        let summary = it.next().unwrap_or("");
+        // the flag field must be exactly one char.
+        let mut chars = flag_field.chars();
+        let Some(flag) = chars.next() else { continue };
+        if chars.next().is_some() {
+            continue;
+        }
+        let dst = refpair.split_once(':').map(|(_, d)| d).unwrap_or(refpair);
+        let status = if flag == '!' { "rejected" } else { "ok" };
+        out.push(PushRef { reference: dst.to_string(), status: status.to_string(), summary: summary.to_string() });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +290,46 @@ mod tests {
         assert!(refs.iter().any(|(n, _)| n == "refs/heads/main"), "main ref present");
         assert!(refs.iter().any(|(n, _)| n == "refs/tags/v1"), "tag ref present");
         assert_eq!(default_branch(&dst).await.as_deref(), Some("main"));
+    }
+
+    fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+    /// git blob sha1 = sha1("blob <len>\0" + content).
+    fn git_blob_sha1(content: &[u8]) -> [u8; 20] {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("blob {}\0", content.len()).as_bytes());
+        h.update(content);
+        h.finalize().into()
+    }
+
+    #[tokio::test]
+    async fn loose_object_then_git_reads_it() {
+        let repo = tempfile::TempDir::new().unwrap();
+        init_bare(repo.path()).await.unwrap();
+        let content = b"hi\n";
+        let sha = git_blob_sha1(content);
+        write_loose_object(repo.path(), &sha, 3, content).unwrap();
+        let out = Cmd::new("git").args(["cat-file", "-p", &hex(&sha)]).current_dir(repo.path())
+            .output().await.unwrap();
+        assert!(out.status.success(), "cat-file: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, content);
+    }
+
+    #[tokio::test]
+    async fn push_reports_accept() {
+        let upstream = tempfile::TempDir::new().unwrap();
+        run(&["init", "--bare", upstream.path().to_str().unwrap()], std::path::Path::new("/")).await;
+        let src = tempfile::TempDir::new().unwrap();
+        run(&["init", "--initial-branch=main", "."], src.path()).await;
+        run(&["config", "user.email", "t@l"], src.path()).await;
+        run(&["config", "user.name", "t"], src.path()).await;
+        std::fs::write(src.path().join("f"), b"x").unwrap();
+        run(&["add", "f"], src.path()).await;
+        run(&["commit", "-m", "c"], src.path()).await;
+        let url = format!("file://{}", upstream.path().display());
+        let res = push(src.path(), &url, None, &["refs/heads/main:refs/heads/main".to_string()], false).await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].reference, "refs/heads/main");
+        assert_eq!(res[0].status, "ok", "summary={}", res[0].summary);
     }
 }

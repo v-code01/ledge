@@ -45,6 +45,7 @@ serde_json.workspace        = true
 thiserror.workspace         = true
 anyhow.workspace            = true
 blake3.workspace            = true
+flate2.workspace            = true
 rand.workspace              = true
 crc32fast.workspace         = true
 base64                      = "0.22"
@@ -57,5 +58,6 @@ rustls-pemfile = { workspace = true }
 tokio    = { workspace = true, features = ["full", "test-util"] }
 reqwest  = { version = "0.12", features = ["json"] }
 capnp.workspace = true
+sha1.workspace = true
 metrics-util = "0.19"
 rcgen = { workspace = true }
