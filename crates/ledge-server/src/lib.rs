@@ -8,6 +8,7 @@ pub mod object_routes;
 pub mod quota;
 pub mod routes;
 pub mod rpc_routes;
+pub mod sync;
 pub mod tls;
 pub mod webhook;
 pub mod webhook_routes;
