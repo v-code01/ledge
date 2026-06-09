@@ -38,6 +38,17 @@ enabled = false
 [webhooks]
 enabled = false
 
+# ── Git remote sync — IMPORT (on-demand) ─────────────────────────────────────
+# Disabled by default. When enabled, tenants POST /sync/import {upstream_url} to
+# clone an upstream git repo into a fresh workspace (import-only today; export /
+# push-back is a follow-on). Requires the `git` binary on PATH (included in the
+# container image). SSRF caveat: upstream URLs are caller-controlled — set
+# allowed_upstream_hosts for untrusted multi-tenant deployments. See README
+# "Git remote sync (import)".
+[sync]
+enabled = false
+# allowed_upstream_hosts = ["github.com"]
+
 # ── Per-tenant quotas (Phase 4d-3) ───────────────────────────────────────────
 # Disabled by default; root tenant is always exempt. None = unlimited.
 [quotas]

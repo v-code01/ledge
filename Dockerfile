@@ -29,10 +29,11 @@ RUN cargo build --release -p ledge-server
 # ---- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates: TLS hygiene. curl: container HEALTHCHECK.
+# ca-certificates: TLS hygiene. curl: container HEALTHCHECK. git: the [sync]
+# import feature shells out to the git binary to clone upstream repos.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 ledge \
     && useradd --uid 10001 --gid 10001 --home-dir /var/lib/ledge --shell /usr/sbin/nologin ledge \

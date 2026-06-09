@@ -214,6 +214,54 @@ registration.
 - **Only `ref.committed` is emitted today** (other event kinds are reserved in the
   type but not yet produced).
 
+## Git remote sync (import)
+
+On-demand IMPORT pulls an upstream git repo into a fresh Ledge workspace,
+preserving canonical git SHA-1s (a re-clone of the workspace produces commits
+byte-identical to the upstream's). It is **disabled by default** and requires the
+`git` binary on `PATH` — the container image ships it.
+
+Enable it in config:
+
+```toml
+[sync]
+enabled = true
+# allowed_upstream_hosts = ["github.com"]   # SSRF allow-list; omit ⇒ any host
+```
+
+Import an upstream, then clone the resulting workspace from Ledge:
+
+```bash
+# POST returns 201 {workspace_id, default_branch, refs:[{name,target_sha1}, …]}
+curl -X POST http://<host>:3000/sync/import \
+  -H "content-type: application/json" \
+  -d '{"upstream_url":"https://github.com/owner/repo.git"}'
+# → {"workspace_id":"<id>","default_branch":"main","refs":[…]}
+
+git clone http://<host>:3000/ws/<workspace_id>
+```
+
+Optional fields: `upstream_auth` (a credential for private upstreams) and
+`ttl_seconds` (overrides the workspace TTL). For GitHub over HTTPS, pass a PAT as
+`x-access-token:<PAT>`:
+
+```bash
+curl -X POST http://<host>:3000/sync/import \
+  -H "content-type: application/json" \
+  -d '{"upstream_url":"https://github.com/owner/private.git","upstream_auth":"x-access-token:<PAT>"}'
+```
+
+**Caveats.**
+- **Import-only.** Export / push-back (Ledge → upstream) is a follow-on; today the
+  flow is upstream → Ledge workspace only.
+- **On-demand only.** Each `POST /sync/import` is a one-shot clone into a new
+  workspace; there is no scheduled / continuous mirror.
+- **SSRF.** `upstream_url` is caller-controlled and the import shells out to `git`.
+  For untrusted multi-tenant deployments set `allowed_upstream_hosts` (empty ⇒ any
+  host is permitted). Tokens are only meaningful over `https://` URLs.
+- Returns **503** when `[sync].enabled` is false and **502** when the upstream
+  clone/ingest fails (e.g. bad URL, auth, or unreachable host).
+
 ## Honest limitations
 
 - **systemd unit is authored but not machine-verified here** (built on macOS, no
