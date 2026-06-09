@@ -45,6 +45,10 @@ pub trait Sha1Provider: Send + Sync {
     /// Used by the fetch path to resolve child SHA-1s found while walking a
     /// commit's reachable object graph (commit → tree → blob).
     async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId>;
+
+    /// Fetch a stored object's (git_type, content) by its git SHA-1 — for resolving
+    /// thin-pack REF_DELTA bases. None if absent.
+    async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)>;
 }
 
 /// Bridge `DiskObjectStore` to the `Sha1Provider` trait.
@@ -69,6 +73,12 @@ impl Sha1Provider for DiskObjectStore {
     }
     async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId> {
         self.sha1_index().await.unwrap_or_default()
+    }
+    async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
+        let id = *Sha1Provider::sha1_index(self).await.get(sha1)?;
+        let ty = Sha1Provider::git_type_of(self, id).await?;
+        let content = ledge_core::ObjectStore::read(self, id).await.ok()?;
+        Some((ty, content.to_vec()))
     }
 }
 
@@ -473,6 +483,18 @@ mod tests {
                 .iter()
                 .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
                 .collect()
+        }
+        async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
+            let blake = *self
+                .sha1s
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, s)| *s == sha1)
+                .map(|(b, _)| b)?;
+            let content = self.objects.lock().unwrap().get(&blake).cloned()?;
+            let ty = self.types.lock().unwrap().get(&blake).copied()?;
+            Some((ty, content.to_vec()))
         }
     }
     #[async_trait]

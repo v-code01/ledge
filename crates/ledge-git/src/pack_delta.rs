@@ -1,9 +1,8 @@
 //! Git packfile delta decoding: the two varint encodings + the copy/insert delta
 //! applier. Pure + bounds-checked (never panics on malformed input).
-// Task 1 of delta-capable receive-pack: these primitives are consumed by the
-// pack-resolving decoder in Task 2; until then they are exercised only by the
-// in-module tests, so silence the not-yet-wired-in dead-code lint.
-#![allow(dead_code)]
+//!
+//! Consumed by the pack-resolving decoder in `push.rs` (`decode_pack_objects`)
+//! to reconstruct OFS_DELTA / REF_DELTA objects.
 use ledge_core::{LedgeError, Result};
 
 const MAX_OBJECT_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB delta-bomb guard

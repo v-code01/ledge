@@ -6,18 +6,17 @@
 //   handle_receive_pack_discovery — produce the git smart-HTTP discovery response
 //   handle_receive_pack   — process a pushed packfile and update refs
 //
-// Pack decode is implemented inline (manual) to avoid gix-pack API churn at
-// Phase 1.  Only non-delta objects (types 1–4) are handled; deltas return
-// LedgeError::Corruption.
+// Pack decode is implemented inline (manual) to avoid gix-pack API churn.
+// All four base object types plus OFS_DELTA / REF_DELTA are resolved; thin-pack
+// REF_DELTA bases are looked up in the object store.
 
 use crate::pkt_line::{decode_line, encode, encode_flush, PktLine};
 use bytes::Bytes;
-use flate2::read::ZlibDecoder;
 use ledge_core::{LedgeError, ObjectId, RefName, RefStore};
-use std::io::Read;
 use std::sync::Arc;
 
 use crate::fetch::Sha1Provider;
+use crate::pack_delta::{apply_delta, read_ofs_varint};
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -240,7 +239,7 @@ pub async fn handle_receive_pack(
 
     let pack_bytes = cursor;
     if !pack_bytes.is_empty() {
-        let decoded = decode_pack_objects(pack_bytes)?;
+        let decoded = decode_pack_objects(pack_bytes, sha1_store).await?;
         for (kind_byte, content) in decoded {
             // Compute the canonical git SHA-1 over "<type> <size>\0<content>".
             let type_name = git_type_name(kind_byte);
@@ -398,120 +397,172 @@ async fn resolve_sha1_to_obj_id(
     None
 }
 
-// ── Manual pack decoder ──────────────────────────────────────────────────────
+// ── Manual pack decoder (delta-resolving) ─────────────────────────────────────
 
-/// Decode a git packfile into a list of `(type_byte, decompressed_content)` pairs.
+/// How a pack object refers to its delta base (or that it is itself a base).
+enum BaseRef {
+    /// A plain (non-delta) object: types 1=commit, 2=tree, 3=blob, 4=tag.
+    Base,
+    /// OFS_DELTA: base is the object at `pack_offset - off`.
+    Ofs(u64),
+    /// REF_DELTA: base is the object whose git SHA-1 is `[u8; 20]` (in-pack or,
+    /// for thin packs, resolved from the store).
+    Ref([u8; 20]),
+}
+
+/// Parse the object header at `data[0..]`: (type_bits, uncompressed_size,
+/// header_len, base_ref).
 ///
-/// Only non-delta object types are supported (1=commit, 2=tree, 3=blob,
-/// 4=tag).  Delta objects (types 6 and 7) return `LedgeError::Corruption`.
+/// Encoding (git pack-format): the first byte's low 4 bits + MSB-continuation
+/// bytes encode the uncompressed size; bits 6-4 of the first byte are the type.
+/// OFS_DELTA (6) appends a base-offset varint; REF_DELTA (7) appends a 20-byte
+/// base SHA-1. Never panics on malformed input — all reads are bounds-checked.
+fn parse_pack_object_header(data: &[u8]) -> ledge_core::Result<(u8, usize, usize, BaseRef)> {
+    let first = *data
+        .first()
+        .ok_or_else(|| LedgeError::Corruption("pack header: empty".into()))?;
+    let type_bits = (first >> 4) & 0x07;
+    let mut size = (first & 0x0F) as usize;
+    let mut shift = 4u32;
+    let mut i = 1usize;
+    let mut b = first;
+    while b & 0x80 != 0 {
+        b = *data
+            .get(i)
+            .ok_or_else(|| LedgeError::Corruption("pack header: truncated size".into()))?;
+        size |= ((b & 0x7f) as usize)
+            .checked_shl(shift)
+            .ok_or_else(|| LedgeError::Corruption("pack header: size overflow".into()))?;
+        shift += 7;
+        i += 1;
+    }
+    let (base_ref, hdr_len) = match type_bits {
+        1..=4 => (BaseRef::Base, i),
+        6 => {
+            let (off, next) = read_ofs_varint(data, i)?;
+            (BaseRef::Ofs(off), next)
+        }
+        7 => {
+            let end = i
+                .checked_add(20)
+                .ok_or_else(|| LedgeError::Corruption("pack header: ref base overflow".into()))?;
+            let sha: [u8; 20] = data
+                .get(i..end)
+                .ok_or_else(|| LedgeError::Corruption("pack header: truncated ref base".into()))?
+                .try_into()
+                .map_err(|_| LedgeError::Corruption("pack header: ref base len".into()))?;
+            (BaseRef::Ref(sha), end)
+        }
+        other => {
+            return Err(LedgeError::Corruption(format!(
+                "unknown pack object type: {other}"
+            )))
+        }
+    };
+    Ok((type_bits, size, hdr_len, base_ref))
+}
+
+/// Decode a packfile into resolved `(git_type, content)` objects.
+///
+/// Resolves OFS_DELTA (base by pack offset) and REF_DELTA (base in-pack or, for
+/// thin packs, fetched from `store` by git SHA-1). Objects are parsed in a first
+/// pass, then resolved in pack order; git emits bases before their deltas, so a
+/// single forward pass suffices. Never panics on malformed input.
 ///
 /// Pack format (v2):
 /// ```text
 /// magic:   "PACK"            4 bytes
 /// version: 2 (BE u32)        4 bytes
 /// count:   num objects (BE)  4 bytes
-/// [per object]
-///   type-size varint         1+ bytes
-///   zlib-compressed content  variable
+/// [per object] type-size varint [+ base ref] then zlib-compressed payload
 /// checksum: SHA-1            20 bytes
 /// ```
-fn decode_pack_objects(pack: &[u8]) -> ledge_core::Result<Vec<(u8, Vec<u8>)>> {
-    if pack.len() < 12 {
-        return Err(LedgeError::Corruption(format!(
-            "pack too short: {} bytes",
-            pack.len()
-        )));
+async fn decode_pack_objects(
+    pack: &[u8],
+    store: &dyn Sha1Provider,
+) -> ledge_core::Result<Vec<(u8, Vec<u8>)>> {
+    if pack.len() < 12 || &pack[..4] != b"PACK" {
+        return Err(LedgeError::Corruption("pack: bad header".into()));
     }
-    if &pack[..4] != b"PACK" {
-        return Err(LedgeError::Corruption(
-            "pack: missing PACK magic".to_string(),
-        ));
-    }
-    let _version = u32::from_be_bytes(pack[4..8].try_into().unwrap());
     let num_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
 
-    let mut pos = 12usize;
-    let mut objects = Vec::with_capacity(num_objects);
-
-    for obj_idx in 0..num_objects {
-        if pos >= pack.len() {
-            return Err(LedgeError::Corruption(format!(
-                "pack: unexpected end at object {}",
-                obj_idx
-            )));
-        }
-        let (type_byte, _size, header_len) = parse_pack_object_header(&pack[pos..])?;
-        pos += header_len;
-
-        // Zlib-inflate the object content.
-        let compressed = &pack[pos..];
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| LedgeError::Corruption(format!("pack: zlib inflate error: {}", e)))?;
-        let consumed = decoder.total_in() as usize;
-        pos += consumed;
-
-        objects.push((type_byte, decompressed));
+    enum Parsed {
+        Base(u8, Vec<u8>),
+        Ofs(u64, Vec<u8>),
+        Ref([u8; 20], Vec<u8>),
     }
-
-    Ok(objects)
-}
-
-/// Parse the type-size varint header of a single pack object.
-///
-/// Returns `(type_byte, decompressed_size, header_byte_count)`.
-///
-/// Encoding (from git pack-format spec):
-/// ```text
-/// byte 0: [MSB | type[2] | type[1] | type[0] | size[3] | size[2] | size[1] | size[0]]
-///           bit7   bit6     bit5      bit4       bit3      bit2      bit1      bit0
-/// subsequent bytes (while previous byte has MSB set):
-///           [MSB | size[6:0]]
-/// ```
-fn parse_pack_object_header(data: &[u8]) -> ledge_core::Result<(u8, usize, usize)> {
-    if data.is_empty() {
-        return Err(LedgeError::Corruption(
-            "pack object header: empty slice".into(),
+    let mut parsed: Vec<(usize, Parsed)> = Vec::with_capacity(num_objects);
+    let mut offset_to_index: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(num_objects);
+    let mut pos = 12usize;
+    for idx in 0..num_objects {
+        let start = pos;
+        let slice = pack
+            .get(pos..)
+            .ok_or_else(|| LedgeError::Corruption(format!("pack: short at obj {idx}")))?;
+        let (type_bits, _size, hdr_len, base_ref) = parse_pack_object_header(slice)?;
+        pos += hdr_len;
+        let compressed = pack
+            .get(pos..)
+            .ok_or_else(|| LedgeError::Corruption(format!("pack: short payload obj {idx}")))?;
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut payload)
+            .map_err(|e| LedgeError::Corruption(format!("pack: inflate obj {idx}: {e}")))?;
+        pos += decoder.total_in() as usize;
+        offset_to_index.insert(start, idx);
+        parsed.push((
+            start,
+            match base_ref {
+                BaseRef::Base => Parsed::Base(type_bits, payload),
+                BaseRef::Ofs(off) => Parsed::Ofs(off, payload),
+                BaseRef::Ref(sha) => Parsed::Ref(sha, payload),
+            },
         ));
     }
-    let first = data[0];
-    let type_bits = (first >> 4) & 0x07;
 
-    match type_bits {
-        1..=4 => {} // commit, tree, blob, tag — all supported
-        6 | 7 => {
-            return Err(LedgeError::Corruption(
-                "delta objects not supported in Phase 1".to_string(),
-            ))
-        }
-        _ => {
-            return Err(LedgeError::Corruption(format!(
-                "unknown pack object type: {}",
-                type_bits
-            )))
-        }
+    let mut resolved: Vec<Option<(u8, Vec<u8>)>> = vec![None; num_objects];
+    let mut sha1_to_idx: std::collections::HashMap<[u8; 20], usize> =
+        std::collections::HashMap::new();
+    for idx in 0..num_objects {
+        let start = parsed[idx].0;
+        let (ty, content) = match &parsed[idx].1 {
+            Parsed::Base(t, c) => (*t, c.clone()),
+            Parsed::Ofs(off, delta) => {
+                let base_off = start
+                    .checked_sub(*off as usize)
+                    .ok_or_else(|| LedgeError::Corruption("pack: ofs underflow".into()))?;
+                let bidx = *offset_to_index
+                    .get(&base_off)
+                    .ok_or_else(|| LedgeError::Corruption("pack: ofs base missing".into()))?;
+                let (bt, bc) = resolved[bidx]
+                    .clone()
+                    .ok_or_else(|| LedgeError::Corruption("pack: ofs base unresolved".into()))?;
+                (bt, apply_delta(&bc, delta)?)
+            }
+            Parsed::Ref(sha, delta) => {
+                let (bt, bc) = if let Some(bidx) = sha1_to_idx.get(sha) {
+                    resolved[*bidx]
+                        .clone()
+                        .ok_or_else(|| LedgeError::Corruption("pack: ref base unresolved".into()))?
+                } else {
+                    store.read_git_object_by_sha1(sha).await.ok_or_else(|| {
+                        LedgeError::Corruption("pack: ref base not in pack or store".into())
+                    })?
+                };
+                (bt, apply_delta(&bc, delta)?)
+            }
+        };
+        let name = git_type_name(ty);
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("{name} {}\0", content.len()).as_bytes());
+        h.update(&content);
+        let sha: [u8; 20] = h.finalize().into();
+        sha1_to_idx.insert(sha, idx);
+        resolved[idx] = Some((ty, content));
     }
-
-    // Low 4 bits of the first byte are the low 4 bits of the object size.
-    let mut size = (first & 0x0F) as usize;
-    let mut shift = 4usize;
-    let mut i = 1usize;
-
-    // Continue reading size bytes while the MSB of the previous byte is set.
-    while (data[i - 1] & 0x80) != 0 {
-        if i >= data.len() {
-            return Err(LedgeError::Corruption(
-                "pack object header: truncated varint".into(),
-            ));
-        }
-        size |= ((data[i] & 0x7F) as usize) << shift;
-        shift += 7;
-        i += 1;
-    }
-
-    Ok((type_bits, size, i))
+    Ok(resolved.into_iter().map(|o| o.unwrap()).collect())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -567,6 +618,29 @@ mod tests {
                 .iter()
                 .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
                 .collect()
+        }
+        async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
+            // The receive-pack handler persists objects by BLAKE3 + git type but
+            // does not populate the `sha1s` map, so recompute each stored object's
+            // canonical git SHA-1 (`"<type> <len>\0" + content`) and match.
+            use sha1::{Digest, Sha1};
+            let objects = self.objects.lock().unwrap();
+            let types = self.types.lock().unwrap();
+            for (blake, content) in objects.iter() {
+                let ty = match types.get(blake) {
+                    Some(t) => *t,
+                    None => continue,
+                };
+                let name = git_type_name(ty);
+                let mut h = Sha1::new();
+                h.update(format!("{name} {}\0", content.len()).as_bytes());
+                h.update(content);
+                let got: [u8; 20] = h.finalize().into();
+                if &got == sha1 {
+                    return Some((ty, content.to_vec()));
+                }
+            }
+            None
         }
     }
     #[async_trait]
@@ -937,6 +1011,70 @@ mod tests {
     // RefStore::update with expected=None must return Conflict because the
     // current implementation rejects create when a ref is already present.
     // This is the canonical Phase 1 ng path.
+
+    #[tokio::test]
+    async fn decode_resolves_real_delta_pack() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = |args: &[&str]| {
+            let o = std::process::Command::new("git").args(args).current_dir(dir.path())
+                .env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            o
+        };
+        g(&["init", "--initial-branch=main", "."]);
+        g(&["config", "user.email", "t@l"]);
+        g(&["config", "user.name", "t"]);
+        let big: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("f.txt"), &big).unwrap();
+        g(&["add", "."]); g(&["commit", "-m", "c1"]);
+        std::fs::write(dir.path().join("f.txt"), big.replace("line 5\n", "LINE FIVE\n")).unwrap();
+        g(&["add", "."]); g(&["commit", "-m", "c2"]);
+        g(&["repack", "-ad", "-f", "--window=50", "--depth=50"]);
+        let rev = std::process::Command::new("git").args(["rev-list", "--objects", "--all"])
+            .current_dir(dir.path()).output().unwrap();
+        let pack = {
+            use std::io::Write;
+            let mut c = std::process::Command::new("git")
+                .args(["pack-objects", "--stdout", "--delta-base-offset"])
+                .current_dir(dir.path())
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            c.stdin.take().unwrap().write_all(&rev.stdout).unwrap();
+            c.wait_with_output().unwrap().stdout
+        };
+        // Guarantee the pack actually contains a delta (else the path isn't exercised).
+        let pf = dir.path().join("p.pack");
+        std::fs::write(&pf, &pack).unwrap();
+        let _ = std::process::Command::new("git").args(["index-pack", pf.to_str().unwrap()])
+            .current_dir(dir.path()).output().unwrap();
+        let idx = pf.with_extension("idx");
+        let vp = std::process::Command::new("git").args(["verify-pack", "-v", idx.to_str().unwrap()])
+            .current_dir(dir.path()).output().unwrap();
+        assert!(String::from_utf8_lossy(&vp.stdout).contains("delta"),
+            "test pack must contain a delta to exercise the path");
+
+        let store = MemObjectStore::new();
+        let decoded = decode_pack_objects(&pack, store.as_ref()).await.unwrap();
+        assert!(!decoded.is_empty());
+        for (ty, content) in &decoded {
+            let name = git_type_name(*ty);
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(format!("{name} {}\0", content.len()).as_bytes());
+            h.update(content);
+            let sha: [u8; 20] = h.finalize().into();
+            let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            // Compare RAW object bytes (`cat-file <type>`), not the `-p`
+            // pretty-printed form: `-p` reformats trees/commits, so it would not
+            // byte-match the reconstructed canonical content. That the computed
+            // SHA-1 (over our reconstructed bytes) is one git knows already
+            // proves the delta resolved correctly.
+            let cat = std::process::Command::new("git").args(["cat-file", name, &hex])
+                .current_dir(dir.path()).output().unwrap();
+            assert!(cat.status.success(), "git knows object {hex}");
+            assert_eq!(cat.stdout, *content, "content matches for {hex}");
+        }
+    }
 
     #[tokio::test]
     async fn receive_pack_reports_ng_on_create_conflict() {
