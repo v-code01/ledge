@@ -221,6 +221,25 @@ pub fn set_webhooks_registered(n: f64) {
     metrics::gauge!(WEBHOOKS_REGISTERED).set(n);
 }
 
+// ── Git-Sync metrics (Phase: remote sync) ────────────────────────────────────
+//    Cover the IMPORT/EXPORT orchestration: outcome count (labelled by op +
+//    result), end-to-end wall time per op, and the number of git objects moved.
+//    No url/auth/tenant labels — never leak the upstream URL or credentials onto
+//    the metrics surface. ───────────────────────────────────────────────────────
+pub const SYNC_TOTAL: &str = "ledge_sync_total";
+pub const SYNC_DURATION: &str = "ledge_sync_duration_seconds";
+pub const SYNC_OBJECTS_TOTAL: &str = "ledge_sync_objects_total";
+/// op ∈ import|export, result ∈ ok|failed.
+pub fn record_sync(op: &'static str, result: &'static str) {
+    metrics::counter!(SYNC_TOTAL, "op" => op, "result" => result).increment(1);
+}
+pub fn record_sync_duration(op: &'static str, d: std::time::Duration) {
+    metrics::histogram!(SYNC_DURATION, "op" => op).record(d.as_secs_f64());
+}
+pub fn record_sync_objects(op: &'static str, n: u64) {
+    metrics::counter!(SYNC_OBJECTS_TOTAL, "op" => op).increment(n);
+}
+
 /// Transport-posture gauges (Phase 4d-4): set ONCE at boot so /metrics reflects
 /// whether TLS / mTLS is active. Zero label cardinality.
 pub const TLS_ENABLED: &str = "ledge_tls_enabled";
@@ -477,6 +496,20 @@ mod tests {
         record_webhook_delivery("failed");
         record_webhook_delivery_duration(std::time::Duration::from_millis(5));
         set_webhooks_registered(3.0);
+    }
+
+    #[test]
+    fn sync_metric_constants_correct() {
+        assert_eq!(SYNC_TOTAL, "ledge_sync_total");
+        assert_eq!(SYNC_DURATION, "ledge_sync_duration_seconds");
+        assert_eq!(SYNC_OBJECTS_TOTAL, "ledge_sync_objects_total");
+    }
+    #[test]
+    fn sync_record_helpers_no_panic_without_recorder() {
+        record_sync("import", "ok");
+        record_sync("import", "failed");
+        record_sync_duration("import", std::time::Duration::from_millis(5));
+        record_sync_objects("import", 42);
     }
 
     #[test]
