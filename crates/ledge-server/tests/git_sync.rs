@@ -244,3 +244,138 @@ async fn bad_upstream_is_clean_error() {
         .unwrap();
     assert!(h.status().is_success(), "server healthy after bad import");
 }
+
+/// Build a clean bare upstream with exactly one commit on `main`, returning its
+/// `file://` URL plus that commit's SHA-1 — the canonical anchor the export
+/// round-trip is measured against. Mirrors the import-test upstream builder but
+/// keeps only the single-commit-on-main shape the export proof needs.
+async fn make_local_upstream() -> (String, String) {
+    let work = TempDir::new().unwrap();
+    assert_git_ok(
+        &git(&["init", "--initial-branch=main", "."], work.path()).await,
+        "git init upstream",
+    );
+    assert_git_ok(
+        &git(&["config", "user.email", "t@l"], work.path()).await,
+        "config email",
+    );
+    assert_git_ok(
+        &git(&["config", "user.name", "t"], work.path()).await,
+        "config name",
+    );
+    std::fs::write(work.path().join("a.txt"), b"payload\n").unwrap();
+    assert_git_ok(&git(&["add", "a.txt"], work.path()).await, "git add");
+    assert_git_ok(&git(&["commit", "-m", "c1"], work.path()).await, "git commit");
+    let main_sha = String::from_utf8(git(&["rev-parse", "main"], work.path()).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Bare-mirror it so the upstream URL points at a clean bare repo. The
+    // `TempDir` for `work` drops here, but `bare` is leaked via `keep`
+    // (kept on disk for the test process lifetime — these are tiny + ephemeral).
+    let bare = TempDir::new().unwrap();
+    assert_git_ok(
+        &git(
+            &[
+                "clone",
+                "--bare",
+                work.path().to_str().unwrap(),
+                bare.path().to_str().unwrap(),
+            ],
+            Path::new("/"),
+        )
+        .await,
+        "git clone --bare upstream",
+    );
+    let url = format!("file://{}", bare.path().display());
+    let _ = bare.keep();
+    (url, main_sha)
+}
+
+/// THE bidirectional-fidelity proof: import upstream A over HTTP into a fresh
+/// workspace, then `POST /workspaces/{id}/sync/push` it to a *different* empty
+/// bare upstream B, and assert a clone of B carries the SAME commit SHA-1 as A.
+/// A → Ledge → B is byte-for-byte SHA-1-faithful end to end over real HTTP.
+#[tokio::test]
+async fn import_then_export_roundtrips_over_http() {
+    let (base, _dir) = start_server_with_sync().await;
+    let (url_a, main_a) = make_local_upstream().await;
+    let client = reqwest::Client::new();
+    let imp: serde_json::Value = client
+        .post(format!("{base}/sync/import"))
+        .json(&serde_json::json!({"upstream_url": url_a}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws = imp["workspace_id"].as_str().unwrap().to_string();
+
+    let bare_b = tempfile::TempDir::new().unwrap();
+    git(
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            bare_b.path().to_str().unwrap(),
+        ],
+        std::path::Path::new("/"),
+    )
+    .await;
+    let url_b = format!("file://{}", bare_b.path().display());
+    let resp = client
+        .post(format!("{base}/workspaces/{ws}/sync/push"))
+        .json(&serde_json::json!({"upstream_url": url_b}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "push status; body={:?}",
+        resp.text().await
+    );
+
+    let out = tempfile::TempDir::new().unwrap();
+    let g = git(
+        &["clone", "--quiet", &url_b, out.path().to_str().unwrap()],
+        std::path::Path::new("/"),
+    )
+    .await;
+    assert!(
+        g.status.success(),
+        "clone B: {}",
+        String::from_utf8_lossy(&g.stderr)
+    );
+    let got = String::from_utf8(git(&["rev-parse", "main"], out.path()).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        got, main_a,
+        "A → import → export → B preserves the commit SHA-1"
+    );
+}
+
+/// Pushing a workspace that does not belong to the caller's tenant must 404 —
+/// the engine's ownership check (`LedgeError::NotFound`) is surfaced verbatim,
+/// and no upstream I/O is attempted (so it never registers as a sync failure).
+#[tokio::test]
+async fn push_foreign_workspace_404() {
+    let (base, _dir) = start_server_with_sync().await;
+    let bare_b = tempfile::TempDir::new().unwrap();
+    git(
+        &["init", "--bare", bare_b.path().to_str().unwrap()],
+        std::path::Path::new("/"),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/workspaces/{}/sync/push", "0".repeat(32)))
+        .json(&serde_json::json!({"upstream_url": format!("file://{}", bare_b.path().display())}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

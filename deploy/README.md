@@ -214,12 +214,14 @@ registration.
 - **Only `ref.committed` is emitted today** (other event kinds are reserved in the
   type but not yet produced).
 
-## Git remote sync (import)
+## Git remote sync (import + export)
 
-On-demand IMPORT pulls an upstream git repo into a fresh Ledge workspace,
-preserving canonical git SHA-1s (a re-clone of the workspace produces commits
-byte-identical to the upstream's). It is **disabled by default** and requires the
-`git` binary on `PATH` — the container image ships it.
+The bridge is **bidirectional**: IMPORT pulls an upstream git repo into a fresh
+Ledge workspace; EXPORT pushes a workspace's heads back to an upstream. Both
+preserve canonical git SHA-1s — the full `A → import → Ledge → export → B`
+round-trip is byte-for-byte SHA-1-faithful (a clone of B carries the same commit
+SHA-1 as upstream A). It is **disabled by default** and requires the `git` binary
+on `PATH` — the container image ships it.
 
 Enable it in config:
 
@@ -251,16 +253,36 @@ curl -X POST http://<host>:3000/sync/import \
   -d '{"upstream_url":"https://github.com/owner/private.git","upstream_auth":"x-access-token:<PAT>"}'
 ```
 
+Push a workspace's heads back to an upstream (EXPORT):
+
+```bash
+# POST returns 200 {pushed:[{ref,sha1}, …], rejected:[{ref,reason}, …]}
+curl -X POST http://<host>:3000/workspaces/<workspace_id>/sync/push \
+  -H "content-type: application/json" \
+  -d '{"upstream_url":"https://github.com/owner/repo.git"}'
+# → {"pushed":[{"ref":"refs/heads/main","sha1":"<sha1>"}],"rejected":[]}
+```
+
+Optional fields: `upstream_auth` (a credential for private upstreams, same
+`x-access-token:<PAT>` form as import), `refs` (a subset of workspace heads to
+push; all heads when omitted), and `force` (default `false`). A push that would
+**not fast-forward** the upstream is **rejected** — it lands in the `rejected`
+array (HTTP is still **200**) rather than clobbering the remote — unless
+`force:true` is set. Pushing a workspace the caller's tenant does not own returns
+**404**.
+
 **Caveats.**
-- **Import-only.** Export / push-back (Ledge → upstream) is a follow-on; today the
-  flow is upstream → Ledge workspace only.
-- **On-demand only.** Each `POST /sync/import` is a one-shot clone into a new
-  workspace; there is no scheduled / continuous mirror.
+- **Bidirectional, on-demand.** Import a repo, work on it in a workspace, push it
+  back: the round-trip preserves SHA-1s end to end. There is no scheduled /
+  continuous mirror — each import and push is a one-shot operation.
 - **SSRF.** `upstream_url` is caller-controlled and the import shells out to `git`.
   For untrusted multi-tenant deployments set `allowed_upstream_hosts` (empty ⇒ any
   host is permitted). Tokens are only meaningful over `https://` URLs.
 - Returns **503** when `[sync].enabled` is false and **502** when the upstream
-  clone/ingest fails (e.g. bad URL, auth, or unreachable host).
+  clone/ingest/push fails (e.g. bad URL, auth, or unreachable host). A push to a
+  foreign workspace returns **404**.
+- **No LFS / submodules.** Large-file pointers and submodules are not expanded or
+  rewritten on either leg of the bridge.
 
 ## Honest limitations
 

@@ -350,6 +350,11 @@ pub fn build_app(state: AppState) -> Router {
         )
         // ── Git remote sync (import upstream) — 503 when [sync] disabled ───────
         .route("/sync/import", axum::routing::post(sync_routes::import))
+        // ── Git remote sync (export workspace heads upstream) — 503 when disabled ─
+        .route(
+            "/workspaces/{id}/sync/push",
+            axum::routing::post(sync_routes::push),
+        )
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
         // ── Binary control plane (Cap'n Proto, spec §2) ────────────────────
         .route("/rpc", axum::routing::post(rpc_routes::rpc))
