@@ -48,6 +48,25 @@ Step 2 of this script now pushes the full Ledge source straight into the instanc
 `git push http://localhost:3030/ws/<id>/ HEAD:refs/heads/main` is now a first-class path —
 which makes **continuous self-hosting via push** possible.
 
+## Disk footprint (measured, honest)
+
+Same ~2,100-object Ledge source, three ways:
+
+| Representation | Size |
+|---|---|
+| git (delta + zlib, hard repack) | **1.4 MB** |
+| Ledge — **zlib per-object** (current) | **20 MB** |
+| Ledge — raw, uncompressed (before) | 30 MB |
+
+Per-object compression shipped (`DiskObjectStore`, zlib, transparent, zero migration, identity
+unchanged) and cut the store **30 MB → 20 MB (~33%)** — verified end-to-end here (push +
+clone-back stay byte-identical). The honest read: that's a modest down payment. Per-object zlib
+can't dedup *across* similar objects, and this corpus is dominated by many small objects, so the
+ratio is ~1.5×, not the 3–4× a naive estimate suggests. The measurement makes the real picture
+clear — **almost the entire remaining gap (20 MB → 1.4 MB, ~14×) is delta**, i.e. git storing
+diffs between similar object versions. **Delta retention is the dominant remaining lever** (and
+reuses the `apply_delta` already shipped for receive-pack). Compression was cut 1 of 2.
+
 ## Other honest notes
 
 - **Snapshot today, continuous now possible:** the sync-import step holds the source as of the
