@@ -111,6 +111,30 @@ pub async fn admin_snapshot(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// `POST /admin/repack` — deltify cold objects to reclaim disk; returns stats.
+///
+/// Runs the offline [`ledge_object_store::repack::repack`] pass over the
+/// node-local concrete disk store. Each candidate is re-stored as a delta only
+/// if the store's self-verifying `deltify` accepts it, so a repack can never
+/// corrupt or grow the store. Returns 200 with the pass statistics and the
+/// before/after byte ratio.
+pub async fn admin_repack(State(state): State<AppState>) -> Response {
+    match ledge_object_store::repack::repack(&state.objects_disk).await {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "objects_seen": s.objects_seen,
+                "objects_deltified": s.objects_deltified,
+                "bytes_before": s.bytes_before,
+                "bytes_after": s.bytes_after,
+                "ratio": if s.bytes_after > 0 { s.bytes_before as f64 / s.bytes_after as f64 } else { 1.0 },
+            })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +255,37 @@ mod route_tests {
             .unwrap()
             .expect("ref must exist in the snapshot");
         assert_eq!(ref_entry.target, oid, "ref target must survive the snapshot");
+    }
+
+    /// `POST /admin/repack` returns 200 and a JSON body carrying the pass stats.
+    #[tokio::test]
+    async fn repack_endpoint_returns_stats() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+
+        // Seed a couple of objects so the pass has something to enumerate.
+        for i in 0..3u32 {
+            let c = bytes::Bytes::from(format!("repack object {i}"));
+            state.objects_disk.write_git_object(3, c).await.unwrap();
+        }
+
+        let app = crate::build_app(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/repack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(
+            out.get("objects_seen").and_then(|v| v.as_u64()).is_some(),
+            "body must carry objects_seen: {out:?}"
+        );
     }
 }
