@@ -15,11 +15,16 @@ const VERSION: u32 = 1;
 pub struct PackFile {
     pack_path: PathBuf,
     index: HashMap<ObjectId, u64>,
+    sha1_to_id: std::collections::HashMap<[u8; 20], ObjectId>,
 }
 
 impl PackFile {
     pub fn pack_path(&self) -> PathBuf {
         self.pack_path.clone()
+    }
+    /// Preloaded `git SHA-1 (first 20 bytes of each record) → ObjectId` map.
+    pub fn sha1_map(&self) -> &std::collections::HashMap<[u8; 20], ObjectId> {
+        &self.sha1_to_id
     }
     pub fn contains(&self, id: ObjectId) -> bool {
         self.index.contains_key(&id)
@@ -43,21 +48,30 @@ impl PackFile {
             return Err(LedgeError::Corruption("idx: too short".into()));
         }
         let count = u32::from_le_bytes(idx[0..4].try_into().unwrap()) as usize;
+        if (idx.len() - 4) % 60 != 0 {
+            return Err(LedgeError::Corruption("idx: bad entry size".into()));
+        }
         let mut index = HashMap::with_capacity(count);
+        let mut sha1_to_id = HashMap::with_capacity(count);
         let mut p = 4usize;
         for _ in 0..count {
-            if p + 40 > idx.len() {
+            if p + 60 > idx.len() {
                 return Err(LedgeError::Corruption("idx: truncated".into()));
             }
             let mut b = [0u8; 32];
             b.copy_from_slice(&idx[p..p + 32]);
-            let off = u64::from_le_bytes(idx[p + 32..p + 40].try_into().unwrap());
-            index.insert(ObjectId::from_bytes(b), off);
-            p += 40;
+            let id = ObjectId::from_bytes(b);
+            let mut s = [0u8; 20];
+            s.copy_from_slice(&idx[p + 32..p + 52]);
+            let off = u64::from_le_bytes(idx[p + 52..p + 60].try_into().unwrap());
+            index.insert(id, off);
+            sha1_to_id.insert(s, id);
+            p += 60;
         }
         Ok(Self {
             pack_path: pack_path.to_path_buf(),
             index,
+            sha1_to_id,
         })
     }
 
@@ -85,20 +99,27 @@ impl PackWriter {
         let mut pack = Vec::new();
         pack.extend_from_slice(MAGIC);
         pack.extend_from_slice(&VERSION.to_le_bytes());
-        let mut idx_entries: Vec<(ObjectId, u64)> = Vec::with_capacity(objects.len());
+        let mut idx_entries: Vec<(ObjectId, [u8; 20], u64)> = Vec::with_capacity(objects.len());
         for (id, bytes) in &objects {
             let off = pack.len() as u64;
             pack.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             pack.extend_from_slice(bytes);
-            idx_entries.push((*id, off));
+            // First 20 bytes of a record image ARE the git SHA-1 (loose object file).
+            // Records shorter than 20 bytes (malformed) get a zeroed sha1 — no panic.
+            let git_sha1: [u8; 20] = bytes
+                .get(0..20)
+                .map(|s| s.try_into().unwrap())
+                .unwrap_or([0u8; 20]);
+            idx_entries.push((*id, git_sha1, off));
         }
         let name = blake3::hash(&pack).to_hex().to_string();
         let pack_path = pack_dir.join(format!("{name}.pack"));
         let idx_path = pack_dir.join(format!("{name}.idx"));
-        let mut idx = Vec::with_capacity(4 + idx_entries.len() * 40);
+        let mut idx = Vec::with_capacity(4 + idx_entries.len() * 60);
         idx.extend_from_slice(&(idx_entries.len() as u32).to_le_bytes());
-        for (id, off) in &idx_entries {
+        for (id, git_sha1, off) in &idx_entries {
             idx.extend_from_slice(id.as_bytes());
+            idx.extend_from_slice(git_sha1);
             idx.extend_from_slice(&off.to_le_bytes());
         }
         let tmp_pack = pack_dir.join(format!(".{name}.pack.tmp"));
@@ -155,6 +176,21 @@ mod tests {
         std::fs::write(pf.pack_path(), b"garbage").unwrap();
         let reopened = PackFile::open(&pf.pack_path());
         assert!(reopened.is_err() || reopened.unwrap().get(id(1)).is_none(), "no panic on corrupt pack");
+    }
+
+    #[test]
+    fn pack_exposes_sha1_map() {
+        let dir = tempfile::tempdir().unwrap();
+        // a record image: first 20 bytes are the git sha1, then header rest + body
+        let mut rec = vec![0u8; 24];
+        rec[0..20].copy_from_slice(&[9u8; 20]);
+        rec.extend_from_slice(b"body");
+        let oid = ObjectId::from_bytes([3u8; 32]);
+        let pf = PackWriter::write(dir.path(), vec![(oid, rec)]).unwrap();
+        assert_eq!(pf.sha1_map().get(&[9u8; 20]).copied(), Some(oid));
+        let re = PackFile::open(&pf.pack_path()).unwrap();
+        assert_eq!(re.sha1_map().get(&[9u8; 20]).copied(), Some(oid));
+        assert!(re.contains(oid)); // existing id->offset index still works
     }
 
     #[test]
