@@ -1,3 +1,4 @@
+pub mod delta;
 pub mod error;
 pub mod hlc;
 pub mod object_id;
