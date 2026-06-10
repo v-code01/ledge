@@ -197,6 +197,7 @@ pub async fn upload_pack(
         state.refs.clone(),
         state.objects_disk.as_ref(),
         &segment,
+        Some(ledge_git::fetch::global_upload_cache()),
     )
     .await;
     metrics::record_git_request_duration("upload-pack", start.elapsed());
@@ -314,6 +315,7 @@ pub async fn ws_upload_pack(
         state.refs.clone(),
         state.objects_disk.as_ref(),
         &segment,
+        Some(ledge_git::fetch::global_upload_cache()),
     )
     .await;
     metrics::record_git_request_duration("upload-pack", start.elapsed());

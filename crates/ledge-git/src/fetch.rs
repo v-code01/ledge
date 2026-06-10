@@ -332,6 +332,7 @@ pub async fn handle_upload_pack(
     refs: Arc<dyn RefStore>,
     sha1_store: &dyn Sha1Provider,
     segment: &str,
+    cache: Option<&UploadPackCache>,
 ) -> ledge_core::Result<Vec<u8>> {
     // Fetch is resolved by SHA-1 through `sha1_index`, never by ref name, so the
     // workspace segment does not change object selection. The parameter exists
@@ -364,6 +365,16 @@ pub async fn handle_upload_pack(
                 }
             }
             PktLine::Delimiter => {}
+        }
+    }
+
+    // ── Cache lookup: a wanted tip sha uniquely determines its object closure ──
+    // so a hit on (segment, sorted wants) serves identical bytes without re-walking
+    // the graph or re-encoding the pack. A changed repo yields different wants → miss.
+    let cache_key = upload_pack_cache_key(segment, &wanted_sha1s);
+    if let Some(c) = cache {
+        if let Some(bytes) = c.get(&cache_key) {
+            return Ok((*bytes).clone());
         }
     }
 
@@ -429,7 +440,99 @@ pub async fn handle_upload_pack(
     let mut response = Vec::with_capacity(nak.len() + pack.len());
     response.extend_from_slice(&nak);
     response.extend_from_slice(&pack);
+
+    if let Some(c) = cache {
+        c.put(cache_key, std::sync::Arc::new(response.clone()));
+    }
     Ok(response)
+}
+
+/// Bounded LRU cache of encoded upload-pack responses, keyed by a hash of the
+/// (segment, sorted wanted SHA-1s). A wanted tip sha uniquely determines its object
+/// closure, so a cached response is never stale: a changed repo yields different
+/// wants (a miss). Bounded by entry count AND total bytes; evicts least-recently-used.
+pub struct UploadPackCache {
+    inner: std::sync::Mutex<CacheInner>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+struct CacheInner {
+    map: std::collections::HashMap<[u8; 32], std::sync::Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+impl UploadPackCache {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(CacheInner {
+                map: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+                misses: 0,
+            }),
+            max_entries,
+            max_bytes,
+        }
+    }
+    pub fn hits(&self) -> u64 {
+        self.inner.lock().unwrap().hits
+    }
+    pub fn misses(&self) -> u64 {
+        self.inner.lock().unwrap().misses
+    }
+    pub fn get(&self, key: &[u8; 32]) -> Option<std::sync::Arc<Vec<u8>>> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(v) = g.map.get(key).cloned() {
+            g.hits += 1;
+            g.order.retain(|k| k != key);
+            g.order.push_front(*key);
+            Some(v)
+        } else {
+            g.misses += 1;
+            None
+        }
+    }
+    pub fn put(&self, key: [u8; 32], val: std::sync::Arc<Vec<u8>>) {
+        let mut g = self.inner.lock().unwrap();
+        if g.map.contains_key(&key) {
+            return;
+        }
+        g.bytes += val.len();
+        g.map.insert(key, val);
+        g.order.push_front(key);
+        while g.order.len() > self.max_entries || g.bytes > self.max_bytes {
+            match g.order.pop_back() {
+                Some(old) => {
+                    if let Some(v) = g.map.remove(&old) {
+                        g.bytes -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Cache key for a clone request: hash of segment + the sorted wanted SHA-1s.
+pub fn upload_pack_cache_key(segment: &str, wanted_sha1s: &[[u8; 20]]) -> [u8; 32] {
+    let mut sorted = wanted_sha1s.to_vec();
+    sorted.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    h.update(segment.as_bytes());
+    h.update(&[0u8]);
+    for w in &sorted {
+        h.update(w);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Process-global cache the server routes share (a pure content-keyed memoization).
+pub fn global_upload_cache() -> &'static UploadPackCache {
+    static C: std::sync::OnceLock<UploadPackCache> = std::sync::OnceLock::new();
+    C.get_or_init(|| UploadPackCache::new(32, 256 * 1024 * 1024))
 }
 
 #[cfg(test)]
@@ -739,6 +842,7 @@ mod tests {
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
             "",
+            None,
         )
         .await
         .unwrap();
@@ -766,6 +870,7 @@ mod tests {
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
             "workspaces/abc/",
+            None,
         )
         .await
         .unwrap();
@@ -798,6 +903,7 @@ mod tests {
             refs.clone() as Arc<dyn ledge_core::RefStore>,
             objects.as_ref(),
             "",
+            None,
         )
         .await
         .unwrap();
@@ -806,6 +912,65 @@ mod tests {
         assert_eq!(&pd[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(pd[4..8].try_into().unwrap()), 2u32);
         assert_eq!(u32::from_be_bytes(pd[8..12].try_into().unwrap()), 2u32);
+    }
+
+    #[tokio::test]
+    async fn upload_pack_cache_hit_serves_identical_bytes() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x42);
+        let id = objects.seed(Bytes::from(b"cache me".to_vec()), sha1);
+        refs.insert("refs/heads/main", id);
+        let mut req = Vec::new();
+        req.extend_from_slice(&crate::pkt_line::encode(
+            format!("want {}\n", hex::encode(sha1)).as_bytes(),
+        ));
+        req.extend_from_slice(&crate::pkt_line::encode_flush());
+        req.extend_from_slice(&crate::pkt_line::encode(b"done\n"));
+        let body = Bytes::from(req);
+        let store_arc = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs_arc = refs.clone() as Arc<dyn ledge_core::RefStore>;
+        let cache = UploadPackCache::new(8, 64 * 1024 * 1024);
+        let first = handle_upload_pack(
+            body.clone(),
+            store_arc.clone(),
+            refs_arc.clone(),
+            objects.as_ref(),
+            "",
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.misses(), 1);
+        let second = handle_upload_pack(
+            body.clone(),
+            store_arc.clone(),
+            refs_arc.clone(),
+            objects.as_ref(),
+            "",
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.hits(), 1, "second identical request is a cache hit");
+        assert_eq!(first, second, "cached bytes identical to fresh build");
+    }
+
+    #[test]
+    fn cache_evicts_lru_and_keys_by_wantset() {
+        let c = UploadPackCache::new(2, 1 << 30);
+        let k = |n: u8| upload_pack_cache_key("", &[[n; 20]]);
+        c.put(k(1), std::sync::Arc::new(vec![1]));
+        c.put(k(2), std::sync::Arc::new(vec![2]));
+        assert!(c.get(&k(1)).is_some()); // touch 1 (now MRU)
+        c.put(k(3), std::sync::Arc::new(vec![3])); // evicts LRU = 2
+        assert!(c.get(&k(2)).is_none(), "LRU evicted");
+        assert!(c.get(&k(1)).is_some());
+        assert!(c.get(&k(3)).is_some());
+        assert_ne!(
+            upload_pack_cache_key("a", &[[1; 20]]),
+            upload_pack_cache_key("b", &[[1; 20]])
+        );
     }
 
     #[test]
