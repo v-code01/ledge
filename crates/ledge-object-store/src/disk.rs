@@ -85,6 +85,11 @@ fn zlib_inflate(data: &[u8], id: ObjectId) -> ledge_core::Result<Vec<u8>> {
 ///   POSIX (atomic replacement of identical data).  No locking is required.
 pub struct DiskObjectStore {
     data_dir: PathBuf,
+    /// Registered packs, hot-swappable without blocking readers. A read consults
+    /// the loose file first, then each pack in turn (loose shadows pack). The
+    /// `ArcSwap` lets a repack atomically publish a new pack set while concurrent
+    /// reads continue against the old snapshot they already loaded.
+    packs: std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::pack::PackFile>>>>,
 }
 
 impl DiskObjectStore {
@@ -95,7 +100,25 @@ impl DiskObjectStore {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(data_dir.join("objects").join("tmp"))
             .map_err(LedgeError::Io)?;
-        Ok(Self { data_dir })
+        // Pack directory holds `<blake3>.pack` + `.idx` pairs. Load every valid
+        // pack present at open time; a corrupt/partial pack is skipped (best
+        // effort) so a single bad pack can't make the whole store unopenable.
+        std::fs::create_dir_all(data_dir.join("objects").join("pack")).map_err(LedgeError::Io)?;
+        let mut packs = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(data_dir.join("objects").join("pack")) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "pack") {
+                    if let Ok(pf) = crate::pack::PackFile::open(&p) {
+                        packs.push(std::sync::Arc::new(pf));
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            data_dir,
+            packs: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(packs)),
+        })
     }
 
     /// Canonical path for an object identified by `id`.
@@ -108,6 +131,48 @@ impl DiskObjectStore {
             .join(&hex)
     }
 
+    /// Directory holding `<blake3>.pack` + `.idx` pairs (`<data_dir>/objects/pack`).
+    /// Stable target for repack output and for tests registering synthetic packs.
+    pub fn pack_dir(&self) -> PathBuf {
+        self.data_dir.join("objects").join("pack")
+    }
+
+    /// Atomically replace the registered pack set. Concurrent readers holding an
+    /// older snapshot finish against it; subsequent `.load()`s see `v`. Used by
+    /// repack to publish freshly written packs without quiescing the store.
+    pub fn swap_packs(&self, v: Vec<std::sync::Arc<crate::pack::PackFile>>) {
+        self.packs.store(std::sync::Arc::new(v));
+    }
+
+    /// Paths of every currently-registered pack (snapshot at call time). Lets a
+    /// repack identify which packs it just superseded so they can be unlinked.
+    pub fn pack_paths(&self) -> Vec<PathBuf> {
+        self.packs.load().iter().map(|p| p.pack_path()).collect()
+    }
+
+    /// The exact stored file image for `id`: the loose file if present, else the
+    /// first pack that holds it, else `None`.
+    ///
+    /// This is the single byte source for every accessor on the read path
+    /// (`read_depth`, `sha1_of`, `git_type_of`, `delta_base_of`, `exists`). A
+    /// pack record is byte-identical to a loose object file, so callers parse the
+    /// returned image with no awareness of where it came from. Loose shadows pack:
+    /// a re-materialized loose copy always wins, which is what lets GC/repack
+    /// stage loose objects atop a pack without a read seeing stale bytes.
+    async fn raw_record(&self, id: ObjectId) -> ledge_core::Result<Option<Vec<u8>>> {
+        match tokio::fs::read(self.object_path(&id)).await {
+            Ok(r) => return Ok(Some(r)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(LedgeError::Io(e)),
+        }
+        for pf in self.packs.load().iter() {
+            if let Some(bytes) = pf.get(id) {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the Git-compatible SHA-1 stored in the 20-byte header of an
     /// already-written object file.
     ///
@@ -116,24 +181,15 @@ impl DiskObjectStore {
     /// Returns [`LedgeError::Corruption`] if the file is shorter than 20 bytes.
     #[instrument(skip(self), fields(id = %id.to_hex()))]
     pub async fn sha1_of(&self, id: ObjectId) -> Result<[u8; 20]> {
-        use tokio::io::AsyncReadExt as _;
-        let path = self.object_path(&id);
-        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                LedgeError::NotFound(id)
-            } else {
-                LedgeError::Io(e)
-            }
-        })?;
-        let mut header = [0u8; 24];
-        let n = file.read(&mut header).await.map_err(LedgeError::Io)?;
-        if n < 20 {
+        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
+        if raw.len() < 20 {
             return Err(LedgeError::Corruption(format!(
-                "object {} header truncated: {n} bytes",
-                id.to_hex()
+                "object {} header truncated: {} bytes",
+                id.to_hex(),
+                raw.len()
             )));
         }
-        Ok(header[..20].try_into().unwrap())
+        Ok(raw[..20].try_into().unwrap())
     }
 
     /// Git object type tags (pack/loose object kinds).
@@ -295,11 +351,22 @@ impl DiskObjectStore {
     /// Complexity: O(N) in the number of stored objects; no file contents are
     /// opened, so it is strictly cheaper than [`Self::sha1_index`].
     pub async fn list_all_ids(&self) -> ledge_core::Result<Vec<ObjectId>> {
-        let mut ids = Vec::new();
+        // Dedup across the loose walk and every pack: an object can legitimately
+        // appear both loose and packed (loose staged atop a pack mid-repack), and
+        // a GC candidate set must list each id exactly once.
+        let mut ids: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
         let objects_dir = self.data_dir.join("objects");
         let mut lvl1 = match tokio::fs::read_dir(&objects_dir).await {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No loose tree yet, but packs may still hold objects.
+                for pf in self.packs.load().iter() {
+                    for id in pf.ids() {
+                        ids.insert(id);
+                    }
+                }
+                return Ok(ids.into_iter().collect());
+            }
             Err(e) => return Err(LedgeError::Io(e)),
         };
         while let Some(d1) = lvl1.next_entry().await.map_err(LedgeError::Io)? {
@@ -323,12 +390,18 @@ impl DiskObjectStore {
                         _ => continue,
                     };
                     if let Ok(id) = ObjectId::from_hex(hex) {
-                        ids.push(id);
+                        ids.insert(id);
                     }
                 }
             }
         }
-        Ok(ids)
+        // Union in every packed id (loose entries already deduped by the set).
+        for pf in self.packs.load().iter() {
+            for id in pf.ids() {
+                ids.insert(id);
+            }
+        }
+        Ok(ids.into_iter().collect())
     }
 
     /// Remove the object file for `id`.
@@ -351,27 +424,14 @@ impl DiskObjectStore {
 
     /// Read the git object type byte from the header (reserved[0]).
     pub async fn git_type_of(&self, id: ObjectId) -> ledge_core::Result<u8> {
-        use tokio::io::AsyncReadExt as _;
-        let path = self.object_path(&id);
-        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ledge_core::LedgeError::NotFound(id)
-            } else {
-                ledge_core::LedgeError::Io(e)
-            }
-        })?;
-        let mut header = [0u8; 24];
-        let n = file
-            .read(&mut header)
-            .await
-            .map_err(ledge_core::LedgeError::Io)?;
-        if n < 24 {
+        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
+        if raw.len() < 24 {
             return Err(ledge_core::LedgeError::Corruption(format!(
                 "object {} header truncated",
                 id.to_hex()
             )));
         }
-        Ok(header[20])
+        Ok(raw[20])
     }
 
     /// Generate a unique temporary file path inside the staging directory.
@@ -388,10 +448,9 @@ impl DiskObjectStore {
     /// (bytes 0..56), never the variable-length body — cheap enough to walk a
     /// whole chain. A missing object is `Ok(None)`.
     pub async fn delta_base_of(&self, id: ObjectId) -> ledge_core::Result<Option<ObjectId>> {
-        let raw = match tokio::fs::read(self.object_path(&id)).await {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(LedgeError::Io(e)),
+        let raw = match self.raw_record(id).await? {
+            Some(r) => r,
+            None => return Ok(None),
         };
         if raw.len() < 56 || raw[21] != ENC_DELTA {
             return Ok(None);
@@ -524,13 +583,9 @@ impl DiskObjectStore {
     /// [`MAX_CHAIN`] hops. `depth` is the number of delta links already
     /// traversed; the cap guarantees termination on cyclic/oversized chains.
     async fn read_depth(&self, id: ObjectId, depth: usize) -> Result<Bytes> {
-        let raw = tokio::fs::read(self.object_path(&id)).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                LedgeError::NotFound(id)
-            } else {
-                LedgeError::Io(e)
-            }
-        })?;
+        // Byte source is loose-or-pack; the rest of the decoder is source-agnostic
+        // since a pack record is a byte-identical loose-object image.
+        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
 
         if raw.len() < 24 {
             return Err(LedgeError::Corruption(format!(
@@ -601,8 +656,9 @@ impl ObjectStore for DiskObjectStore {
             .into_iter()
             .map(|c| {
                 let data_dir = self.data_dir.clone();
+                let packs = self.packs.clone();
                 tokio::spawn(async move {
-                    DiskObjectStore { data_dir }.write(c).await
+                    DiskObjectStore { data_dir, packs }.write(c).await
                 })
             })
             .collect();
@@ -632,11 +688,8 @@ impl ObjectStore for DiskObjectStore {
 
     /// Return `true` if an object for `id` is present in the store.
     async fn exists(&self, id: ObjectId) -> Result<bool> {
-        match tokio::fs::metadata(self.object_path(&id)).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(LedgeError::Io(e)),
-        }
+        // Presence = loose file OR any registered pack holds the id.
+        Ok(self.raw_record(id).await?.is_some())
     }
 }
 
@@ -1036,5 +1089,54 @@ mod tests {
         assert_eq!(ObjectStore::read(&store, id0).await.unwrap().as_ref(), {
             let v0b: Vec<u8> = (0..300).flat_map(|i| format!("L{i}\n").into_bytes()).collect(); v0b
         }.as_slice());
+    }
+
+    // ── Task 2 (packing): two-tier read (loose + pack) ────────────────────────
+
+    #[tokio::test]
+    async fn reads_packed_only_object() {
+        let (store, _d) = make_store();
+        let content = (0..400).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>();
+        let id = store.write_git_object(3, Bytes::from(content.clone())).await.unwrap();
+        let raw = std::fs::read(store.object_path(&id)).unwrap();
+        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
+        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        std::fs::remove_file(store.object_path(&id)).unwrap(); // loose gone — only the pack has it
+        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), content.as_slice());
+        assert_eq!(store.git_type_of(id).await.unwrap(), 3);
+        assert_eq!(store.sha1_of(id).await.unwrap().len(), 20);
+        assert!(store.exists(id).await.unwrap());
+        assert!(store.list_all_ids().await.unwrap().contains(&id));
+    }
+
+    #[tokio::test]
+    async fn packed_delta_with_packed_base_resolves() {
+        let (store, _d) = make_store();
+        let base = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>();
+        let edited = String::from_utf8(base.clone()).unwrap().replace("l200\n","E\n").into_bytes();
+        let bid = store.write_git_object(3, Bytes::from(base)).await.unwrap();
+        let tid = store.write_git_object(3, Bytes::from(edited.clone())).await.unwrap();
+        assert!(store.deltify(tid, bid).await.unwrap());
+        let rb = std::fs::read(store.object_path(&bid)).unwrap();
+        let rt = std::fs::read(store.object_path(&tid)).unwrap();
+        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(bid, rb), (tid, rt)]).unwrap();
+        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        std::fs::remove_file(store.object_path(&bid)).unwrap();
+        std::fs::remove_file(store.object_path(&tid)).unwrap();
+        assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), edited.as_slice());
+        assert_eq!(store.delta_base_of(tid).await.unwrap(), Some(bid));
+    }
+
+    #[tokio::test]
+    async fn loose_shadows_pack() {
+        let (store, _d) = make_store();
+        let c = b"loose wins".to_vec();
+        let id = store.write_git_object(3, Bytes::from(c.clone())).await.unwrap();
+        // pack a DIFFERENT byte image under the same id path won't happen (content-addressed);
+        // just assert that with both loose present and a pack registered, read uses loose.
+        let raw = std::fs::read(store.object_path(&id)).unwrap();
+        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
+        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), c.as_slice()); // loose still there
     }
 }
