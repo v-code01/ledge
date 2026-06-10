@@ -48,36 +48,41 @@ Step 2 of this script now pushes the full Ledge source straight into the instanc
 `git push http://localhost:3030/ws/<id>/ HEAD:refs/heads/main` is now a first-class path —
 which makes **continuous self-hosting via push** possible.
 
-## Disk footprint (measured, honest — and a finding that surprised us)
+## Disk footprint (measured, honest — the full journey to near-git)
 
-Same ~2,170-object Ledge source. Two things shipped: per-object **compression** (zlib) and
-**delta retention** (offline repack, `POST /admin/repack`). Both are transparent end-to-end
-(push + clone-back stay byte-identical, verified 6/6 here). What the measurement then revealed:
+Same ~2,200-object Ledge source. Three storage cuts shipped — **compression** (zlib per object),
+**delta retention** (offline `POST /admin/repack`), and **packing** (consolidate to one pack
+file). All transparent end-to-end (push + clone-back byte-identical, verified **6/6** at each
+stage). The on-disk (`du`) journey:
 
-| Metric | Value |
-|---|---|
-| git (delta + zlib pack) | **1.4 MB** |
-| Ledge — **actual content bytes** (compressed + deltified) | **4.18 MB** |
-| Ledge — **`du` block-allocated** | **~20 MB** |
-| of which: filesystem block overhead | **~16 MB** |
-| objects < 1 KB | **1,595 of 2,170 (74%)** |
+| Stage | Store on disk (`du`) | Files |
+|---|---|---|
+| git (delta + zlib pack) | **1.4 MB** | ~3 |
+| Ledge — raw, uncompressed | 30 MB | 2,200 |
+| Ledge — + compression (zlib) | 20 MB | 2,200 |
+| Ledge — + delta retention | ~20 MB* | 2,200 |
+| **Ledge — + packing (current)** | **2.3 MB** | **2** |
 
-Compression cut raw content ~30 MB → ~8 MB; **delta retention** then deltified 1,277 objects
-(content `4.18 MB → 2.19 MB`, ~1.9× on the touched bytes) — every rewrite **self-verified**
-(`apply_delta` round-trip + BLAKE3 match, so a bad delta can never corrupt) and GC **retains the
-base of every kept delta** (no data loss). The actual *content* footprint, **4.18 MB, is now
-within ~3× of git's 1.4 MB** — the content-level gap is largely closed.
+*Delta retention deltified 1,313 objects (content `4.3 MB → 2.2 MB`, ~1.9×) but `du` barely moved
+— because the per-object-file model meant **74% of objects (<1 KB) each cost a full ~8 KB block**,
+so ~16 MB of the 20 MB was filesystem block overhead, not content. That measurement is what
+pointed at packing.
 
-**But `du` barely moved (21 → 19 MB), and the measurement says why:** Ledge stores one file per
-object, 74% of objects are <1 KB, and each costs a full ~8 KB filesystem block — so **~16 MB of
-the on-disk size is per-file block overhead, not content.** Our earlier "delta is the ~14×
-lever" framing was measuring `du`, which is dominated by block rounding, not bytes.
+**Packing closed it:** consolidating 2,218 files → **one 2.2 MB pack + one 88 KB index** drops
+`du` from 21 MB to **2.3 MB — within ~1.6× of git's 1.4 MB.** The disk gap is essentially closed.
+A `.pack` record is the exact bytes of a loose object file, so reads parse packed/loose
+identically; the repack writes a new pack, swaps it in, **verifies every object by read-back, then**
+deletes the loose files (and prunes the emptied `objects/XX/YY` dirs — which themselves cost
+~10 MB of empty-directory blocks if left behind). Content-addressing (BLAKE3) + delta self-verify
++ GC base-retention remain the correctness nets.
 
-**The true remaining lever is packing** — many objects into a few files (git's actual model),
-which eliminates the per-object block overhead. Delta retention is its necessary precursor
-(packing deltified content → near-git size); packing alone would kill the block overhead but
-leave content un-deltified. Pack-file storage is the next architectural step; delta + compression
-are done and correct.
+**Two honest follow-ons the measurement surfaced:**
+- `write_git_object` doesn't dedup against packs — re-importing an already-packed object writes a
+  duplicate *loose* copy (correct on read; loose shadows pack), re-inflating disk until the next
+  repack. A cheap `exists()`-against-packs check on write fixes it.
+- Base selection is still a size-window-16 heuristic (git uses ~250) → ~59% deltified vs git's
+  ~95%; a bigger window narrows the last ~1.6× toward parity. New writes stay loose until repack
+  (no background scheduler yet).
 
 ## Other honest notes
 
