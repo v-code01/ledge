@@ -90,6 +90,15 @@ pub struct DiskObjectStore {
     /// `ArcSwap` lets a repack atomically publish a new pack set while concurrent
     /// reads continue against the old snapshot they already loaded.
     packs: std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::pack::PackFile>>>>,
+    /// Cached `git-SHA-1 → ObjectId` reverse index, lazily built on first
+    /// [`Self::sha1_index`] and reused across calls. `None` means "stale, rebuild
+    /// on next read". Invalidated on every loose write and on `swap_packs` (the
+    /// only two ways the loose/packed object set can change). Holding the map in
+    /// an `Arc` lets a clone clone the pointer (not the whole map) and lets the
+    /// fetch path avoid an O(N) full-store rescan on every request.
+    sha1_cache: std::sync::Arc<
+        arc_swap::ArcSwapOption<std::collections::HashMap<[u8; 20], ObjectId>>,
+    >,
 }
 
 impl DiskObjectStore {
@@ -118,6 +127,7 @@ impl DiskObjectStore {
         Ok(Self {
             data_dir,
             packs: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(packs)),
+            sha1_cache: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         })
     }
 
@@ -142,6 +152,9 @@ impl DiskObjectStore {
     /// repack to publish freshly written packs without quiescing the store.
     pub fn swap_packs(&self, v: Vec<std::sync::Arc<crate::pack::PackFile>>) {
         self.packs.store(std::sync::Arc::new(v));
+        // The packed half of the index just changed (repack published new packs);
+        // invalidate so the next sha1_index() folds in the new packs' sha1_maps.
+        self.sha1_cache.store(None);
     }
 
     /// Paths of every currently-registered pack (snapshot at call time). Lets a
@@ -255,6 +268,9 @@ impl DiskObjectStore {
         tokio::fs::rename(&tmp, &final_path)
             .await
             .map_err(ledge_core::LedgeError::Io)?;
+        // A new loose object changed the set the index describes — drop the cache
+        // so the next sha1_index() rebuilds and includes it.
+        self.sha1_cache.store(None);
         Ok(id)
     }
 
@@ -269,18 +285,36 @@ impl DiskObjectStore {
     ///
     /// Complexity is O(N) in the number of stored objects; acceptable for the
     /// clone/fetch use case where a repo's object count is bounded.
+    ///
+    /// # Caching
+    /// The result is memoized in an `Arc` and returned by pointer on subsequent
+    /// calls, so a busy clone path does not rescan the whole store per request.
+    /// The cache is invalidated (set to `None`) on every loose write
+    /// ([`Self::write_git_object`]) and on [`Self::swap_packs`] — the only
+    /// mutations that can change the loose-or-packed object set. The packed half
+    /// uses each pack's preloaded `sha1_map`, so no per-record file reads occur.
     pub async fn sha1_index(
         &self,
-    ) -> ledge_core::Result<std::collections::HashMap<[u8; 20], ObjectId>> {
+    ) -> ledge_core::Result<std::sync::Arc<std::collections::HashMap<[u8; 20], ObjectId>>> {
+        // Fast path: a live cached index — clone the Arc pointer, not the map.
+        if let Some(cached) = self.sha1_cache.load_full() {
+            return Ok(cached);
+        }
         use tokio::io::AsyncReadExt as _;
         let mut map = std::collections::HashMap::new();
         let objects_dir = self.data_dir.join("objects");
+        // A missing loose tree is not an early return: packs may still hold
+        // objects we must index. `None` here means "skip the loose walk, fall
+        // through to the packed half + cache store".
         let mut lvl1 = match tokio::fs::read_dir(&objects_dir).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(map),
+            Ok(rd) => Some(rd),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(ledge_core::LedgeError::Io(e)),
         };
-        while let Some(d1) = lvl1.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+        while let Some(d1) = match lvl1.as_mut() {
+            Some(rd) => rd.next_entry().await.map_err(ledge_core::LedgeError::Io)?,
+            None => None,
+        } {
             let name1 = d1.file_name();
             // Skip the write-staging directory; only 2-hex fan-out dirs hold objects.
             if name1 == std::ffi::OsStr::new("tmp") {
@@ -332,7 +366,22 @@ impl DiskObjectStore {
                 }
             }
         }
-        Ok(map)
+        // Packed half: fold in each pack's preloaded sha1→id map. No per-record
+        // file reads — the map was built when the pack was opened. A loose object
+        // and its packed copy share the same git SHA-1 → same ObjectId, so the
+        // insert order between halves is immaterial (idempotent on collision).
+        for pf in self.packs.load().iter() {
+            for (sha1, id) in pf.sha1_map() {
+                map.insert(*sha1, *id);
+            }
+        }
+        let arc = std::sync::Arc::new(map);
+        // Publish the freshly-built index. A concurrent invalidation (write /
+        // swap_packs) that raced this store will be re-observed as `None` on the
+        // next call and rebuilt; we never return a map that omits a known object
+        // because invalidation always follows the mutation it describes.
+        self.sha1_cache.store(Some(arc.clone()));
+        Ok(arc)
     }
 
     /// Enumerate the [`ObjectId`] of every loose object currently stored.
@@ -657,8 +706,9 @@ impl ObjectStore for DiskObjectStore {
             .map(|c| {
                 let data_dir = self.data_dir.clone();
                 let packs = self.packs.clone();
+                let sha1_cache = self.sha1_cache.clone();
                 tokio::spawn(async move {
-                    DiskObjectStore { data_dir, packs }.write(c).await
+                    DiskObjectStore { data_dir, packs, sha1_cache }.write(c).await
                 })
             })
             .collect();
@@ -1125,6 +1175,35 @@ mod tests {
         std::fs::remove_file(store.object_path(&tid)).unwrap();
         assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), edited.as_slice());
         assert_eq!(store.delta_base_of(tid).await.unwrap(), Some(bid));
+    }
+
+    #[tokio::test]
+    async fn sha1_index_two_tier_and_cached() {
+        let (store, _d) = make_store();
+        let id = store.write_git_object(3, Bytes::from((0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>())).await.unwrap();
+        let sha1 = store.sha1_of(id).await.unwrap();
+        let a = store.sha1_index().await.unwrap();
+        let b = store.sha1_index().await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "cached: same Arc on repeat call");
+        assert_eq!(a.get(&sha1).copied(), Some(id));
+        // pack it, prune loose, swap → cache invalidated + packed object still indexed
+        let raw = std::fs::read(store.object_path(&id)).unwrap();
+        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
+        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        std::fs::remove_file(store.object_path(&id)).unwrap();
+        let c = store.sha1_index().await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&a, &c), "swap_packs invalidated the cache");
+        assert_eq!(c.get(&sha1).copied(), Some(id), "packed object present in index");
+    }
+
+    #[tokio::test]
+    async fn write_invalidates_sha1_cache() {
+        let (store, _d) = make_store();
+        let a = store.sha1_index().await.unwrap();
+        let id = store.write_git_object(3, Bytes::from(b"new object".to_vec())).await.unwrap();
+        let b = store.sha1_index().await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&a, &b), "write invalidated the cache");
+        assert!(b.contains_key(&store.sha1_of(id).await.unwrap()));
     }
 
     #[tokio::test]

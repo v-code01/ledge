@@ -611,13 +611,15 @@ mod tests {
             self.types.lock().unwrap().insert(hash, git_type);
             Ok(id)
         }
-        async fn sha1_index(&self) -> HashMap<[u8; 20], ObjectId> {
-            self.sha1s
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
-                .collect()
+        async fn sha1_index(&self) -> std::sync::Arc<HashMap<[u8; 20], ObjectId>> {
+            std::sync::Arc::new(
+                self.sha1s
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
+                    .collect(),
+            )
         }
         async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
             // The receive-pack handler persists objects by BLAKE3 + git type but

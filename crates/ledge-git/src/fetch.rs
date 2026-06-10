@@ -44,7 +44,11 @@ pub trait Sha1Provider: Send + Sync {
     ///
     /// Used by the fetch path to resolve child SHA-1s found while walking a
     /// commit's reachable object graph (commit → tree → blob).
-    async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId>;
+    ///
+    /// Returns an `Arc` so the disk implementation can hand back its memoized
+    /// index by pointer rather than rebuilding (and re-scanning the whole store)
+    /// on every clone request.
+    async fn sha1_index(&self) -> std::sync::Arc<std::collections::HashMap<[u8; 20], ObjectId>>;
 
     /// Fetch a stored object's (git_type, content) by its git SHA-1 — for resolving
     /// thin-pack REF_DELTA bases. None if absent.
@@ -71,8 +75,10 @@ impl Sha1Provider for DiskObjectStore {
     ) -> ledge_core::Result<ObjectId> {
         self.write_git_object(git_type, content).await
     }
-    async fn sha1_index(&self) -> std::collections::HashMap<[u8; 20], ObjectId> {
-        self.sha1_index().await.unwrap_or_default()
+    async fn sha1_index(&self) -> std::sync::Arc<std::collections::HashMap<[u8; 20], ObjectId>> {
+        self.sha1_index()
+            .await
+            .unwrap_or_else(|_| std::sync::Arc::new(std::collections::HashMap::new()))
     }
     async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
         let id = *Sha1Provider::sha1_index(self).await.get(sha1)?;
@@ -476,13 +482,15 @@ mod tests {
             self.types.lock().unwrap().insert(hash, git_type);
             Ok(id)
         }
-        async fn sha1_index(&self) -> HashMap<[u8; 20], ObjectId> {
-            self.sha1s
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
-                .collect()
+        async fn sha1_index(&self) -> std::sync::Arc<HashMap<[u8; 20], ObjectId>> {
+            std::sync::Arc::new(
+                self.sha1s
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(blake, sha1)| (*sha1, ObjectId::from_bytes(*blake)))
+                    .collect(),
+            )
         }
         async fn read_git_object_by_sha1(&self, sha1: &[u8; 20]) -> Option<(u8, Vec<u8>)> {
             let blake = *self
