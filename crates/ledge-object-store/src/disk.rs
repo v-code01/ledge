@@ -159,7 +159,7 @@ impl DiskObjectStore {
     /// returned image with no awareness of where it came from. Loose shadows pack:
     /// a re-materialized loose copy always wins, which is what lets GC/repack
     /// stage loose objects atop a pack without a read seeing stale bytes.
-    async fn raw_record(&self, id: ObjectId) -> ledge_core::Result<Option<Vec<u8>>> {
+    pub(crate) async fn raw_record(&self, id: ObjectId) -> ledge_core::Result<Option<Vec<u8>>> {
         match tokio::fs::read(self.object_path(&id)).await {
             Ok(r) => return Ok(Some(r)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

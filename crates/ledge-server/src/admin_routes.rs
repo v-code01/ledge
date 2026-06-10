@@ -125,6 +125,9 @@ pub async fn admin_repack(State(state): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "objects_seen": s.objects_seen,
                 "objects_deltified": s.objects_deltified,
+                "objects_packed": s.objects_packed,
+                "files_before": s.files_before,
+                "files_after": s.files_after,
                 "bytes_before": s.bytes_before,
                 "bytes_after": s.bytes_after,
                 "ratio": if s.bytes_after > 0 { s.bytes_before as f64 / s.bytes_after as f64 } else { 1.0 },
