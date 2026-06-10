@@ -138,15 +138,26 @@ impl Gc {
         // Capture the root count before `reachable_from` consumes the Vec.
         let root_count = roots.len();
         let reachable: HashSet<ObjectId> = graph::reachable_from(&self.objects, roots).await?;
+        // `reachable` counts objects reached by the git-graph walk from the roots.
+        // The delta-base closure below only ADDS bases that are otherwise
+        // unreachable; reporting the ref-reachable count keeps `stats.reachable`
+        // stable for callers/tests (non-delta graphs add nothing to the closure).
         let reachable_count = reachable.len();
 
+        // Close the keep-set under the delta-base relation: a kept delta's base
+        // must be kept too, else the delta becomes unreadable (data loss). Task 3.
+        // Header-only `delta_base_of` walk; the closure terminates because every
+        // step either inserts a NEW id into `keep` (a finite set bounded by the
+        // candidate population) or stops — no id is revisited.
+        let keep = self.close_under_delta_bases(reachable).await?;
+
         // ── 4. Sweep ─────────────────────────────────────────────────────────
-        // Delete every candidate that is not reachable. Deletes are idempotent;
-        // a crash mid-sweep is harmless — the next pass re-derives and continues.
+        // Delete every candidate that is not in the keep-set. Deletes are
+        // idempotent; a crash mid-sweep is harmless — the next pass re-derives.
         let mut reclaimed = 0usize;
         let mut bytes_freed = 0u64;
         for id in candidates {
-            if reachable.contains(&id) {
+            if keep.contains(&id) {
                 continue;
             }
             // Stat the file *before* deleting to attribute freed bytes.
@@ -180,6 +191,10 @@ impl Gc {
             std::collections::HashMap::with_capacity(groups.len());
         for (tenant, tenant_roots) in groups {
             let reachable = graph::reachable_from(&self.objects, tenant_roots).await?;
+            // Close under delta-bases: a base backing a kept delta is real on-disk
+            // bytes GC retains for this tenant, so it must count toward the
+            // tenant's measured usage (and is retained by the closure, Task 3).
+            let reachable = self.close_under_delta_bases(reachable).await?;
             let mut bytes = 0u64;
             let objects = reachable.len() as u64;
             for id in &reachable {
@@ -215,6 +230,30 @@ impl Gc {
         );
 
         Ok(stats)
+    }
+
+    /// Expand `set` to its closure under the delta-base relation: for every id in
+    /// the set that is stored as a delta, transitively include its base (Task 3,
+    /// delta retention). A kept delta whose base is reclaimed becomes unreadable —
+    /// the closure prevents that data loss.
+    ///
+    /// Complexity: O(|closure|) header-only reads (`delta_base_of` reads only the
+    /// 56-byte object header). Termination: each iteration either inserts a NEW id
+    /// (the `keep` set grows monotonically and is bounded by the finite on-disk
+    /// object population) or stops; no id is pushed onto the frontier twice.
+    async fn close_under_delta_bases(&self, set: HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        let mut keep = set;
+        let mut frontier: Vec<ObjectId> = keep.iter().copied().collect();
+        while let Some(id) = frontier.pop() {
+            if let Some(base) = self.objects.delta_base_of(id).await? {
+                // `insert` returns true only the first time `base` is seen, so a
+                // base is enqueued at most once even with diamond delta chains.
+                if keep.insert(base) {
+                    frontier.push(base);
+                }
+            }
+        }
+        Ok(keep)
     }
 }
 
@@ -639,6 +678,68 @@ mod tests {
         // Root tenant has NO durable refs here ⇒ absent or zero.
         assert_eq!(snap.get("root").copied().unwrap_or_default(), TenantUsage::default());
         let _ = (a_blob, a_tree, g_blob, g_tree); // silence unused (ids are wired via refs)
+    }
+
+    // 12 ──────────────────────────────────────────────────────────────────────
+    /// DATA-LOSS guard (delta retention, Task 3): if a reachable object `a` is
+    /// stored as a delta against `base`, GC MUST keep `base` even though `base`
+    /// is not independently reachable — otherwise `a` becomes unreadable.
+    ///
+    /// Reachability is established the SAME way `gc_keeps_object_reachable_from_durable_ref`
+    /// does it: `a` is the blob inside a tree referenced by a commit that a durable
+    /// ref (`refs/heads/main`) points at, so the git-graph walk
+    /// (commit→tree→blob-by-SHA-1) reaches `a`. `base` is a BARE blob in no tree and
+    /// under no ref, so it is NOT independently reachable — it survives ONLY via the
+    /// delta-base closure.
+    #[tokio::test]
+    async fn gc_retains_base_of_a_kept_delta() {
+        let h = setup();
+
+        // `base`: a 400-line blob. `a`: the same content with one line changed,
+        // so `a` is highly compressible as a delta against `base`.
+        let base_content: Vec<u8> = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect();
+        let edited: Vec<u8> = String::from_utf8(base_content.clone())
+            .unwrap()
+            .replace("l200\n", "EDIT\n")
+            .into_bytes();
+        let base = h
+            .objects
+            .write_git_object(3, Bytes::from(base_content))
+            .await
+            .unwrap();
+        let a = h
+            .objects
+            .write_git_object(3, Bytes::from(edited.clone()))
+            .await
+            .unwrap();
+        assert!(
+            h.objects.deltify(a, base).await.unwrap(),
+            "a is now a delta on base"
+        );
+
+        // Make ONLY `a` reachable: tree -> a, commit -> tree, durable ref -> commit.
+        // `base` is referenced by no tree and no ref, so the graph walk never
+        // reaches it (it is reachable solely through the delta-base relation).
+        let tree = write_tree(&h.objects, "a.txt", a).await;
+        let commit = write_commit(&h.objects, tree).await;
+        set_ref(&h.refs, "refs/heads/main", commit).await;
+
+        let stats = h.gc.run().await.unwrap();
+
+        assert!(
+            h.objects.exists(base).await.unwrap(),
+            "GC MUST retain the delta base (a needs it)"
+        );
+        assert_eq!(
+            ledge_core::ObjectStore::read(&*h.objects, a).await.unwrap().as_ref(),
+            edited.as_slice(),
+            "a still resolves after GC"
+        );
+        // Nothing was reclaimed: commit + tree + a are ref-reachable, and base is
+        // kept by the delta-base closure.
+        assert_eq!(stats.reclaimed, 0, "base must not be reclaimed");
+        assert!(h.objects.exists(commit).await.unwrap());
+        assert!(h.objects.exists(tree).await.unwrap());
     }
 
     // 11 ──────────────────────────────────────────────────────────────────────
