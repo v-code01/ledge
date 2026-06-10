@@ -105,6 +105,31 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         let _ = std::fs::remove_file(op);
         let _ = std::fs::remove_file(op.with_extension("idx"));
     }
+    // Prune the now-empty `objects/<XX>/<YY>` loose dirs left behind by the deletes:
+    // each empty dir still costs a filesystem block, which would otherwise dominate
+    // `du` after packing (an empty 2-level skeleton is ~thousands of wasted blocks).
+    // `pack/` and `tmp/` are preserved (not removed even if momentarily empty).
+    let objects_root = store.pack_dir().parent().map(|p| p.to_path_buf());
+    if let Some(root) = objects_root {
+        if let Ok(level1) = std::fs::read_dir(&root) {
+            for d1 in level1.flatten() {
+                let name = d1.file_name();
+                if name == std::ffi::OsStr::new("pack") || name == std::ffi::OsStr::new("tmp") {
+                    continue;
+                }
+                let p1 = d1.path();
+                if !p1.is_dir() {
+                    continue;
+                }
+                if let Ok(level2) = std::fs::read_dir(&p1) {
+                    for d2 in level2.flatten() {
+                        let _ = std::fs::remove_dir(d2.path()); // removes only if empty
+                    }
+                }
+                let _ = std::fs::remove_dir(&p1); // removes only if now empty
+            }
+        }
+    }
     stats.objects_packed = new_ids.len();
     stats.files_after = std::fs::read_dir(store.pack_dir()).map(|rd| rd.count()).unwrap_or(0);
 
@@ -202,6 +227,12 @@ mod tests {
         let packdir = dir.path().join("objects").join("pack");
         let packs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="pack")).count();
         assert_eq!(packs, 1, "one pack file");
+        // empty loose dirs are pruned (else they dominate du after packing)
+        let empty_loose_dirs = std::fs::read_dir(dir.path().join("objects")).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| { let n = e.file_name(); n != std::ffi::OsStr::new("pack") && n != std::ffi::OsStr::new("tmp") && e.path().is_dir() })
+            .count();
+        assert_eq!(empty_loose_dirs, 0, "repack prunes the empty objects/XX loose dirs");
     }
 
     // counts loose object files under objects/XX/YY, excluding the pack/ and tmp/ dirs
