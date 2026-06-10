@@ -8,6 +8,42 @@ use tracing::instrument;
 
 use ledge_core::{LedgeError, ObjectId, ObjectStore, Result};
 
+/// Object body encoding stored in header byte 21.
+/// `0` = raw (legacy / never-shrink fallback), `1` = zlib (RFC 1950).
+const ENC_RAW: u8 = 0;
+const ENC_ZLIB: u8 = 1;
+/// Inflate guard: refuse to materialize more than 2 GiB from a single object,
+/// bounding the blast radius of a malformed/hostile compressed body (zip bomb).
+const MAX_DECOMPRESSED: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// zlib-compress `data`. Writing into a `Vec` sink never performs I/O, so the
+/// `expect`s below are unreachable; they document that infallibility.
+fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).expect("zlib write to Vec is infallible");
+    e.finish().expect("zlib finish to Vec is infallible")
+}
+
+/// Inflate a zlib stream, capped at [`MAX_DECOMPRESSED`]. A malformed stream or
+/// an over-large expansion yields [`LedgeError::Corruption`] — never a panic.
+fn zlib_inflate(data: &[u8], id: ObjectId) -> ledge_core::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    // `.take(MAX + 1)` lets us distinguish "exactly MAX" (ok) from "exceeds MAX".
+    flate2::read::ZlibDecoder::new(data)
+        .take(MAX_DECOMPRESSED as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| LedgeError::Corruption(format!("object {}: inflate: {e}", id.to_hex())))?;
+    if out.len() > MAX_DECOMPRESSED {
+        return Err(LedgeError::Corruption(format!(
+            "object {}: inflated too large",
+            id.to_hex()
+        )));
+    }
+    Ok(out)
+}
+
 /// Content-addressed object store backed by the local filesystem.
 ///
 /// Layout mirrors Git's loose-object layout for tooling compatibility:
@@ -24,9 +60,13 @@ use ledge_core::{LedgeError, ObjectId, ObjectStore, Result};
 /// ```text
 /// bytes  0..20  — SHA-1 of "<typename> <len>\0<content>"  (Git-compatible)
 /// byte     20   — git object type (1=commit, 2=tree, 3=blob, 4=tag)
-/// bytes 21..24  — reserved, always zero
-/// bytes 24..    — raw content
+/// byte     21   — body encoding: 0 = raw, 1 = zlib (RFC 1950)
+/// bytes 22..24  — reserved, always zero
+/// bytes 24..    — body (raw or zlib-compressed per byte 21)
 /// ```
+///
+/// Identity and dedup remain `BLAKE3(uncompressed content)`; compression is a
+/// pure storage detail. byte 21 = 0 keeps legacy raw objects readable.
 ///
 /// # Invariants
 /// - Writes are atomic: content is written to `tmp/` then `rename(2)`'d to its
@@ -124,9 +164,18 @@ impl DiskObjectStore {
 
         let mut payload = Vec::with_capacity(24 + content.len());
         payload.extend_from_slice(&sha1_hash);
-        payload.push(git_type); // reserved[0] = git type
-        payload.extend_from_slice(&[0u8; 3]); // reserved[1..4]
-        payload.extend_from_slice(&content);
+        payload.push(git_type); // byte 20 = git type
+        // byte 21 = encoding (0=raw, 1=zlib). Never inflate: fall back to raw when
+        // zlib doesn't shrink (tiny / already-compressed inputs).
+        let compressed = zlib_compress(&content);
+        let (enc, stored): (u8, &[u8]) = if compressed.len() < content.len() {
+            (ENC_ZLIB, compressed.as_slice())
+        } else {
+            (ENC_RAW, content.as_ref())
+        };
+        payload.push(enc);
+        payload.extend_from_slice(&[0u8; 2]); // bytes 22..24 reserved
+        payload.extend_from_slice(stored);
 
         let tmp = self.tmp_path();
         let final_path = self.object_path(&id);
@@ -395,8 +444,20 @@ impl ObjectStore for DiskObjectStore {
             )));
         }
 
-        // Skip the 24-byte header and return only the content.
-        Ok(Bytes::from(raw[24..].to_vec()))
+        // Header byte 21 selects how the body (bytes 24..) is encoded.
+        let enc = raw[21];
+        let body = &raw[24..];
+        let content = match enc {
+            ENC_RAW => body.to_vec(),
+            ENC_ZLIB => zlib_inflate(body, id)?,
+            other => {
+                return Err(LedgeError::Corruption(format!(
+                    "object {}: unknown encoding {other}",
+                    id.to_hex()
+                )))
+            }
+        };
+        Ok(Bytes::from(content))
     }
 
     /// Return `true` if an object for `id` is present in the store.
@@ -511,9 +572,12 @@ mod tests {
                 .join(&hex),
         )
         .unwrap();
+        // This 19-byte input does not shrink under zlib, so the never-inflate
+        // fallback stores it raw: enc byte (21) = 0, body == content verbatim.
         assert_eq!(raw.len(), 24 + content.len());
-        // reserved[0] now holds the git object type byte (3 = blob for `write`).
+        // byte 20 holds the git object type (3 = blob for `write`).
         assert_eq!(raw[20], 3);
+        // byte 21 = encoding flag (0 = raw here); bytes 22..24 reserved zero.
         assert_eq!(&raw[21..24], &[0u8; 3]);
         assert_eq!(&raw[24..], content as &[u8]);
     }
@@ -684,5 +748,77 @@ mod tests {
             let (id, original) = result.unwrap();
             assert_eq!(store.read(id).await.unwrap(), original);
         }
+    }
+
+    // ── Task 1: object compression (zlib + backward-compat enc flag) ──────────
+
+    #[tokio::test]
+    async fn roundtrip_compressible_binary_empty_tiny() {
+        let (store, _d) = make_store();
+        let big: Vec<u8> = (0..400).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let cases: Vec<Vec<u8>> = vec![
+            big.clone(),
+            vec![],
+            b"hi".to_vec(),
+            (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect(),
+        ];
+        for c in cases {
+            let id = store.write_git_object(3, Bytes::from(c.clone())).await.unwrap();
+            let got = ObjectStore::read(&store, id).await.unwrap();
+            assert_eq!(got.as_ref(), c.as_slice(), "round-trip byte-identical (len {})", c.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_same_content_same_id() {
+        let (store, _d) = make_store();
+        let c = Bytes::from(vec![7u8; 5000]);
+        let a = store.write_git_object(3, c.clone()).await.unwrap();
+        let b = store.write_git_object(3, c.clone()).await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn compresses_on_disk() {
+        let (store, _d) = make_store();
+        let c = Bytes::from((0..2000).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>());
+        let id = store.write_git_object(3, c.clone()).await.unwrap();
+        let p = store.object_path(&id);
+        let on_disk = std::fs::metadata(&p).unwrap().len() as usize;
+        assert!(on_disk < 24 + c.len(), "stored ({on_disk}) < header+raw ({})", 24 + c.len());
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw[21], 1, "enc flag = zlib");
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_object_reads_back() {
+        let (store, _d) = make_store();
+        let content = b"legacy raw object body".to_vec();
+        let mut h = sha1::Sha1::new();
+        sha1::Digest::update(&mut h, format!("blob {}\0", content.len()).as_bytes());
+        sha1::Digest::update(&mut h, &content);
+        let sha1: [u8; 20] = sha1::Digest::finalize(h).into();
+        let id = ObjectId::from_bytes(blake3::hash(&content).into());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&sha1);
+        payload.push(3);
+        payload.extend_from_slice(&[0u8; 3]); // reserved incl enc byte = 0 (legacy raw)
+        payload.extend_from_slice(&content);
+        let p = store.object_path(&id);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &payload).unwrap();
+        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), content.as_slice());
+    }
+
+    #[tokio::test]
+    async fn corrupt_compressed_body_is_clean_error() {
+        let (store, _d) = make_store();
+        let id = store.write_git_object(3, Bytes::from(vec![1u8; 3000])).await.unwrap();
+        let p = store.object_path(&id);
+        let mut raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw[21], 1);
+        for b in raw[24..].iter_mut() { *b = 0xff; }
+        std::fs::write(&p, &raw).unwrap();
+        assert!(ObjectStore::read(&store, id).await.is_err());
     }
 }

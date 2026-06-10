@@ -10,6 +10,7 @@ authors.workspace     = true
 [dependencies]
 ledge-core    = { path = "../ledge-core" }
 blake3.workspace      = true
+flate2.workspace      = true
 sha1.workspace        = true
 bytes.workspace       = true
 tokio.workspace       = true

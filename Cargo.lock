@@ -1638,6 +1638,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "flate2",
  "futures",
  "hex",
  "io-uring",
