@@ -48,24 +48,36 @@ Step 2 of this script now pushes the full Ledge source straight into the instanc
 `git push http://localhost:3030/ws/<id>/ HEAD:refs/heads/main` is now a first-class path —
 which makes **continuous self-hosting via push** possible.
 
-## Disk footprint (measured, honest)
+## Disk footprint (measured, honest — and a finding that surprised us)
 
-Same ~2,100-object Ledge source, three ways:
+Same ~2,170-object Ledge source. Two things shipped: per-object **compression** (zlib) and
+**delta retention** (offline repack, `POST /admin/repack`). Both are transparent end-to-end
+(push + clone-back stay byte-identical, verified 6/6 here). What the measurement then revealed:
 
-| Representation | Size |
+| Metric | Value |
 |---|---|
-| git (delta + zlib, hard repack) | **1.4 MB** |
-| Ledge — **zlib per-object** (current) | **20 MB** |
-| Ledge — raw, uncompressed (before) | 30 MB |
+| git (delta + zlib pack) | **1.4 MB** |
+| Ledge — **actual content bytes** (compressed + deltified) | **4.18 MB** |
+| Ledge — **`du` block-allocated** | **~20 MB** |
+| of which: filesystem block overhead | **~16 MB** |
+| objects < 1 KB | **1,595 of 2,170 (74%)** |
 
-Per-object compression shipped (`DiskObjectStore`, zlib, transparent, zero migration, identity
-unchanged) and cut the store **30 MB → 20 MB (~33%)** — verified end-to-end here (push +
-clone-back stay byte-identical). The honest read: that's a modest down payment. Per-object zlib
-can't dedup *across* similar objects, and this corpus is dominated by many small objects, so the
-ratio is ~1.5×, not the 3–4× a naive estimate suggests. The measurement makes the real picture
-clear — **almost the entire remaining gap (20 MB → 1.4 MB, ~14×) is delta**, i.e. git storing
-diffs between similar object versions. **Delta retention is the dominant remaining lever** (and
-reuses the `apply_delta` already shipped for receive-pack). Compression was cut 1 of 2.
+Compression cut raw content ~30 MB → ~8 MB; **delta retention** then deltified 1,277 objects
+(content `4.18 MB → 2.19 MB`, ~1.9× on the touched bytes) — every rewrite **self-verified**
+(`apply_delta` round-trip + BLAKE3 match, so a bad delta can never corrupt) and GC **retains the
+base of every kept delta** (no data loss). The actual *content* footprint, **4.18 MB, is now
+within ~3× of git's 1.4 MB** — the content-level gap is largely closed.
+
+**But `du` barely moved (21 → 19 MB), and the measurement says why:** Ledge stores one file per
+object, 74% of objects are <1 KB, and each costs a full ~8 KB filesystem block — so **~16 MB of
+the on-disk size is per-file block overhead, not content.** Our earlier "delta is the ~14×
+lever" framing was measuring `du`, which is dominated by block rounding, not bytes.
+
+**The true remaining lever is packing** — many objects into a few files (git's actual model),
+which eliminates the per-object block overhead. Delta retention is its necessary precursor
+(packing deltified content → near-git size); packing alone would kill the block overhead but
+leave content un-deltified. Pack-file storage is the next architectural step; delta + compression
+are done and correct.
 
 ## Other honest notes
 

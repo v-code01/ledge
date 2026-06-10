@@ -1,0 +1,22 @@
+
+=== 0. deploy a persistent self-hosted Ledge (sync+auth, named volume, restart) ===
+     healthy after ~1s
+  [32mPASS[0m instance up + healthy on http://localhost:3030 (metrics http://localhost:9091)
+     host source: branch=main HEAD=aaefdcbb25fed3520912f791cd006117dad7574a
+
+=== 1. Ledge imports its OWN source (POST /sync/import file:///srv/ledge-src) ===
+     imported: workspace=19eb21d9324000000000000000000002 default_branch=main refs=1
+  [32mPASS[0m Ledge ingested its own source (1 refs)
+
+=== 2. raw git push of the source into Ledge — delta-capable receive-pack ===
+  [32mPASS[0m raw git push into Ledge works (delta packs accepted)
+
+=== 3. clone Ledge's copy of the source BACK OUT + verify HEAD SHA-1 ===
+  [32mPASS[0m cloned the source back out of Ledge (http://.../ws/19eb21d9324000000000000000000002)
+     cloned HEAD=aaefdcbb25fed3520912f791cd006117dad7574a  vs host HEAD=aaefdcbb25fed3520912f791cd006117dad7574a
+  [32mPASS[0m HEAD SHA-1 byte-identical — Ledge is serving its own source
+  [32mPASS[0m working tree intact (Cargo.toml + ledge-server member present)
+
+=== summary ===
+  PASS=6  FAIL=0
+  Ledge is now self-hosting its source at: http://localhost:3030/ws/19eb21d9324000000000000000000002 (instance left RUNNING; `docker compose -f /Users/vanshverma/ledge/dogfood/docker-compose.yml down` to stop, add -v to wipe the volume)
