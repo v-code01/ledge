@@ -6,12 +6,21 @@ use rand::Rng as _;
 use sha1::Digest as _;
 use tracing::instrument;
 
+use ledge_core::delta::{apply_delta, encode_delta};
 use ledge_core::{LedgeError, ObjectId, ObjectStore, Result};
 
 /// Object body encoding stored in header byte 21.
-/// `0` = raw (legacy / never-shrink fallback), `1` = zlib (RFC 1950).
+/// `0` = raw (legacy / never-shrink fallback), `1` = zlib (RFC 1950),
+/// `2` = delta against another object (see [`DiskObjectStore::deltify`]).
 const ENC_RAW: u8 = 0;
 const ENC_ZLIB: u8 = 1;
+/// Delta encoding: body is `[base_id:32][zlib(delta_bytes)]`. The reconstructed
+/// content is `apply_delta(read(base_id), inflate(delta_bytes))`.
+const ENC_DELTA: u8 = 2;
+/// Maximum delta-chain depth honoured by the resolver and enforced by
+/// [`DiskObjectStore::deltify`]. Bounds recursion and worst-case read cost so a
+/// malformed or hostile chain can never hang or blow the stack.
+const MAX_CHAIN: usize = 50;
 /// Inflate guard: refuse to materialize more than 2 GiB from a single object,
 /// bounding the blast radius of a malformed/hostile compressed body (zip bomb).
 const MAX_DECOMPRESSED: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
@@ -374,6 +383,196 @@ impl DiskObjectStore {
             .join(suffix.to_string())
     }
 
+    /// If `id` is stored as a delta (enc byte 21 == [`ENC_DELTA`]), return its
+    /// base [`ObjectId`]; otherwise `None`. Reads only the fixed-size header
+    /// (bytes 0..56), never the variable-length body — cheap enough to walk a
+    /// whole chain. A missing object is `Ok(None)`.
+    pub async fn delta_base_of(&self, id: ObjectId) -> ledge_core::Result<Option<ObjectId>> {
+        let raw = match tokio::fs::read(self.object_path(&id)).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(LedgeError::Io(e)),
+        };
+        if raw.len() < 56 || raw[21] != ENC_DELTA {
+            return Ok(None);
+        }
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&raw[24..56]);
+        Ok(Some(ObjectId::from_bytes(b)))
+    }
+
+    /// Length of the delta chain rooted at `id`, in hops, clamped at
+    /// [`MAX_CHAIN`]. Header-only walk: terminates either at the first non-delta
+    /// object or once the cap is reached, so a cyclic/oversized chain can never
+    /// loop forever.
+    async fn chain_depth(&self, mut id: ObjectId) -> ledge_core::Result<usize> {
+        let mut d = 0;
+        while let Some(base) = self.delta_base_of(id).await? {
+            d += 1;
+            if d >= MAX_CHAIN {
+                break;
+            }
+            id = base;
+        }
+        Ok(d)
+    }
+
+    /// Does the delta chain starting at `from` reach `target` within
+    /// [`MAX_CHAIN`] hops? Used by [`Self::deltify`] to reject base/target pairs
+    /// that would close a cycle (`target` already depends on the proposed base).
+    async fn delta_reaches(&self, from: ObjectId, target: ObjectId) -> ledge_core::Result<bool> {
+        let mut id = from;
+        for _ in 0..MAX_CHAIN {
+            match self.delta_base_of(id).await? {
+                Some(base) if base == target => return Ok(true),
+                Some(base) => id = base,
+                None => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Re-store `target` as an [`ENC_DELTA`] object against `base`, returning
+    /// `true` iff the rewrite was committed.
+    ///
+    /// # Self-verification (the corruption guard)
+    /// Before any byte is written, the freshly-encoded delta is round-tripped:
+    /// `apply_delta(base_content, delta)` must reproduce content whose
+    /// `BLAKE3` hash equals `target`'s id. A mismatch (encoder bug, wrong base,
+    /// truncation) returns [`LedgeError::Corruption`] and leaves the on-disk
+    /// object untouched (still readable in its prior raw/zlib form). It is
+    /// therefore impossible for `deltify` to corrupt an object.
+    ///
+    /// # Refusal cases (return `Ok(false)`, no error, object unchanged)
+    /// - `target == base` (a self-delta is meaningless).
+    /// - the chain at `base` is already [`MAX_CHAIN`] deep (would exceed the cap).
+    /// - `base`'s chain already reaches `target` (would create a cycle).
+    /// - the delta file would be `>=` the current file size (never grow).
+    pub async fn deltify(&self, target: ObjectId, base: ObjectId) -> ledge_core::Result<bool> {
+        if target == base {
+            return Ok(false);
+        }
+        // Cap the resulting chain: deltifying adds one hop on top of `base`'s
+        // existing depth, so `base` must be strictly below MAX_CHAIN - 1.
+        if self.chain_depth(base).await? >= MAX_CHAIN - 1 {
+            return Ok(false);
+        }
+        if self.delta_reaches(base, target).await? {
+            return Ok(false); // would create a cycle
+        }
+
+        // Resolve both operands to full content (works even if base is itself a
+        // delta — chains compose).
+        let target_content = self.read_depth(target, 0).await?;
+        let base_content = self.read_depth(base, 0).await?;
+
+        // Preserve the target's git type and canonical SHA-1 header bytes.
+        let git_type = self
+            .git_type_of(target)
+            .await
+            .map_err(|e| match e {
+                LedgeError::NotFound(_) => e,
+                other => LedgeError::Corruption(format!(
+                    "object {}: deltify type: {other}",
+                    target.to_hex()
+                )),
+            })?;
+        let sha1 = self.sha1_of(target).await?;
+
+        let delta = encode_delta(&base_content, &target_content);
+
+        // SELF-VERIFY (the guard): the round-trip must reproduce the EXACT
+        // target bytes — proven by BLAKE3 equality with the target's id. Any
+        // mismatch aborts the rewrite; the object stays in its prior encoding.
+        let check = apply_delta(&base_content, &delta)
+            .map_err(|e| LedgeError::Corruption(format!("deltify verify: {e}")))?;
+        if blake3::hash(&check).as_bytes() != target.as_bytes() {
+            return Err(LedgeError::Corruption(
+                "deltify: round-trip mismatch (encoder bug); object kept raw".into(),
+            ));
+        }
+
+        let zdelta = zlib_compress(&delta);
+        let mut file = Vec::with_capacity(56 + zdelta.len());
+        file.extend_from_slice(&sha1); // bytes 0..20  — canonical git SHA-1 (unchanged)
+        file.push(git_type); // byte 20  — git object type (unchanged)
+        file.push(ENC_DELTA); // byte 21  — encoding = delta
+        file.extend_from_slice(&[0u8; 2]); // bytes 22..24 — reserved zero
+        file.extend_from_slice(base.as_bytes()); // bytes 24..56 — the BASE id (32B), NOT target
+        file.extend_from_slice(&zdelta); // bytes 56..    — zlib(delta_bytes)
+
+        // Never grow: if the delta encoding isn't strictly smaller than the
+        // current file, keep the object as-is.
+        let cur = tokio::fs::metadata(self.object_path(&target))
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(usize::MAX);
+        if file.len() >= cur {
+            return Ok(false);
+        }
+
+        // Atomic replace: write to tmp/, then rename(2) over the canonical path.
+        let tmp = self.tmp_path();
+        tokio::fs::write(&tmp, &file).await.map_err(LedgeError::Io)?;
+        tokio::fs::rename(&tmp, self.object_path(&target))
+            .await
+            .map_err(LedgeError::Io)?;
+        Ok(true)
+    }
+
+    /// Read and decode the object `id`, resolving delta chains recursively up to
+    /// [`MAX_CHAIN`] hops. `depth` is the number of delta links already
+    /// traversed; the cap guarantees termination on cyclic/oversized chains.
+    async fn read_depth(&self, id: ObjectId, depth: usize) -> Result<Bytes> {
+        let raw = tokio::fs::read(self.object_path(&id)).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                LedgeError::NotFound(id)
+            } else {
+                LedgeError::Io(e)
+            }
+        })?;
+
+        if raw.len() < 24 {
+            return Err(LedgeError::Corruption(format!(
+                "object {} too short: {} bytes",
+                id.to_hex(),
+                raw.len()
+            )));
+        }
+
+        match raw[21] {
+            ENC_RAW => Ok(Bytes::from(raw[24..].to_vec())),
+            ENC_ZLIB => Ok(Bytes::from(zlib_inflate(&raw[24..], id)?)),
+            ENC_DELTA => {
+                if depth >= MAX_CHAIN {
+                    return Err(LedgeError::Corruption(format!(
+                        "object {}: delta chain too deep",
+                        id.to_hex()
+                    )));
+                }
+                if raw.len() < 56 {
+                    return Err(LedgeError::Corruption(format!(
+                        "object {}: truncated delta header",
+                        id.to_hex()
+                    )));
+                }
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&raw[24..56]);
+                let base_id = ObjectId::from_bytes(b);
+                // Box::pin to allow the recursive async call (sized future).
+                let base = Box::pin(self.read_depth(base_id, depth + 1)).await?;
+                let delta = zlib_inflate(&raw[56..], id)?;
+                let content = apply_delta(&base, &delta).map_err(|e| {
+                    LedgeError::Corruption(format!("object {}: apply_delta: {e}", id.to_hex()))
+                })?;
+                Ok(Bytes::from(content))
+            }
+            other => Err(LedgeError::Corruption(format!(
+                "object {}: unknown encoding {other}",
+                id.to_hex()
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -426,38 +625,9 @@ impl ObjectStore for DiskObjectStore {
     /// Returns [`LedgeError::Corruption`] when the file is shorter than the
     /// 24-byte header.
     async fn read(&self, id: ObjectId) -> Result<Bytes> {
-        let raw = tokio::fs::read(self.object_path(&id))
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    LedgeError::NotFound(id)
-                } else {
-                    LedgeError::Io(e)
-                }
-            })?;
-
-        if raw.len() < 24 {
-            return Err(LedgeError::Corruption(format!(
-                "object {} too short: {} bytes",
-                id.to_hex(),
-                raw.len()
-            )));
-        }
-
-        // Header byte 21 selects how the body (bytes 24..) is encoded.
-        let enc = raw[21];
-        let body = &raw[24..];
-        let content = match enc {
-            ENC_RAW => body.to_vec(),
-            ENC_ZLIB => zlib_inflate(body, id)?,
-            other => {
-                return Err(LedgeError::Corruption(format!(
-                    "object {}: unknown encoding {other}",
-                    id.to_hex()
-                )))
-            }
-        };
-        Ok(Bytes::from(content))
+        // Header byte 21 selects the encoding (raw / zlib / delta). Delta
+        // objects are resolved recursively; `read_depth` enforces the chain cap.
+        self.read_depth(id, 0).await
     }
 
     /// Return `true` if an object for `id` is present in the store.
@@ -820,5 +990,51 @@ mod tests {
         for b in raw[24..].iter_mut() { *b = 0xff; }
         std::fs::write(&p, &raw).unwrap();
         assert!(ObjectStore::read(&store, id).await.is_err());
+    }
+
+    // ── Task 2: enc=2 delta objects (self-verifying deltify + chain read) ─────
+
+    #[tokio::test]
+    async fn deltify_shrinks_and_reads_back() {
+        let (store, _d) = make_store();
+        let base: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let target = String::from_utf8(base.clone()).unwrap().replace("line 250\n", "EDITED\n").into_bytes();
+        let bid = store.write_git_object(3, Bytes::from(base.clone())).await.unwrap();
+        let tid = store.write_git_object(3, Bytes::from(target.clone())).await.unwrap();
+        let before = std::fs::metadata(store.object_path(&tid)).unwrap().len();
+        assert!(store.deltify(tid, bid).await.unwrap(), "should deltify");
+        let after = std::fs::metadata(store.object_path(&tid)).unwrap().len();
+        assert!(after < before, "delta file {after} < raw {before}");
+        assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), target.as_slice());
+        assert_eq!(store.git_type_of(tid).await.unwrap(), 3);
+        assert_eq!(store.delta_base_of(tid).await.unwrap(), Some(bid));
+        assert_eq!(store.delta_base_of(bid).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn deltify_refuses_when_not_smaller() {
+        let (store, _d) = make_store();
+        let a = store.write_git_object(3, Bytes::from(vec![1u8; 50])).await.unwrap();
+        let b = store.write_git_object(3, Bytes::from((0..50u8).collect::<Vec<_>>())).await.unwrap();
+        let _ = store.deltify(a, b).await.unwrap(); // may refuse (delta not smaller)
+        assert_eq!(ObjectStore::read(&store, a).await.unwrap().len(), 50, "a still reads exact");
+    }
+
+    #[tokio::test]
+    async fn delta_chain_reads_back() {
+        let (store, _d) = make_store();
+        let v0: Vec<u8> = (0..300).flat_map(|i| format!("L{i}\n").into_bytes()).collect();
+        let v1 = String::from_utf8(v0.clone()).unwrap().replace("L100\n","A\n").into_bytes();
+        let v2 = String::from_utf8(v1.clone()).unwrap().replace("L200\n","B\n").into_bytes();
+        let id0 = store.write_git_object(3, Bytes::from(v0)).await.unwrap();
+        let id1 = store.write_git_object(3, Bytes::from(v1.clone())).await.unwrap();
+        let id2 = store.write_git_object(3, Bytes::from(v2.clone())).await.unwrap();
+        assert!(store.deltify(id1, id0).await.unwrap());
+        assert!(store.deltify(id2, id1).await.unwrap()); // chain: id2 -> id1 -> id0
+        assert_eq!(ObjectStore::read(&store, id2).await.unwrap().as_ref(), v2.as_slice());
+        assert_eq!(ObjectStore::read(&store, id1).await.unwrap().as_ref(), v1.as_slice());
+        assert_eq!(ObjectStore::read(&store, id0).await.unwrap().as_ref(), {
+            let v0b: Vec<u8> = (0..300).flat_map(|i| format!("L{i}\n").into_bytes()).collect(); v0b
+        }.as_slice());
     }
 }
