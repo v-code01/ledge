@@ -125,3 +125,24 @@ caches it; git serves a pack precomputed at `gc` time, so git wins the *cold* cl
 precompute at repack (build + cache the pack when objects change, not on first clone) would win
 the cold case too — the documented follow-on. The cache is want-set-keyed (a tip sha uniquely
 determines its closure ⇒ never stale), bounded LRU (32 entries / 256 MiB), per-node in-memory.
+
+
+## Native git packs (the storage IS a git packfile now)
+
+Phases A–D: Ledge's cold tier is a **real git v2 packfile** — written from scratch in Rust,
+**certified by `git verify-pack` running inside the container** (delta chains to length 41), and
+read back by Ledge's BLAKE3 `ObjectId` via a `.lidx` sidecar. One artifact: git-valid (clone-ready)
+and blake3-addressable (Ledge reads).
+
+| Disk (`du`, same source) | Size |
+|---|---|
+| git pack | **1.4 MB** |
+| **Ledge — native git pack, window=64** | **1.9 MB (pack 1.67 MB)** |
+| Ledge — internal pack (pre-git-pack) | 2.3 MB |
+| Ledge — raw, uncompressed | 30 MB |
+
+86% of objects deltify (REF_DELTA, self-verified). The disk gap to git closed from ~1.6× to
+**~1.35×**. Honest residual: git still edges disk (1.4 vs 1.9 MB) via OFS_DELTA + window-250 +
+path-aware base selection — closing it fully (sub-1.4 MB) needs base-index caching to afford a
+250-wide window + OFS deltas (diminishing returns). Repack at window=64 is ~54 s (offline
+maintenance; the raw-length delta ranking made a wide window affordable at all).
