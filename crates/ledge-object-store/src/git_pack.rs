@@ -80,8 +80,13 @@ pub fn write_git_pack(
     let mut recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     for &i in &order {
         if window > 0 {
-            let full_zsz = zlib(&objects[i].content).len();
-            let mut best: Option<(usize, Vec<u8>, usize)> = None; // (base_idx, delta, zsz)
+            let target = &objects[i].content;
+            // Rank candidates by RAW delta length (no zlib per candidate — zlib'ing
+            // every candidate was the cost wall that made a wide window unaffordable).
+            // zlib + self-verify only the single winner. A useful delta must be
+            // smaller than the raw content; keep the smallest such delta in the window.
+            let mut best: Option<(usize, Vec<u8>)> = None;
+            let mut best_len = target.len();
             for &b in recent.iter().take(window) {
                 if objects[b].git_type != objects[i].git_type {
                     continue;
@@ -89,20 +94,20 @@ pub fn write_git_pack(
                 if depth[b] >= MAX_DELTA_DEPTH {
                     continue;
                 }
-                let delta = encode_delta(&objects[b].content, &objects[i].content);
-                // self-verify: never emit a delta git would decode incorrectly.
-                match apply_delta(&objects[b].content, &delta) {
-                    Ok(r) if r == objects[i].content => {}
-                    _ => continue,
-                }
-                let zsz = zlib(&delta).len();
-                if zsz < full_zsz && best.as_ref().map(|x| zsz < x.2).unwrap_or(true) {
-                    best = Some((b, delta, zsz));
+                let delta = encode_delta(&objects[b].content, target);
+                if delta.len() < best_len {
+                    best_len = delta.len();
+                    best = Some((b, delta));
                 }
             }
-            if let Some((b, delta, _)) = best {
-                depth[i] = depth[b] + 1;
-                chosen[i] = Some((b, delta));
+            if let Some((b, delta)) = best {
+                // self-verify the winner (never emit a delta git would mis-decode),
+                // and only commit if its zlib actually beats the full object's zlib.
+                let verified = matches!(apply_delta(&objects[b].content, &delta), Ok(ref r) if r == target);
+                if verified && zlib(&delta).len() < zlib(target).len() {
+                    depth[i] = depth[b] + 1;
+                    chosen[i] = Some((b, delta));
+                }
             }
         }
         recent.push_front(i);
