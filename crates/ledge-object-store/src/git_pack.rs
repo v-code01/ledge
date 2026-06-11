@@ -1,9 +1,17 @@
-//! Native git v2 packfile + index writer. NON-DELTA (every object zlib(content)).
+//! Native git v2 packfile + index writer.
+//! Phase A1: NON-DELTA (every object zlib(content)).
+//! Phase A2: optional REF_DELTA compression against a same-type, larger-first
+//! window of recently-written objects (self-verified — never emit a wrong delta).
 //! Validated against git's own `verify-pack`/`unpack-objects`.
 
 use std::io::Write;
 
+use ledge_core::delta::{apply_delta, encode_delta};
 use ledge_core::{LedgeError, Result};
+
+/// Cap on delta-chain depth. git's own default is `--depth=50`; we honour the
+/// same ceiling so `verify-pack` never trips its "delta chain too long" guard.
+const MAX_DELTA_DEPTH: usize = 50;
 
 pub struct PackObject {
     pub git_type: u8, // 1=commit 2=tree 3=blob 4=tag
@@ -31,31 +39,101 @@ fn write_obj_header(out: &mut Vec<u8>, git_type: u8, mut size: usize) {
     out.push(byte);
 }
 
-/// Write a git v2 pack + idx (non-delta). Returns (pack_bytes, idx_bytes).
+/// Write a git v2 pack + idx. Returns (pack_bytes, idx_bytes).
 ///
-/// Complexity: O(n log n) over object count (idx requires sha-sorted order);
-/// each object is compressed once and its CRC-32 computed once.
+/// `window > 0` enables REF_DELTA compression: each object is matched against
+/// the `window` most-recently-written same-type objects (processed largest-first
+/// within a type so deltas describe a smaller target against a larger base), and
+/// is stored as a delta iff the zlib(delta) is strictly smaller than its full
+/// zlib(content) AND the delta round-trips (`apply_delta(base, delta) == content`).
+/// `window == 0` is the Phase A1 non-delta path, byte-for-byte unchanged.
+///
+/// Complexity: O(n log n) for the idx sort, plus O(n · window) delta probes (each
+/// an `encode_delta` + verifying `apply_delta` + a zlib of the candidate delta).
 /// Side effects: none (pure). Errors only on packs that would exceed the
-/// 4-byte (2 GiB) offset table this Phase A1 writer supports.
-pub fn write_git_pack(objects: &[PackObject]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// 4-byte (2 GiB) offset table this writer supports.
+pub fn write_git_pack(objects: &[PackObject], window: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    let n = objects.len();
+
+    // ---- base selection ----
+    // Process objects grouped by type, largest-first, so a delta encodes a
+    // smaller target against a larger (already-written) base. `order` is the
+    // pack write order; `chosen[i]` is the picked (base_index, delta_bytes) for
+    // object i (or None = store full); `depth[i]` is its delta-chain depth.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        objects[a]
+            .git_type
+            .cmp(&objects[b].git_type)
+            .then(objects[b].content.len().cmp(&objects[a].content.len()))
+    });
+    let mut chosen: Vec<Option<(usize, Vec<u8>)>> = vec![None; n];
+    let mut depth: Vec<usize> = vec![0; n];
+    // `recent`: window of already-processed indices, most-recent first.
+    let mut recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for &i in &order {
+        if window > 0 {
+            let full_zsz = zlib(&objects[i].content).len();
+            let mut best: Option<(usize, Vec<u8>, usize)> = None; // (base_idx, delta, zsz)
+            for &b in recent.iter().take(window) {
+                if objects[b].git_type != objects[i].git_type {
+                    continue;
+                }
+                if depth[b] >= MAX_DELTA_DEPTH {
+                    continue;
+                }
+                let delta = encode_delta(&objects[b].content, &objects[i].content);
+                // self-verify: never emit a delta git would decode incorrectly.
+                match apply_delta(&objects[b].content, &delta) {
+                    Ok(r) if r == objects[i].content => {}
+                    _ => continue,
+                }
+                let zsz = zlib(&delta).len();
+                if zsz < full_zsz && best.as_ref().map(|x| zsz < x.2).unwrap_or(true) {
+                    best = Some((b, delta, zsz));
+                }
+            }
+            if let Some((b, delta, _)) = best {
+                depth[i] = depth[b] + 1;
+                chosen[i] = Some((b, delta));
+            }
+        }
+        recent.push_front(i);
+        if recent.len() > window.max(1) {
+            recent.pop_back();
+        }
+    }
+
     // ---- pack ----
     let mut pack = Vec::new();
     pack.extend_from_slice(b"PACK");
     pack.extend_from_slice(&2u32.to_be_bytes());
-    pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    pack.extend_from_slice(&(n as u32).to_be_bytes());
     // record (sha1, offset, crc32) per object for the idx
-    let mut entries: Vec<([u8; 20], u64, u32)> = Vec::with_capacity(objects.len());
-    for o in objects {
+    let mut entries: Vec<([u8; 20], u64, u32)> = Vec::with_capacity(n);
+    for &i in &order {
+        let o = &objects[i];
         let offset = pack.len() as u64;
         if offset >= 0x8000_0000 {
             return Err(LedgeError::Corruption(
-                "git_pack: large-offset packs unsupported (Phase A1)".into(),
+                "git_pack: large-offset packs unsupported".into(),
             ));
         }
         let start = pack.len();
-        write_obj_header(&mut pack, o.git_type, o.content.len());
-        pack.extend_from_slice(&zlib(&o.content));
-        // crc32 of the object's packed bytes (header + zlib)
+        match &chosen[i] {
+            Some((b, delta)) => {
+                // REF_DELTA (type 7): header size is the delta length, then the
+                // 20-byte base sha1, then zlib(delta).
+                write_obj_header(&mut pack, 7, delta.len());
+                pack.extend_from_slice(&objects[*b].sha1);
+                pack.extend_from_slice(&zlib(delta));
+            }
+            None => {
+                write_obj_header(&mut pack, o.git_type, o.content.len());
+                pack.extend_from_slice(&zlib(&o.content));
+            }
+        }
+        // crc32 of the object's packed bytes (header + base sha + zlib)
         let mut crc = flate2::Crc::new();
         crc.update(&pack[start..]);
         entries.push((o.sha1, offset, crc.sum()));
@@ -212,7 +290,7 @@ mod tests {
 
         // 3) Write our pack+idx, name by the pack-trailer sha (git convention is
         //    flexible; we just place both).
-        let (pack, idx) = write_git_pack(&objs).unwrap();
+        let (pack, idx) = write_git_pack(&objs, 0).unwrap();
         let out = tempfile::tempdir().unwrap();
         let packdir = out.path().join("pk");
         std::fs::create_dir_all(&packdir).unwrap();
@@ -267,6 +345,133 @@ mod tests {
             };
             let got = git(&["cat-file", ty, &hex], dst.path());
             assert_eq!(got, o.content, "unpacked object {hex} content mismatch");
+        }
+    }
+
+    // Build a deltifiable object set via real git (a big file edited across
+    // commits), returning Vec<PackObject>. Reuses the A1 `git()` helper +
+    // cat-file enumeration.
+    async fn deltifiable_objects() -> Vec<PackObject> {
+        let repo = tempfile::tempdir().unwrap();
+        git(&["init", "--initial-branch=main", "."], repo.path());
+        git(&["config", "user.email", "t@l"], repo.path());
+        git(&["config", "user.name", "t"], repo.path());
+        let base: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        for v in 0..6 {
+            std::fs::write(
+                repo.path().join("f.txt"),
+                base.replace("line 5\n", &format!("V{v}\n")),
+            )
+            .unwrap();
+            git(&["add", "."], repo.path());
+            git(&["commit", "-m", &format!("c{v}")], repo.path());
+        }
+        // enumerate (sha,type,content) exactly like the A1 test
+        let names = git(
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+            repo.path(),
+        );
+        let mut objs = Vec::new();
+        for line in String::from_utf8(names).unwrap().lines() {
+            let mut it = line.split_whitespace();
+            let sha_hex = it.next().unwrap();
+            let ty = it.next().unwrap();
+            let content = git(&["cat-file", ty, sha_hex], repo.path());
+            let git_type = match ty {
+                "commit" => 1u8,
+                "tree" => 2,
+                "blob" => 3,
+                "tag" => 4,
+                _ => panic!(),
+            };
+            let mut sha1 = [0u8; 20];
+            for i in 0..20 {
+                sha1[i] = u8::from_str_radix(&sha_hex[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            objs.push(PackObject {
+                git_type,
+                content,
+                sha1,
+            });
+        }
+        objs
+    }
+
+    #[tokio::test]
+    async fn delta_pack_validates_and_is_smaller() {
+        let objs = deltifiable_objects().await;
+        let (pack_d, idx_d) = write_git_pack(&objs, 16).unwrap();
+        let (pack_full, _) = write_git_pack(&objs, 0).unwrap();
+        println!(
+            "delta pack = {} bytes, non-delta = {} bytes ({} objects)",
+            pack_d.len(),
+            pack_full.len(),
+            objs.len()
+        );
+        // 1) measurably smaller
+        assert!(
+            pack_d.len() < pack_full.len(),
+            "delta pack {} should be < non-delta {}",
+            pack_d.len(),
+            pack_full.len()
+        );
+        // 2) git verify-pack accepts the DELTA pack + reports a delta chain
+        let out = tempfile::tempdir().unwrap();
+        let pd = out.path().join("pk");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(pd.join("d.pack"), &pack_d).unwrap();
+        std::fs::write(pd.join("d.idx"), &idx_d).unwrap();
+        let vp = std::process::Command::new("git")
+            .args(["verify-pack", "-v", pd.join("d.idx").to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            vp.status.success(),
+            "verify-pack rejected delta pack:\n{}\n{}",
+            String::from_utf8_lossy(&vp.stdout),
+            String::from_utf8_lossy(&vp.stderr)
+        );
+        // a delta chain present (verify-pack -v prints "chain length = N" lines,
+        // or per-object "X delta")
+        let vptxt = String::from_utf8_lossy(&vp.stdout);
+        assert!(
+            vptxt.contains("chain length") || vptxt.lines().any(|l| l.contains(" delta ")),
+            "expected a delta in the pack:\n{vptxt}"
+        );
+        // 3) unpack-objects round-trips every object byte-identical
+        let dst = tempfile::tempdir().unwrap();
+        git(&["init", "--bare", "."], dst.path());
+        let st = std::process::Command::new("git")
+            .args(["unpack-objects"])
+            .current_dir(dst.path())
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(pd.join("d.pack")).unwrap(),
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "unpack-objects: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        for o in &objs {
+            let hex: String = o.sha1.iter().map(|b| format!("{b:02x}")).collect();
+            let ty = match o.git_type {
+                1 => "commit",
+                2 => "tree",
+                3 => "blob",
+                4 => "tag",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                git(&["cat-file", ty, &hex], dst.path()),
+                o.content,
+                "object {hex} mismatch"
+            );
         }
     }
 }
