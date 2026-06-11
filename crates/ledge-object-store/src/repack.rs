@@ -38,56 +38,68 @@ const WINDOW: usize = 16;
 /// fail to shrink is rejected and the full object is left untouched. Returns the
 /// pass statistics; on-disk size never increases.
 pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> {
-    let ids = store.list_all_ids().await?;
-    let mut stats = RepackStats { objects_seen: ids.len(), ..Default::default() };
-    let mut items: Vec<(u8, u64, ObjectId)> = Vec::new();
-    for id in ids {
-        if store.delta_base_of(id).await?.is_some() {
-            continue; // already a delta
-        }
-        let ty = match store.git_type_of(id).await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let size = ledge_core::ObjectStore::read(store, id).await.map(|b| b.len() as u64).unwrap_or(0);
-        stats.bytes_before += std::fs::metadata(store.object_path(&id)).map(|m| m.len()).unwrap_or(0);
-        items.push((ty, size, id));
-    }
-    items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))); // type asc, size desc
-    for i in 0..items.len() {
-        let (ty_i, _sz, id_i) = items[i];
-        let lo = i.saturating_sub(WINDOW);
-        // Larger same-type neighbours in `[lo, i)` are candidate delta bases.
-        for &(ty_j, _, base_j) in &items[lo..i] {
-            if ty_j != ty_i {
-                continue;
-            }
-            if store.deltify(id_i, base_j).await.unwrap_or(false) {
-                stats.objects_deltified += 1;
-                break;
-            }
-        }
-    }
-    for (_, _, id) in &items {
-        stats.bytes_after += std::fs::metadata(store.object_path(id)).map(|m| m.len()).unwrap_or(0);
+    let all_ids = store.list_all_ids().await?;
+    let mut stats = RepackStats { objects_seen: all_ids.len(), ..Default::default() };
+
+    // On-disk bytes of the (loose) repack candidates before the pass — the same
+    // accounting the old internal-deltify path reported. A packed-only object has
+    // no loose file, so its metadata read fails and contributes 0.
+    for id in &all_ids {
+        stats.bytes_before += std::fs::metadata(store.object_path(id)).map(|m| m.len()).unwrap_or(0);
     }
 
-    // ---- PACK: consolidate every present object into one new pack ----
     // Real file count before the pack stage: every loose object file plus every
     // existing pack-dir entry. This is what the dogfood/admin stats compare
     // against `files_after`.
     stats.files_before = count_loose_files(store) + count_pack_dir(store);
-    let all_ids = store.list_all_ids().await?;
-    let mut records: Vec<(ledge_core::ObjectId, Vec<u8>)> = Vec::with_capacity(all_ids.len());
+
+    // ---- PACK: consolidate every present object into one native git pack ----
+    // Collect each kept object as a PackObject (delta-resolved content + git
+    // sha1 + type). `write_git_pack` does its OWN REF_DELTA compression over a
+    // same-type, larger-first window, so we deliberately drop the old per-loose
+    // internal-delta pre-pass: the pack format owns deltification now.
+    let mut pobjs: Vec<crate::git_pack::PackObject> = Vec::with_capacity(all_ids.len());
+    // (oid, sha1, type) parallel to `pobjs`, used to build the `.lidx` rows.
+    let mut meta: Vec<(ObjectId, [u8; 20], u8)> = Vec::with_capacity(all_ids.len());
     for id in &all_ids {
-        if let Some(bytes) = store.raw_record(*id).await? {
-            records.push((*id, bytes));
-        }
+        let content = match ledge_core::ObjectStore::read(store, *id).await {
+            Ok(c) => c.to_vec(),
+            Err(_) => continue, // unreadable object: skip rather than abort the pass
+        };
+        let git_type = store.git_type_of(*id).await?;
+        let sha1 = store.sha1_of(*id).await?;
+        pobjs.push(crate::git_pack::PackObject { git_type, content, sha1 });
+        meta.push((*id, sha1, git_type));
     }
+
+    let (pack, idx, offsets) = crate::git_pack::write_git_pack(&pobjs, WINDOW)?;
+    let lidx_entries: Vec<crate::git_pack_file::LidxEntry> = meta
+        .iter()
+        .zip(&offsets)
+        .map(|((oid, sha1, t), off)| crate::git_pack_file::LidxEntry {
+            oid: *oid,
+            sha1: *sha1,
+            git_type: *t,
+            offset: *off,
+        })
+        .collect();
+    let lidx = crate::git_pack_file::write_lidx(&lidx_entries);
+
+    // Name the pack triple by blake3 of the pack bytes — content-addressed, so a
+    // re-run that produces identical bytes is idempotent.
+    let name = blake3::hash(&pack).to_hex().to_string();
+    let dir = store.pack_dir();
     let old_packs = store.pack_paths(); // snapshot BEFORE swap
-    let new_pack = crate::pack::PackWriter::write(&store.pack_dir(), records)?;
-    let new_ids = new_pack.ids();
-    store.swap_packs(vec![std::sync::Arc::new(new_pack)]); // register BEFORE any delete
+    std::fs::create_dir_all(&dir).map_err(ledge_core::LedgeError::Io)?;
+    // Atomic-ish publish: write each member to a tmp sibling then rename into place.
+    for (ext, bytes) in [("pack", &pack), ("idx", &idx), ("lidx", &lidx)] {
+        let tmp = dir.join(format!(".{name}.{ext}.tmp"));
+        std::fs::write(&tmp, bytes.as_slice()).map_err(ledge_core::LedgeError::Io)?;
+        std::fs::rename(&tmp, dir.join(format!("{name}.{ext}"))).map_err(ledge_core::LedgeError::Io)?;
+    }
+    let new_pf = crate::git_pack_file::GitPackFile::open(&dir.join(format!("{name}.pack")))?;
+    let new_ids = new_pf.oids();
+    store.swap_packs(vec![std::sync::Arc::new(new_pf)]); // register BEFORE any delete
 
     // verify every object reads back through the real (now pack-backed) path
     // BEFORE deleting anything. A failure here returns Err via `?` with loose +
@@ -96,14 +108,15 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         ledge_core::ObjectStore::read(store, *id).await
             .map_err(|e| ledge_core::LedgeError::Corruption(format!("repack verify {}: {e}", id.to_hex())))?;
     }
-    // safe now: delete loose files that are packed + the OLD pack/idx files.
+    // safe now: delete loose files that are packed + the OLD pack/idx/lidx files.
     for id in &new_ids {
         let lp = store.object_path(id);
         if lp.exists() { let _ = std::fs::remove_file(&lp); }
     }
     for op in &old_packs {
-        let _ = std::fs::remove_file(op);
-        let _ = std::fs::remove_file(op.with_extension("idx"));
+        for ext in ["pack", "idx", "lidx"] {
+            let _ = std::fs::remove_file(op.with_extension(ext));
+        }
     }
     // Prune the now-empty `objects/<XX>/<YY>` loose dirs left behind by the deletes:
     // each empty dir still costs a filesystem block, which would otherwise dominate
@@ -131,6 +144,22 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         }
     }
     stats.objects_packed = new_ids.len();
+    // Post-pass footprint = total bytes of the consolidated pack directory (the
+    // loose files are gone). Count REF_DELTAs as the deltified tally.
+    stats.bytes_after = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| std::fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    let mut deltified = 0usize;
+    for id in &new_ids {
+        if store.delta_base_of(*id).await?.is_some() {
+            deltified += 1;
+        }
+    }
+    stats.objects_deltified = deltified;
     stats.files_after = std::fs::read_dir(store.pack_dir()).map(|rd| rd.count()).unwrap_or(0);
 
     Ok(stats)
@@ -223,10 +252,19 @@ mod tests {
         for (i, c) in ids.iter().zip(&contents) {
             assert_eq!(ledge_core::ObjectStore::read(&store, *i).await.unwrap().as_ref(), c.as_slice(), "exact post-pack");
         }
-        // exactly one .pack + one .idx remain
+        // exactly one .pack + one .idx + one .lidx remain
         let packdir = dir.path().join("objects").join("pack");
         let packs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="pack")).count();
         assert_eq!(packs, 1, "one pack file");
+        let idxs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="idx")).count();
+        assert_eq!(idxs, 1, "one idx file");
+        let lidxs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="lidx")).count();
+        assert_eq!(lidxs, 1, "one lidx file");
+        // git itself must accept the stored pack as a valid git packfile.
+        let packfile = std::fs::read_dir(&packdir).unwrap()
+            .filter_map(|e| e.ok()).find(|e| e.path().extension().is_some_and(|x| x=="idx")).unwrap().path();
+        let vp = std::process::Command::new("git").args(["verify-pack","-v", packfile.to_str().unwrap()]).output().unwrap();
+        assert!(vp.status.success(), "git verify-pack on the stored pack: {}", String::from_utf8_lossy(&vp.stderr));
         // empty loose dirs are pruned (else they dominate du after packing)
         let empty_loose_dirs = std::fs::read_dir(dir.path().join("objects")).unwrap()
             .filter_map(|e| e.ok())

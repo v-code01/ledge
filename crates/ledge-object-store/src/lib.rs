@@ -3,7 +3,6 @@ pub mod git_pack;
 pub mod git_pack_file;
 pub mod graph;
 pub mod io;
-pub mod pack;
 pub mod repack;
 
 pub use disk::DiskObjectStore;

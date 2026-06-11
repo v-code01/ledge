@@ -89,7 +89,7 @@ pub struct DiskObjectStore {
     /// the loose file first, then each pack in turn (loose shadows pack). The
     /// `ArcSwap` lets a repack atomically publish a new pack set while concurrent
     /// reads continue against the old snapshot they already loaded.
-    packs: std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::pack::PackFile>>>>,
+    packs: std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::git_pack_file::GitPackFile>>>>,
     /// Cached `git-SHA-1 → ObjectId` reverse index, lazily built on first
     /// [`Self::sha1_index`] and reused across calls. `None` means "stale, rebuild
     /// on next read". Invalidated on every loose write and on `swap_packs` (the
@@ -118,7 +118,7 @@ impl DiskObjectStore {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().is_some_and(|x| x == "pack") {
-                    if let Ok(pf) = crate::pack::PackFile::open(&p) {
+                    if let Ok(pf) = crate::git_pack_file::GitPackFile::open(&p) {
                         packs.push(std::sync::Arc::new(pf));
                     }
                 }
@@ -150,7 +150,7 @@ impl DiskObjectStore {
     /// Atomically replace the registered pack set. Concurrent readers holding an
     /// older snapshot finish against it; subsequent `.load()`s see `v`. Used by
     /// repack to publish freshly written packs without quiescing the store.
-    pub fn swap_packs(&self, v: Vec<std::sync::Arc<crate::pack::PackFile>>) {
+    pub fn swap_packs(&self, v: Vec<std::sync::Arc<crate::git_pack_file::GitPackFile>>) {
         self.packs.store(std::sync::Arc::new(v));
         // The packed half of the index just changed (repack published new packs);
         // invalidate so the next sha1_index() folds in the new packs' sha1_maps.
@@ -160,30 +160,23 @@ impl DiskObjectStore {
     /// Paths of every currently-registered pack (snapshot at call time). Lets a
     /// repack identify which packs it just superseded so they can be unlinked.
     pub fn pack_paths(&self) -> Vec<PathBuf> {
-        self.packs.load().iter().map(|p| p.pack_path()).collect()
+        self.packs.load().iter().map(|p| p.pack_path().to_path_buf()).collect()
     }
 
-    /// The exact stored file image for `id`: the loose file if present, else the
-    /// first pack that holds it, else `None`.
+    /// The 24-byte-header loose-object file image for `id`, or `None` if no loose
+    /// file exists (NotFound is mapped to `None`, not an error).
     ///
-    /// This is the single byte source for every accessor on the read path
-    /// (`read_depth`, `sha1_of`, `git_type_of`, `delta_base_of`, `exists`). A
-    /// pack record is byte-identical to a loose object file, so callers parse the
-    /// returned image with no awareness of where it came from. Loose shadows pack:
-    /// a re-materialized loose copy always wins, which is what lets GC/repack
-    /// stage loose objects atop a pack without a read seeing stale bytes.
-    pub(crate) async fn raw_record(&self, id: ObjectId) -> ledge_core::Result<Option<Vec<u8>>> {
+    /// This is the LOOSE tier only. Every read-path accessor consults this first
+    /// (loose shadows pack), then falls through to the registered [`GitPackFile`]s
+    /// via their own typed methods (`read`/`sha1_of`/`git_type_of`/…). A
+    /// re-materialized loose copy always wins, which is what lets GC/repack stage
+    /// loose objects atop a pack without a read seeing stale bytes.
+    pub(crate) async fn loose_bytes(&self, id: ObjectId) -> ledge_core::Result<Option<Vec<u8>>> {
         match tokio::fs::read(self.object_path(&id)).await {
-            Ok(r) => return Ok(Some(r)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(LedgeError::Io(e)),
+            Ok(r) => Ok(Some(r)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LedgeError::Io(e)),
         }
-        for pf in self.packs.load().iter() {
-            if let Some(bytes) = pf.get(id) {
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
     }
 
     /// Return the Git-compatible SHA-1 stored in the 20-byte header of an
@@ -194,15 +187,24 @@ impl DiskObjectStore {
     /// Returns [`LedgeError::Corruption`] if the file is shorter than 20 bytes.
     #[instrument(skip(self), fields(id = %id.to_hex()))]
     pub async fn sha1_of(&self, id: ObjectId) -> Result<[u8; 20]> {
-        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
-        if raw.len() < 20 {
-            return Err(LedgeError::Corruption(format!(
-                "object {} header truncated: {} bytes",
-                id.to_hex(),
-                raw.len()
-            )));
+        // Loose tier: the canonical git SHA-1 is the first 20 header bytes.
+        if let Some(raw) = self.loose_bytes(id).await? {
+            if raw.len() < 20 {
+                return Err(LedgeError::Corruption(format!(
+                    "object {} header truncated: {} bytes",
+                    id.to_hex(),
+                    raw.len()
+                )));
+            }
+            return Ok(raw[..20].try_into().unwrap());
         }
-        Ok(raw[..20].try_into().unwrap())
+        // Pack tier: first GitPackFile that carries the id wins.
+        for pf in self.packs.load().iter() {
+            if let Some(sha1) = pf.sha1_of(id) {
+                return Ok(sha1);
+            }
+        }
+        Err(LedgeError::NotFound(id))
     }
 
     /// Git object type tags (pack/loose object kinds).
@@ -371,8 +373,8 @@ impl DiskObjectStore {
         // and its packed copy share the same git SHA-1 → same ObjectId, so the
         // insert order between halves is immaterial (idempotent on collision).
         for pf in self.packs.load().iter() {
-            for (sha1, id) in pf.sha1_map() {
-                map.insert(*sha1, *id);
+            for (sha1, id) in pf.sha1_pairs() {
+                map.insert(sha1, id);
             }
         }
         let arc = std::sync::Arc::new(map);
@@ -410,7 +412,7 @@ impl DiskObjectStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No loose tree yet, but packs may still hold objects.
                 for pf in self.packs.load().iter() {
-                    for id in pf.ids() {
+                    for id in pf.oids() {
                         ids.insert(id);
                     }
                 }
@@ -446,7 +448,7 @@ impl DiskObjectStore {
         }
         // Union in every packed id (loose entries already deduped by the set).
         for pf in self.packs.load().iter() {
-            for id in pf.ids() {
+            for id in pf.oids() {
                 ids.insert(id);
             }
         }
@@ -473,14 +475,23 @@ impl DiskObjectStore {
 
     /// Read the git object type byte from the header (reserved[0]).
     pub async fn git_type_of(&self, id: ObjectId) -> ledge_core::Result<u8> {
-        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
-        if raw.len() < 24 {
-            return Err(ledge_core::LedgeError::Corruption(format!(
-                "object {} header truncated",
-                id.to_hex()
-            )));
+        // Loose tier: git object type is header byte 20.
+        if let Some(raw) = self.loose_bytes(id).await? {
+            if raw.len() < 24 {
+                return Err(ledge_core::LedgeError::Corruption(format!(
+                    "object {} header truncated",
+                    id.to_hex()
+                )));
+            }
+            return Ok(raw[20]);
         }
-        Ok(raw[20])
+        // Pack tier: the type is carried in the `.lidx` row.
+        for pf in self.packs.load().iter() {
+            if let Some(t) = pf.git_type_of(id) {
+                return Ok(t);
+            }
+        }
+        Err(LedgeError::NotFound(id))
     }
 
     /// Generate a unique temporary file path inside the staging directory.
@@ -497,16 +508,24 @@ impl DiskObjectStore {
     /// (bytes 0..56), never the variable-length body — cheap enough to walk a
     /// whole chain. A missing object is `Ok(None)`.
     pub async fn delta_base_of(&self, id: ObjectId) -> ledge_core::Result<Option<ObjectId>> {
-        let raw = match self.raw_record(id).await? {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        if raw.len() < 56 || raw[21] != ENC_DELTA {
-            return Ok(None);
+        // Loose tier: enc byte 21 == ENC_DELTA → base id lives in bytes 24..56.
+        if let Some(raw) = self.loose_bytes(id).await? {
+            if raw.len() < 56 || raw[21] != ENC_DELTA {
+                return Ok(None);
+            }
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&raw[24..56]);
+            return Ok(Some(ObjectId::from_bytes(b)));
         }
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&raw[24..56]);
-        Ok(Some(ObjectId::from_bytes(b)))
+        // Pack tier: ask the first pack that carries the id. A pack whose record
+        // for `id` is a REF_DELTA returns Some(base); a full object returns
+        // Ok(None) — either way `pf.contains(id)` is the signal we found it.
+        for pf in self.packs.load().iter() {
+            if pf.contains(id) {
+                return pf.delta_base_of(id);
+            }
+        }
+        Ok(None)
     }
 
     /// Length of the delta chain rooted at `id`, in hops, clamped at
@@ -632,9 +651,21 @@ impl DiskObjectStore {
     /// [`MAX_CHAIN`] hops. `depth` is the number of delta links already
     /// traversed; the cap guarantees termination on cyclic/oversized chains.
     async fn read_depth(&self, id: ObjectId, depth: usize) -> Result<Bytes> {
-        // Byte source is loose-or-pack; the rest of the decoder is source-agnostic
-        // since a pack record is a byte-identical loose-object image.
-        let raw = self.raw_record(id).await?.ok_or(LedgeError::NotFound(id))?;
+        // Loose tier first (loose shadows pack). A loose file carries our 24-byte
+        // header + encoded body (raw / zlib / delta); delta resolves recursively.
+        let raw = match self.loose_bytes(id).await? {
+            Some(r) => r,
+            None => {
+                // Pack tier: GitPackFile.read resolves REF_DELTA internally and
+                // returns the full content. First pack carrying the id wins.
+                for pf in self.packs.load().iter() {
+                    if let Some(c) = pf.read(id)? {
+                        return Ok(Bytes::from(c));
+                    }
+                }
+                return Err(LedgeError::NotFound(id));
+            }
+        };
 
         if raw.len() < 24 {
             return Err(LedgeError::Corruption(format!(
@@ -738,8 +769,13 @@ impl ObjectStore for DiskObjectStore {
 
     /// Return `true` if an object for `id` is present in the store.
     async fn exists(&self, id: ObjectId) -> Result<bool> {
-        // Presence = loose file OR any registered pack holds the id.
-        Ok(self.raw_record(id).await?.is_some())
+        // Presence = loose metadata OR any registered pack holds the id.
+        match tokio::fs::metadata(self.object_path(&id)).await {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(LedgeError::Io(e)),
+        }
+        Ok(self.packs.load().iter().any(|pf| pf.contains(id)))
     }
 }
 
@@ -755,6 +791,48 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = DiskObjectStore::new(dir.path().to_path_buf()).unwrap();
         (store, dir)
+    }
+
+    /// Pack the given `(oid, git_type, content, sha1)` objects into a real git
+    /// packfile (`.pack` + `.idx` + `.lidx`) in the store's pack_dir and return an
+    /// opened [`GitPackFile`] over it. `write_git_pack` with a non-zero window may
+    /// store some objects as REF_DELTA against larger same-type neighbours.
+    async fn pack_objects(
+        store: &DiskObjectStore,
+        objs: &[(ObjectId, u8, Vec<u8>, [u8; 20])],
+    ) -> std::sync::Arc<crate::git_pack_file::GitPackFile> {
+        let pobjs: Vec<crate::git_pack::PackObject> = objs
+            .iter()
+            .map(|(_, t, c, s)| crate::git_pack::PackObject {
+                git_type: *t,
+                content: c.clone(),
+                sha1: *s,
+            })
+            .collect();
+        let (pack, idx, offs) = crate::git_pack::write_git_pack(&pobjs, 16).unwrap();
+        let name = "test";
+        let dir = store.pack_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.pack")), &pack).unwrap();
+        std::fs::write(dir.join(format!("{name}.idx")), &idx).unwrap();
+        let lidx: Vec<crate::git_pack_file::LidxEntry> = objs
+            .iter()
+            .zip(offs)
+            .map(|((oid, t, _, s), off)| crate::git_pack_file::LidxEntry {
+                oid: *oid,
+                sha1: *s,
+                git_type: *t,
+                offset: off,
+            })
+            .collect();
+        std::fs::write(
+            dir.join(format!("{name}.lidx")),
+            crate::git_pack_file::write_lidx(&lidx),
+        )
+        .unwrap();
+        std::sync::Arc::new(
+            crate::git_pack_file::GitPackFile::open(&dir.join(format!("{name}.pack"))).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -1148,9 +1226,9 @@ mod tests {
         let (store, _d) = make_store();
         let content = (0..400).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>();
         let id = store.write_git_object(3, Bytes::from(content.clone())).await.unwrap();
-        let raw = std::fs::read(store.object_path(&id)).unwrap();
-        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
-        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        let sha1 = store.sha1_of(id).await.unwrap();
+        let pf = pack_objects(&store, &[(id, 3, content.clone(), sha1)]).await;
+        store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&id)).unwrap(); // loose gone — only the pack has it
         assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), content.as_slice());
         assert_eq!(store.git_type_of(id).await.unwrap(), 3);
@@ -1164,13 +1242,18 @@ mod tests {
         let (store, _d) = make_store();
         let base = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>();
         let edited = String::from_utf8(base.clone()).unwrap().replace("l200\n","E\n").into_bytes();
-        let bid = store.write_git_object(3, Bytes::from(base)).await.unwrap();
+        let bid = store.write_git_object(3, Bytes::from(base.clone())).await.unwrap();
         let tid = store.write_git_object(3, Bytes::from(edited.clone())).await.unwrap();
-        assert!(store.deltify(tid, bid).await.unwrap());
-        let rb = std::fs::read(store.object_path(&bid)).unwrap();
-        let rt = std::fs::read(store.object_path(&tid)).unwrap();
-        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(bid, rb), (tid, rt)]).unwrap();
-        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        let bsha1 = store.sha1_of(bid).await.unwrap();
+        let tsha1 = store.sha1_of(tid).await.unwrap();
+        // Pack both: write_git_pack(window=16) will store `edited` as a REF_DELTA
+        // against the larger `base` INSIDE the pack — git-native delta, not ours.
+        let pf = pack_objects(
+            &store,
+            &[(bid, 3, base, bsha1), (tid, 3, edited.clone(), tsha1)],
+        )
+        .await;
+        store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&bid)).unwrap();
         std::fs::remove_file(store.object_path(&tid)).unwrap();
         assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), edited.as_slice());
@@ -1180,16 +1263,16 @@ mod tests {
     #[tokio::test]
     async fn sha1_index_two_tier_and_cached() {
         let (store, _d) = make_store();
-        let id = store.write_git_object(3, Bytes::from((0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>())).await.unwrap();
+        let content = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>();
+        let id = store.write_git_object(3, Bytes::from(content.clone())).await.unwrap();
         let sha1 = store.sha1_of(id).await.unwrap();
         let a = store.sha1_index().await.unwrap();
         let b = store.sha1_index().await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&a, &b), "cached: same Arc on repeat call");
         assert_eq!(a.get(&sha1).copied(), Some(id));
         // pack it, prune loose, swap → cache invalidated + packed object still indexed
-        let raw = std::fs::read(store.object_path(&id)).unwrap();
-        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
-        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        let pf = pack_objects(&store, &[(id, 3, content, sha1)]).await;
+        store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&id)).unwrap();
         let c = store.sha1_index().await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&a, &c), "swap_packs invalidated the cache");
@@ -1213,9 +1296,9 @@ mod tests {
         let id = store.write_git_object(3, Bytes::from(c.clone())).await.unwrap();
         // pack a DIFFERENT byte image under the same id path won't happen (content-addressed);
         // just assert that with both loose present and a pack registered, read uses loose.
-        let raw = std::fs::read(store.object_path(&id)).unwrap();
-        let pf = crate::pack::PackWriter::write(&store.pack_dir(), vec![(id, raw)]).unwrap();
-        store.swap_packs(vec![std::sync::Arc::new(pf)]);
+        let sha1 = store.sha1_of(id).await.unwrap();
+        let pf = pack_objects(&store, &[(id, 3, c.clone(), sha1)]).await;
+        store.swap_packs(vec![pf]);
         assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), c.as_slice()); // loose still there
     }
 }
