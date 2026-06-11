@@ -39,7 +39,11 @@ fn write_obj_header(out: &mut Vec<u8>, git_type: u8, mut size: usize) {
     out.push(byte);
 }
 
-/// Write a git v2 pack + idx. Returns (pack_bytes, idx_bytes).
+/// Write a git v2 pack + idx. Returns (pack_bytes, idx_bytes, offsets).
+///
+/// `offsets[i]` is the pack byte-offset of `objects[i]` in INPUT order (the
+/// `.lidx` bridge keys blake3 ObjectIds to these offsets so a reader can seek
+/// directly into the pack without git's sha1-keyed `.idx`).
 ///
 /// `window > 0` enables REF_DELTA compression: each object is matched against
 /// the `window` most-recently-written same-type objects (processed largest-first
@@ -52,7 +56,10 @@ fn write_obj_header(out: &mut Vec<u8>, git_type: u8, mut size: usize) {
 /// an `encode_delta` + verifying `apply_delta` + a zlib of the candidate delta).
 /// Side effects: none (pure). Errors only on packs that would exceed the
 /// 4-byte (2 GiB) offset table this writer supports.
-pub fn write_git_pack(objects: &[PackObject], window: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn write_git_pack(
+    objects: &[PackObject],
+    window: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u64>)> {
     let n = objects.len();
 
     // ---- base selection ----
@@ -111,9 +118,12 @@ pub fn write_git_pack(objects: &[PackObject], window: usize) -> Result<(Vec<u8>,
     pack.extend_from_slice(&(n as u32).to_be_bytes());
     // record (sha1, offset, crc32) per object for the idx
     let mut entries: Vec<([u8; 20], u64, u32)> = Vec::with_capacity(n);
+    // `offsets[orig_idx]` = pack byte-offset of objects[orig_idx] (INPUT order).
+    let mut offsets = vec![0u64; n];
     for &i in &order {
         let o = &objects[i];
         let offset = pack.len() as u64;
+        offsets[i] = offset;
         if offset >= 0x8000_0000 {
             return Err(LedgeError::Corruption(
                 "git_pack: large-offset packs unsupported".into(),
@@ -185,7 +195,7 @@ pub fn write_git_pack(objects: &[PackObject], window: usize) -> Result<(Vec<u8>,
     };
     idx.extend_from_slice(&idx_sha);
 
-    Ok((pack, idx))
+    Ok((pack, idx, offsets))
 }
 
 #[cfg(test)]
@@ -290,7 +300,7 @@ mod tests {
 
         // 3) Write our pack+idx, name by the pack-trailer sha (git convention is
         //    flexible; we just place both).
-        let (pack, idx) = write_git_pack(&objs, 0).unwrap();
+        let (pack, idx, _off) = write_git_pack(&objs, 0).unwrap();
         let out = tempfile::tempdir().unwrap();
         let packdir = out.path().join("pk");
         std::fs::create_dir_all(&packdir).unwrap();
@@ -404,8 +414,8 @@ mod tests {
     #[tokio::test]
     async fn delta_pack_validates_and_is_smaller() {
         let objs = deltifiable_objects().await;
-        let (pack_d, idx_d) = write_git_pack(&objs, 16).unwrap();
-        let (pack_full, _) = write_git_pack(&objs, 0).unwrap();
+        let (pack_d, idx_d, _off_d) = write_git_pack(&objs, 16).unwrap();
+        let (pack_full, _, _) = write_git_pack(&objs, 0).unwrap();
         println!(
             "delta pack = {} bytes, non-delta = {} bytes ({} objects)",
             pack_d.len(),
