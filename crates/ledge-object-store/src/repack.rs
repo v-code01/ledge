@@ -26,7 +26,7 @@ pub struct RepackStats {
 }
 
 /// Number of larger same-type neighbours considered as a delta base per object.
-const WINDOW: usize = 16;
+const WINDOW: usize = 64;
 
 /// Run one offline repack pass over `store`.
 ///
