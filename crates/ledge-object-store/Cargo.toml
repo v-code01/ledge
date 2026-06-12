@@ -22,6 +22,7 @@ tracing.workspace     = true
 hex.workspace         = true
 thiserror.workspace   = true
 object_store = { version = "0.11", features = ["aws"] }
+futures.workspace     = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -30,4 +31,3 @@ io-uring = "0.7"
 tempfile.workspace = true
 tokio              = { workspace = true, features = ["full", "test-util"] }
 proptest.workspace = true
-futures.workspace  = true

@@ -265,6 +265,19 @@ impl DiskObjectStore {
                         "s3 tier verify failed for {key}"
                     )));
                 }
+                // index files → S3 too (for full-node DR); kept LOCAL as the lookup
+                // cache. `p` is `<H>.pack`; `with_extension` yields `<H>.idx` /
+                // `<H>.lidx` (pack name = blake3 hex, no extra dots ⇒ safe). They
+                // upload under `packs/<H>.idx` / `packs/<H>.lidx` so a fully wiped
+                // node can rebuild its indexes via `recover_from_s3`.
+                for ext in ["idx", "lidx"] {
+                    let sib = p.with_extension(ext);
+                    if sib.exists() {
+                        let stem = sib.file_name().unwrap().to_string_lossy().to_string();
+                        cold.put(&format!("packs/{stem}"), std::fs::read(&sib).map_err(LedgeError::Io)?)
+                            .await?;
+                    }
+                }
                 std::fs::write(&marker, key.as_bytes()).map_err(LedgeError::Io)?;
                 std::fs::remove_file(&p).map_err(LedgeError::Io)?;
                 stats.packs_tiered += 1;
@@ -275,6 +288,52 @@ impl DiskObjectStore {
         // subsequent read sees a tiered (body-absent) pack and restores it.
         self.reload_packs();
         Ok(stats)
+    }
+
+    /// Reconcile the local pack dir with S3: for each pack in S3 whose `.lidx` is
+    /// absent locally, download its `.idx` + `.lidx` and write a `<name>.pack.s3`
+    /// marker (the body restores lazily on read). Returns packs recovered. No-op
+    /// without a cold tier.
+    ///
+    /// This is the full-node DR path: a disk death wipes every `<H>.pack`,
+    /// `<H>.idx`, `<H>.lidx` and marker, but the bodies + indexes survive in S3
+    /// (uploaded by [`Self::tier_packs`]). Naming is `<H>` = blake3 hex pack name:
+    /// the S3 keys are `packs/<H>.{pack,idx,lidx}`, so a `.lidx` key
+    /// `packs/<H>.lidx` ⇒ `<H>` ⇒ local files `<H>.{idx,lidx}` + marker
+    /// `<H>.pack.s3` (consistent with `tier_packs` and `reload_packs`).
+    ///
+    /// Idempotent: a pack whose `.lidx` is already present locally is skipped, so
+    /// a second call after a successful recover returns `0`. The body itself is
+    /// NOT downloaded here — [`Self::ensure_pack_local`] restores it on first read.
+    pub async fn recover_from_s3(&self) -> ledge_core::Result<usize> {
+        let Some(cold) = self.cold.load_full() else {
+            return Ok(0);
+        };
+        let dir = self.pack_dir();
+        std::fs::create_dir_all(&dir).map_err(LedgeError::Io)?;
+        let keys = cold.list("packs/").await?;
+        let mut recovered = 0usize;
+        for key in keys.iter().filter(|k| k.ends_with(".lidx")) {
+            // key = "packs/<H>.lidx" ⇒ name = "<H>".
+            let fname = key.strip_prefix("packs/").unwrap_or(key); // "<H>.lidx"
+            let name = fname.trim_end_matches(".lidx"); // "<H>"
+            // local lidx already present? skip (idempotent).
+            let local_lidx = dir.join(format!("{name}.lidx"));
+            if local_lidx.exists() {
+                continue;
+            }
+            // pull lidx + idx (both must exist in S3 for a tiered pack).
+            let lidx = cold.get(&format!("packs/{name}.lidx")).await?;
+            std::fs::write(&local_lidx, &lidx).map_err(LedgeError::Io)?;
+            let idx = cold.get(&format!("packs/{name}.idx")).await?;
+            std::fs::write(dir.join(format!("{name}.idx")), &idx).map_err(LedgeError::Io)?;
+            // marker so reads restore the body on demand (points at the S3 body key).
+            let marker = dir.join(format!("{name}.pack.s3"));
+            std::fs::write(&marker, format!("packs/{name}.pack").as_bytes()).map_err(LedgeError::Io)?;
+            recovered += 1;
+        }
+        self.reload_packs();
+        Ok(recovered)
     }
 
     /// Canonical path for an object identified by `id`.
@@ -1479,6 +1538,40 @@ mod tests {
     async fn tier_disabled_without_cold() {
         let (store, _d) = make_store();
         assert!(store.tier_packs().await.is_err(), "tier without a cold tier is an error");
+    }
+
+    // ── Task 1 (S3 full-node DR): tier indexes too + rebuild a wiped node ──────
+
+    #[tokio::test]
+    async fn recover_from_s3_after_full_wipe() {
+        let (store, _d) = make_store();
+        store.set_cold(std::sync::Arc::new(crate::s3::S3Tier::in_memory("ledge")));
+        let mut ids = Vec::new(); let mut wants = Vec::new();
+        for v in 0..6 {
+            let c: Vec<u8> = (0..400).flat_map(|i| format!("l{i} v{v}\n").into_bytes()).collect();
+            ids.push(store.write_git_object(3, Bytes::from(c.clone())).await.unwrap());
+            wants.push(c);
+        }
+        crate::repack::repack(&store).await.unwrap();
+        store.tier_packs().await.unwrap();
+        // WIPE the entire local pack dir (simulate disk death): remove ALL files
+        for e in std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok()) {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        store.reload_packs();
+        // recover indexes from S3
+        let n = store.recover_from_s3().await.unwrap();
+        assert!(n >= 1, "recovered at least one pack from S3");
+        // read works again (index recovered from S3, body restores on read) — byte-identical
+        assert_eq!(ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(), wants[3].as_slice());
+        // idempotent
+        assert_eq!(store.recover_from_s3().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recover_noop_without_cold() {
+        let (store, _d) = make_store();
+        assert_eq!(store.recover_from_s3().await.unwrap(), 0);
     }
 
     #[tokio::test]

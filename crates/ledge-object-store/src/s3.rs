@@ -98,6 +98,27 @@ impl S3Tier {
         }
     }
 
+    /// List logical keys under `key_prefix` (e.g. "packs/"), WITHOUT the S3 prefix.
+    ///
+    /// `object_store::list` is sync-returns-a-stream (not an `async fn`); we drive
+    /// it with `StreamExt::next`. Each returned `ObjectMeta::location` is the FULL
+    /// path `"{prefix}/{key}"`; we strip the configured `prefix/` so callers get
+    /// back the same logical keys they `put`. Any stream item error is a tier fault.
+    pub async fn list(&self, key_prefix: &str) -> Result<Vec<String>> {
+        use futures::StreamExt;
+        let full = self.path(key_prefix); // "{prefix}/{key_prefix}"
+        let mut out = Vec::new();
+        let mut stream = self.store.list(Some(&full));
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| LedgeError::Unavailable(format!("s3 list: {e}")))?;
+            let loc = meta.location.to_string(); // "{prefix}/packs/<name>.idx"
+            if let Some(rest) = loc.strip_prefix(&format!("{}/", self.prefix)) {
+                out.push(rest.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete a pack body. Idempotent: deleting an absent key is `Ok(())`.
     pub async fn delete(&self, key: &str) -> Result<()> {
         match self.store.delete(&self.path(key)).await {
@@ -111,6 +132,21 @@ impl S3Tier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn s3tier_list_returns_logical_keys() {
+        let t = S3Tier::in_memory("ledge");
+        t.put("packs/a.idx", b"i".to_vec()).await.unwrap();
+        t.put("packs/a.lidx", b"l".to_vec()).await.unwrap();
+        t.put("packs/a.pack", b"p".to_vec()).await.unwrap();
+        let mut keys = t.list("packs/").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![
+            "packs/a.idx".to_string(),
+            "packs/a.lidx".to_string(),
+            "packs/a.pack".to_string(),
+        ]);
+    }
 
     #[tokio::test]
     async fn s3tier_roundtrip_inmemory() {
