@@ -1,0 +1,67 @@
+# Dogfood: Ledge with an S3 cold tier (MinIO standing in for S3).
+# Demonstrates off-machine durability — cold pack bodies spill to MinIO and the
+# Ledge container's local .pack is removed; reads restore from MinIO.
+#
+#   bash dogfood/s3/tier.sh
+services:
+  minio:
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ledgeminio
+      MINIO_ROOT_PASSWORD: ledgeminiosecret
+    ports:
+      - "9100:9000"   # S3 API (host:container)
+      - "9101:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  createbucket:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set local http://minio:9000 ledgeminio ledgeminiosecret) do echo 'wait minio'; sleep 1; done;
+      /usr/bin/mc mb -p local/ledge-packs || true;
+      echo 'bucket ready';
+      exit 0;"
+
+  ledge:
+    image: ledge:latest
+    restart: unless-stopped
+    command: ["start"]
+    depends_on:
+      - createbucket
+    ports:
+      - "3031:3000"
+      - "9102:9090"
+    volumes:
+      - ledge-s3-data:/var/lib/ledge
+      - ../../:/srv/ledge-src:ro
+    environment:
+      LEDGE__AUTH__ENABLED: "true"
+      LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_60f65c9f1fc03bc2_De4xeFuCPjWQUU5GKkGpuBPJykCo6e7IjlK2X__1HIY"
+      LEDGE__SYNC__ENABLED: "true"
+      LEDGE__S3__ENABLED: "true"
+      LEDGE__S3__ENDPOINT: "http://minio:9000"
+      LEDGE__S3__REGION: "us-east-1"
+      LEDGE__S3__BUCKET: "ledge-packs"
+      LEDGE__S3__ACCESS_KEY_ID: "ledgeminio"
+      LEDGE__S3__SECRET_ACCESS_KEY: "ledgeminiosecret"
+      LEDGE__S3__PREFIX: "ledge"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "*"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  ledge-s3-data:
