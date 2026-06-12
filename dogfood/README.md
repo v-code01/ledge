@@ -146,3 +146,24 @@ and blake3-addressable (Ledge reads).
 path-aware base selection — closing it fully (sub-1.4 MB) needs base-index caching to afford a
 250-wide window + OFS deltas (diminishing returns). Repack at window=64 is ~54 s (offline
 maintenance; the raw-length delta ranking made a wide window affordable at all).
+
+## Off-machine durability: S3 cold tier (the "survives the laptop dying" answer)
+
+`bash dogfood/s3/tier.sh` (MinIO standing in for S3). Latest run — **8 PASS / 0 FAIL**
+([`results/2026-06-11-s3-tier.txt`](results/2026-06-11-s3-tier.txt)):
+
+import the source → repack to a git pack → **`POST /admin/tier`** spills the **1.7 MB pack body
+to MinIO** and **removes the local `.pack`** (the Ledge volume keeps only the 68 KB `.idx` +
+146 KB `.lidx` + a 75-byte `.s3` marker) → `git clone` the workspace back **succeeds
+byte-identical** because the server **restores the pack body from MinIO** to serve it.
+
+Two real S3 round-trips prove it: a `HEAD` verifies the upload *before* the local body is
+deleted (the marker is written only on success), and a `GET` restores the body on the cold read.
+A native git pack is an immutable, content-addressed blob — the ideal tiering unit; the indexes
+stay local so lookups never hit the network, only fetching a cold pack's bytes does. **Cold pack
+bodies now live in object storage, off the Ledge volume** — the original "what survives the SSD
+dying" concern, answered. (`[s3]` is default-off; enable via `LEDGE__S3__*`.)
+
+Honest v1 residuals: whole-pack restore (not byte-range); only `.pack` tiers (indexes stay local —
+full-node DR needs them in S3 too, but they're regenerable via `git index-pack`/blake3); explicit
+tiering (no auto age/size policy); no warm-cache eviction.
