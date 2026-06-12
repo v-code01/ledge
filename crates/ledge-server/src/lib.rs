@@ -366,6 +366,10 @@ pub fn build_app(state: AppState) -> Router {
             "/admin/repack",
             axum::routing::post(admin_routes::admin_repack),
         )
+        .route(
+            "/admin/tier",
+            axum::routing::post(admin_routes::admin_tier),
+        )
         // ── Cluster control plane (spec §7) — inert (503) in single-node mode ──
         .route(
             "/raft/{shard}/{kind}",

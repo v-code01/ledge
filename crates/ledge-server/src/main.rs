@@ -104,6 +104,24 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(&cfg.server.data_dir);
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.clone())?);
+    // ── S3 cold tier (default off). When `[s3].enabled`, build an
+    //    AmazonS3/MinIO-backed tier from the operator-supplied credentials and
+    //    install it on the disk store so `POST /admin/tier` can spill cold pack
+    //    bodies off-machine. `from_parts` returns a `ledge_core::Result`; the
+    //    `?` lifts its `thiserror`-backed error into main's `anyhow::Result`.
+    //    Default-off path is byte-identical to before this block existed. ──────
+    if cfg.s3.enabled {
+        let tier = ledge_object_store::s3::S3Tier::from_parts(
+            cfg.s3.endpoint.as_deref(),
+            &cfg.s3.region,
+            &cfg.s3.bucket,
+            &cfg.s3.access_key_id,
+            &cfg.s3.secret_access_key,
+            &cfg.s3.prefix,
+        )?;
+        objects.set_cold(std::sync::Arc::new(tier));
+        tracing::info!(bucket = %cfg.s3.bucket, "s3 cold tier enabled");
+    }
     ledge_server::metrics::install_recorder()?;
     // Phase 4d-4: install the rustls crypto provider before ANY TLS config is
     // built (the cluster-stack client config below + the serve listeners need it).

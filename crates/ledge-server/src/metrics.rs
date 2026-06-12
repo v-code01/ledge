@@ -240,6 +240,24 @@ pub fn record_sync_objects(op: &'static str, n: u64) {
     metrics::counter!(SYNC_OBJECTS_TOTAL, "op" => op).increment(n);
 }
 
+// ── S3 cold-tier metrics (Phase: S3 cold tier, Task 3). Bumped by the
+//    `POST /admin/tier` handler after a `tier_packs` pass spills cold pack
+//    bodies to the configured object store. Labeled only by `op` (low
+//    cardinality; never the bucket, key, or any credential — no leakage on the
+//    metrics surface). `_TOTAL` counts packs moved; `BYTES_TOTAL` counts bytes
+//    moved. The put side is emitted from the server's admin handler; the
+//    restore (`op="get"`) side lives in the disk store (a different crate that
+//    cannot reach these server-local helpers), so single-node `/metrics` only
+//    shows the `op="put"` series until a cross-crate emit is wired. ───────────
+pub const S3_TIER_TOTAL: &str = "ledge_s3_tier_total";
+pub const S3_BYTES_TOTAL: &str = "ledge_s3_bytes_total";
+/// Record one S3 tier transfer. `op` ∈ `put` (tier/upload) | `get`
+/// (restore/download). `packs` bumps the pack counter, `bytes` the byte counter.
+pub fn record_s3_tier(op: &'static str, packs: u64, bytes: u64) {
+    metrics::counter!(S3_TIER_TOTAL, "op" => op).increment(packs);
+    metrics::counter!(S3_BYTES_TOTAL, "op" => op).increment(bytes);
+}
+
 /// Transport-posture gauges (Phase 4d-4): set ONCE at boot so /metrics reflects
 /// whether TLS / mTLS is active. Zero label cardinality.
 pub const TLS_ENABLED: &str = "ledge_tls_enabled";
@@ -510,6 +528,17 @@ mod tests {
         record_sync("import", "failed");
         record_sync_duration("import", std::time::Duration::from_millis(5));
         record_sync_objects("import", 42);
+    }
+
+    #[test]
+    fn s3_tier_metric_constants_correct() {
+        assert_eq!(S3_TIER_TOTAL, "ledge_s3_tier_total");
+        assert_eq!(S3_BYTES_TOTAL, "ledge_s3_bytes_total");
+    }
+    #[test]
+    fn s3_tier_record_helper_no_panic_without_recorder() {
+        record_s3_tier("put", 3, 4096);
+        record_s3_tier("get", 1, 1024);
     }
 
     #[test]

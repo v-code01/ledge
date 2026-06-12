@@ -138,6 +138,43 @@ pub async fn admin_repack(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `POST /admin/tier` — spill cold pack bodies to the configured S3 object store.
+///
+/// Runs one [`ledge_object_store::DiskObjectStore::tier_packs`] pass over the
+/// node-local disk store, uploading each not-yet-tiered `.pack` body to the cold
+/// tier and recording the put-side counters. Outcomes:
+/// - **200** with `{packs_tiered, bytes_uploaded}` on success.
+/// - **503** when no cold tier is configured (`[s3].enabled = false`) — the pass
+///   returns an `Unavailable("s3 cold tier disabled")` error, matched on the
+///   `"disabled"` substring so it is reported as a soft "feature off", not a
+///   server fault.
+/// - **502** for any other failure (e.g. the S3 upload itself errored), since
+///   the fault is in the upstream object store, not this node.
+pub async fn admin_tier(State(state): State<AppState>) -> Response {
+    match state.objects_disk.tier_packs().await {
+        Ok(s) => {
+            crate::metrics::record_s3_tier("put", s.packs_tiered as u64, s.bytes_uploaded);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "packs_tiered": s.packs_tiered,
+                    "bytes_uploaded": s.bytes_uploaded,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            // disabled (no cold tier) ⇒ 503; any other (upstream) error ⇒ 502.
+            let msg = e.to_string();
+            if msg.contains("disabled") {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else {
+                (StatusCode::BAD_GATEWAY, msg).into_response()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +327,28 @@ mod route_tests {
             out.get("objects_seen").and_then(|v| v.as_u64()).is_some(),
             "body must carry objects_seen: {out:?}"
         );
+    }
+
+    /// `POST /admin/tier` on a store WITHOUT a configured cold tier returns 503
+    /// (Service Unavailable) — the feature is off, not a server fault. The
+    /// default `state_over` store never installs a cold tier, so `tier_packs`
+    /// returns the `"s3 cold tier disabled"` error that maps to 503.
+    #[tokio::test]
+    async fn tier_endpoint_503_when_disabled() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+
+        let app = crate::build_app(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/tier")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
