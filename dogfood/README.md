@@ -167,3 +167,20 @@ dying" concern, answered. (`[s3]` is default-off; enable via `LEDGE__S3__*`.)
 Honest v1 residuals: whole-pack restore (not byte-range); only `.pack` tiers (indexes stay local —
 full-node DR needs them in S3 too, but they're regenerable via `git index-pack`/blake3); explicit
 tiering (no auto age/size policy); no warm-cache eviction.
+
+
+### Full-node disaster recovery (lose the whole disk, rebuild from S3)
+
+`bash dogfood/s3/tier.sh` now also proves **full-node DR** — latest run **11 PASS / 0 FAIL**
+([`results/2026-06-11-s3-dr.txt`](results/2026-06-11-s3-dr.txt)):
+
+tier (pack body **and** `.idx`/`.lidx` now go to S3) → **`rm -f` the ENTIRE local
+`objects/pack/` dir** (simulate the SSD dying — `.pack`, `.idx`, `.lidx`, marker, all gone) →
+**`POST /admin/recover`** pulls the small indexes back from S3 and writes markers
+(`packs_recovered: 1`) → **`git clone` the workspace back succeeds, rebuilt entirely from object
+storage** (indexes recovered eagerly, the pack body restores on the read).
+
+A node also runs `recover_from_s3` on boot, so a freshly-provisioned/wiped instance self-heals
+from S3. **This is the complete answer to "what survives the laptop dying": tier, lose
+everything local, recover from S3.** (Un-repacked loose objects aren't tiered — repack first;
+recovery pulls indexes eagerly + bodies lazily; byte-range restore is a v3 perf follow-on.)

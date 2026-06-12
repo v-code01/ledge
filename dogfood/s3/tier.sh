@@ -56,6 +56,24 @@ else
 fi
 rm -rf "$OUT"
 
+note "5. DISASTER: wipe the ENTIRE local pack dir (simulate the SSD dying)"
+"${COMPOSE[@]}" exec -T ledge sh -c 'rm -f /var/lib/ledge/objects/pack/*'
+GONE="$("${COMPOSE[@]}" exec -T ledge sh -c 'ls /var/lib/ledge/objects/pack/ 2>/dev/null | wc -l' | tr -d "[:space:]")"
+if [ "${GONE:-1}" = "0" ]; then ok "local pack dir wiped (no .pack/.idx/.lidx/marker left)"; else bad "wipe failed ($GONE files)"; fi
+
+note "6. RECOVER from S3 + clone again (full-node DR)"
+R="$(curl -fsS -X POST "$CLIENT/admin/recover" -H "Authorization: Bearer $TOKEN")"
+echo "   $R"
+NR="$(echo "$R" | jq -r '.packs_recovered // 0')"
+if [ "$NR" -ge 1 ]; then ok "recovered $NR pack(s) indexes from S3"; else bad "nothing recovered"; fi
+OUT2="$(mktemp -d)"
+if GIT_TERMINAL_PROMPT=0 git -c http.extraHeader="Authorization: Bearer $TOKEN" clone --quiet "$CLIENT/ws/$WS" "$OUT2/c" >/tmp/s3dr.err 2>&1; then
+  if [ -f "$OUT2/c/Cargo.toml" ] && grep -q "ledge-server" "$OUT2/c/Cargo.toml"; then ok "clone-back works AFTER a full local wipe — rebuilt entirely from S3"; else bad "tree incomplete after recover"; fi
+else
+  bad "clone-back after wipe+recover FAILED"; tail -3 /tmp/s3dr.err
+fi
+rm -rf "$OUT2"
+
 note "summary"
 printf '  PASS=%s  FAIL=%s\n' "$pass" "$fail"
 echo "  Off-machine durability: the pack body is in MinIO; the Ledge volume holds only the small indexes. (\`${COMPOSE[*]} down -v\` to stop+wipe)"

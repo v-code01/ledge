@@ -1,0 +1,34 @@
+
+=== 0. up: MinIO + bucket + Ledge (s3 enabled) ===
+   healthy after ~2s
+  PASS Ledge (s3) up on http://localhost:3031
+
+=== 1. import the Ledge source + repack to a git pack ===
+  PASS imported (workspace 19eb9ecf299000000000000000000000)
+  PASS repacked to a git pack
+   local .pack files before tier: 1
+
+=== 2. TIER: spill the pack body to MinIO (POST /admin/tier) ===
+   {"bytes_uploaded":1710075,"packs_tiered":1}
+  PASS tiered 1 pack(s) to MinIO
+  PASS local .pack body REMOVED after tiering (indexes stay local)
+
+=== 3. the pack body now lives in MinIO (off the Ledge volume) ===
+   s3 markers (head-verified uploads): 1 ; mc bucket listing: 0 .pack object(s)
+  PASS pack body uploaded to MinIO + head-verified (marker present; bucket shows 0)
+
+=== 4. clone back: cold reads RESTORE the pack from MinIO (byte-identical) ===
+  PASS cloned the source back (the server restored the tiered pack from MinIO to serve it)
+  PASS working tree intact (Cargo.toml + ledge-server present)
+
+=== 5. DISASTER: wipe the ENTIRE local pack dir (simulate the SSD dying) ===
+  PASS local pack dir wiped (no .pack/.idx/.lidx/marker left)
+
+=== 6. RECOVER from S3 + clone again (full-node DR) ===
+   {"packs_recovered":1}
+  PASS recovered 1 pack(s) indexes from S3
+  PASS clone-back works AFTER a full local wipe — rebuilt entirely from S3
+
+=== summary ===
+  PASS=11  FAIL=0
+  Off-machine durability: the pack body is in MinIO; the Ledge volume holds only the small indexes. (`docker compose -f /Users/vanshverma/ledge/dogfood/s3/docker-compose.yml down -v` to stop+wipe)
