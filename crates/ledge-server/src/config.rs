@@ -18,6 +18,8 @@ pub struct LedgeConfig {
     pub webhooks: WebhooksConfig,
     #[serde(default)]
     pub sync: SyncConfig,
+    #[serde(default)]
+    pub s3: S3Config,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -189,6 +191,50 @@ pub struct SyncConfig {
     pub allowed_upstream_hosts: Vec<String>,
 }
 
+/// S3 (object-storage) cold-tier configuration. Disabled by default
+/// (byte-identical when off: no `object_store` client is ever built, pack bodies
+/// stay on the local disk tier). When `enabled`, immutable git-pack bodies spill
+/// to S3/MinIO for off-machine durability.
+fn s3_def_region() -> String {
+    "us-east-1".into()
+}
+fn s3_def_prefix() -> String {
+    "ledge".into()
+}
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct S3Config {
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "s3_def_region")]
+    pub region: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default = "s3_def_prefix")]
+    pub prefix: String,
+}
+
+// Hand-impl (not derive) so the non-deserialize path — e.g. `S3Config::default()`
+// constructed directly in code, where `#[serde(default = "fn")]` does NOT fire —
+// still yields the canonical region/prefix rather than empty strings.
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            region: s3_def_region(),
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            prefix: s3_def_prefix(),
+        }
+    }
+}
+
 impl QuotaConfig {
     /// Project the manager-relevant durable limits into a [`ledge_workspace::QuotaLimits`]
     /// (Copy). The rate/burst are NOT included — they build the `TenantRateLimiter`
@@ -243,7 +289,8 @@ impl LedgeConfig {
             .set_default("tls.enabled", false).map_err(map_cfg)?
             .set_default("tls.mtls",    false).map_err(map_cfg)?
             .set_default("webhooks.enabled", false).map_err(map_cfg)?
-            .set_default("sync.enabled", false).map_err(map_cfg)?;
+            .set_default("sync.enabled", false).map_err(map_cfg)?
+            .set_default("s3.enabled", false).map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -560,6 +607,26 @@ mod tests {
         let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
         assert!(cfg.sync.enabled);
         assert_eq!(cfg.sync.allowed_upstream_hosts, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn s3_disabled_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let c = LedgeConfig::load(None).unwrap();
+        assert!(!c.s3.enabled);
+        assert_eq!(c.s3.region, "us-east-1");
+        assert_eq!(c.s3.prefix, "ledge");
+    }
+
+    #[test]
+    fn s3_toml_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[s3]\nenabled=true\nbucket=\"b\"\nendpoint=\"http://localhost:9000\"").unwrap();
+        let c = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
+        assert!(c.s3.enabled);
+        assert_eq!(c.s3.bucket, "b");
+        assert_eq!(c.s3.region, "us-east-1"); // serde default applied
     }
 
     #[test]

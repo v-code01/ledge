@@ -21,6 +21,7 @@ arc-swap              = { workspace = true }
 tracing.workspace     = true
 hex.workspace         = true
 thiserror.workspace   = true
+object_store = { version = "0.11", features = ["aws"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
