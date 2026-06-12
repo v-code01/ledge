@@ -175,6 +175,27 @@ pub async fn admin_tier(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `POST /admin/recover` — reconcile the local pack dir with S3 (pull indexes for
+/// packs present in object storage but missing locally). Bodies restore on read.
+///
+/// Outcomes:
+/// - **200** with `{packs_recovered}` on a successful reconcile (0 ⇒ nothing missing).
+/// - **503** when no cold tier is configured — `recover_from_s3` returns `Ok(0)`
+///   in that case, so we gate on [`DiskObjectStore::cold_enabled`] to report the
+///   feature as off rather than masquerading as a successful empty recovery.
+/// - **502** for any other failure (the fault is in the upstream object store).
+pub async fn admin_recover(State(state): State<AppState>) -> Response {
+    // recover_from_s3 returns Ok(0) when no cold tier is configured — treat that as 503.
+    if state.objects_disk.cold_enabled() {
+        match state.objects_disk.recover_from_s3().await {
+            Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "packs_recovered": n }))).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        }
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +365,29 @@ mod route_tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/tier")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `POST /admin/recover` on a store WITHOUT a configured cold tier returns 503
+    /// (Service Unavailable) — `recover_from_s3` would no-op with `Ok(0)`, so the
+    /// handler gates on `cold_enabled()` to report the feature as off rather than
+    /// a successful empty recovery. The default `state_over` store has no cold tier.
+    #[tokio::test]
+    async fn recover_endpoint_503_when_disabled() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+
+        let app = crate::build_app(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/recover")
                     .body(Body::empty())
                     .unwrap(),
             )

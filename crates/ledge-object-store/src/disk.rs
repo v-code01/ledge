@@ -164,6 +164,12 @@ impl DiskObjectStore {
         self.cold.store(Some(tier));
     }
 
+    /// True iff an S3 cold tier is installed. Lets the control plane distinguish
+    /// "tiering off" (no cold tier ⇒ recover is a no-op) from a real S3 fault.
+    pub fn cold_enabled(&self) -> bool {
+        self.cold.load().is_some()
+    }
+
     /// Re-scan the pack dir + swap the in-memory pack set (after tiering/restore).
     ///
     /// A tiered pack has no local `.pack` but keeps its `.lidx`; since

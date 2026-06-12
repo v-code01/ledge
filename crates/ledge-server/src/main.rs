@@ -121,6 +121,15 @@ async fn main() -> anyhow::Result<()> {
         )?;
         objects.set_cold(std::sync::Arc::new(tier));
         tracing::info!(bucket = %cfg.s3.bucket, "s3 cold tier enabled");
+        // Recover-from-S3 on boot: reconcile the local pack dir with object
+        // storage so a wiped/replaced node rebuilds its pack indexes from the
+        // cold tier (bodies restore lazily on read). Non-fatal — a recover
+        // failure logs a warning; the node still boots and serves hot data.
+        match objects.recover_from_s3().await {
+            Ok(n) if n > 0 => tracing::info!(packs = n, "recovered packs from S3 on boot"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "s3 recover-on-boot failed"),
+        }
     }
     ledge_server::metrics::install_recorder()?;
     // Phase 4d-4: install the rustls crypto provider before ANY TLS config is
