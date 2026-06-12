@@ -91,15 +91,14 @@ pub struct GitPackFile {
 impl GitPackFile {
     /// Open a `.pack` and its sibling `.lidx`, building the lookup maps.
     ///
-    /// Validates the pack's `"PACK"` magic and parses the full `.lidx`. The
-    /// `.idx` is intentionally untouched — every map is derived from `.lidx`.
+    /// Every lookup map is derived from the `.lidx` (required); the `.idx` is
+    /// intentionally untouched. The `.pack` body itself is NOT read here — only
+    /// `read`/`read_at`/`delta_base_of` open it, lazily, and they validate the
+    /// `"PACK"` magic at that point. This deliberate laziness lets a *tiered*
+    /// pack — one whose `.pack` body has been spilled to the S3 cold tier and
+    /// removed locally, with the small `.lidx`/`.idx` kept on disk — open
+    /// cleanly so the store can restore the body from S3 before the first read.
     pub fn open(pack_path: &Path) -> Result<Self> {
-        let pack = std::fs::read(pack_path)?;
-        if pack.len() < 12 || &pack[0..4] != b"PACK" {
-            return Err(LedgeError::Corruption(
-                "git_pack_file: bad pack magic".into(),
-            ));
-        }
         let lidx_path = pack_path.with_extension("lidx");
         let lidx = std::fs::read(&lidx_path)?;
         let entries = read_lidx(&lidx)?;
@@ -153,12 +152,25 @@ impl GitPackFile {
         &self.pack_path
     }
 
+    /// Read the backing `.pack` into memory, validating the `"PACK"` magic.
+    /// Kept here (not in `open`) so a tiered pack — `.pack` absent until the
+    /// store restores it from S3 — can still be opened from its `.lidx`.
+    fn read_pack(&self) -> Result<Vec<u8>> {
+        let pack = std::fs::read(&self.pack_path)?;
+        if pack.len() < 12 || &pack[0..4] != b"PACK" {
+            return Err(LedgeError::Corruption(
+                "git_pack_file: bad pack magic".into(),
+            ));
+        }
+        Ok(pack)
+    }
+
     /// Read the full (delta-resolved) content of `id`, or `None` if absent.
     pub fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
         let Some(&(_, off)) = self.by_oid.get(&id) else {
             return Ok(None);
         };
-        let pack = std::fs::read(&self.pack_path)?;
+        let pack = self.read_pack()?;
         Ok(Some(self.read_at(&pack, off, 0)?))
     }
 
@@ -217,7 +229,7 @@ impl GitPackFile {
         let Some(&(_, off)) = self.by_oid.get(&id) else {
             return Ok(None);
         };
-        let pack = std::fs::read(&self.pack_path)?;
+        let pack = self.read_pack()?;
         let data = (pack.get(off as usize..))
             .ok_or_else(|| LedgeError::Corruption("git_pack_file: offset out of range".into()))?;
         let (git_type, _size, hdr_len) = parse_pack_obj_header(data)?;

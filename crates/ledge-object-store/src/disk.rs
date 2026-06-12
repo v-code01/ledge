@@ -25,6 +25,16 @@ const MAX_CHAIN: usize = 50;
 /// bounding the blast radius of a malformed/hostile compressed body (zip bomb).
 const MAX_DECOMPRESSED: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
+/// The cold-tier marker path for a `.pack`: `<name>.pack.s3`. Built by APPENDING
+/// `.s3` to the full `.pack` filename (NOT `Path::with_extension`, which would
+/// rewrite `<name>.pack` → `<name>.s3` and lose the `.pack` segment). Presence
+/// of this file means "the body lives in S3 under the key stored inside it".
+fn marker_path(pack_path: &std::path::Path) -> PathBuf {
+    let mut s = pack_path.as_os_str().to_os_string();
+    s.push(".s3");
+    PathBuf::from(s)
+}
+
 /// zlib-compress `data`. Writing into a `Vec` sink never performs I/O, so the
 /// `expect`s below are unreachable; they document that infallibility.
 fn zlib_compress(data: &[u8]) -> Vec<u8> {
@@ -99,6 +109,22 @@ pub struct DiskObjectStore {
     sha1_cache: std::sync::Arc<
         arc_swap::ArcSwapOption<std::collections::HashMap<[u8; 20], ObjectId>>,
     >,
+    /// Optional S3 cold tier. `None` ⇒ tiering disabled and the store is
+    /// byte-identical to the loose+pack-only behaviour (default OFF). When set,
+    /// [`Self::tier_packs`] spills each `.pack` *body* to S3 (keeping the small
+    /// `.idx`/`.lidx` local), and a cold read restores the body on demand via
+    /// [`Self::ensure_pack_local`]. Held behind `ArcSwapOption` so it can be
+    /// installed/cleared without blocking concurrent reads.
+    cold: std::sync::Arc<arc_swap::ArcSwapOption<crate::s3::S3Tier>>,
+}
+
+/// Counters reported by a single [`DiskObjectStore::tier_packs`] pass.
+#[derive(Debug, Default, Clone)]
+pub struct TierStats {
+    /// Number of `.pack` bodies uploaded to S3 and removed locally this pass.
+    pub packs_tiered: usize,
+    /// Total bytes of pack body uploaded this pass.
+    pub bytes_uploaded: u64,
 }
 
 impl DiskObjectStore {
@@ -128,7 +154,127 @@ impl DiskObjectStore {
             data_dir,
             packs: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(packs)),
             sha1_cache: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            cold: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         })
+    }
+
+    /// Install (or replace) the S3 cold tier. Once set, [`Self::tier_packs`] can
+    /// spill pack bodies off-machine and cold reads restore them on demand.
+    pub fn set_cold(&self, tier: std::sync::Arc<crate::s3::S3Tier>) {
+        self.cold.store(Some(tier));
+    }
+
+    /// Re-scan the pack dir + swap the in-memory pack set (after tiering/restore).
+    ///
+    /// A tiered pack has no local `.pack` but keeps its `.lidx`; since
+    /// [`crate::git_pack_file::GitPackFile::open`] no longer reads the `.pack`
+    /// at open time, the pack still opens here so a later read can restore it.
+    pub fn reload_packs(&self) {
+        let mut packs = Vec::new();
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(self.pack_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                // A pack is identified by its `<name>.pack` path. It is present
+                // either as a real `.pack` body (local / restored) OR as a tiered
+                // pack whose body lives in S3 — the latter has only a
+                // `<name>.pack.s3` marker (extension `s3`) on disk. Map a marker
+                // back to its `<name>.pack` path so a tiered pack still opens
+                // (from its `.lidx`) and can be restored on read.
+                let pack_path = if p.extension().is_some_and(|x| x == "pack") {
+                    p.clone()
+                } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".pack.s3")) {
+                    // strip the trailing ".s3" to recover "<name>.pack".
+                    let s = p.as_os_str().to_string_lossy();
+                    PathBuf::from(&s[..s.len() - 3])
+                } else {
+                    continue;
+                };
+                if !seen.insert(pack_path.clone()) {
+                    continue; // a restored pack may have both `.pack` and marker
+                }
+                if let Ok(pf) = crate::git_pack_file::GitPackFile::open(&pack_path) {
+                    packs.push(std::sync::Arc::new(pf));
+                }
+            }
+        }
+        self.swap_packs(packs);
+    }
+
+    /// If `pf`'s local `.pack` is absent but a `<name>.pack.s3` marker + a cold
+    /// tier exist, download the body from S3 and write it to the local `.pack`
+    /// (tmp + atomic rename). A no-op when the body is already local, when no
+    /// cold tier is installed, or when no marker is present.
+    async fn ensure_pack_local(
+        &self,
+        pf: &crate::git_pack_file::GitPackFile,
+    ) -> ledge_core::Result<()> {
+        let pack_path = pf.pack_path().to_path_buf();
+        if pack_path.exists() {
+            return Ok(());
+        }
+        // Marker is `<name>.pack.s3` — APPEND ".s3" to the full `.pack` path
+        // (NOT `with_extension`, which would clobber `.pack` → `.s3`).
+        let marker = marker_path(&pack_path);
+        let Some(cold) = self.cold.load_full() else {
+            return Ok(());
+        };
+        if !marker.exists() {
+            return Ok(());
+        }
+        let key = std::fs::read_to_string(&marker).map_err(LedgeError::Io)?;
+        let bytes = cold.get(key.trim()).await?;
+        // atomic-ish: tmp + rename so a partial download never surfaces as a
+        // valid-looking `.pack`.
+        let tmp = pack_path.with_extension("pack.tmp");
+        std::fs::write(&tmp, &bytes).map_err(LedgeError::Io)?;
+        std::fs::rename(&tmp, &pack_path).map_err(LedgeError::Io)?;
+        Ok(())
+    }
+
+    /// Spill every local `.pack` *body* to the S3 cold tier, keeping the small
+    /// `.idx`/`.lidx` indexes on disk, and drop the local body. Each upload is
+    /// verified present via `head` before the local `.pack` is removed, and a
+    /// `<name>.pack.s3` marker records the S3 key so a later read can restore it.
+    ///
+    /// Idempotent: a pack whose marker already exists is skipped. Errors if no
+    /// cold tier is installed (so a caller can't silently no-op).
+    pub async fn tier_packs(&self) -> ledge_core::Result<TierStats> {
+        let Some(cold) = self.cold.load_full() else {
+            return Err(LedgeError::Unavailable("s3 cold tier disabled".into()));
+        };
+        let mut stats = TierStats::default();
+        let dir = self.pack_dir();
+        let entries: Vec<_> = std::fs::read_dir(&dir).map_err(LedgeError::Io)?.flatten().collect();
+        for e in entries {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "pack") {
+                // already tiered? (marker present) — idempotent skip.
+                let marker = marker_path(&p);
+                if marker.exists() {
+                    continue;
+                }
+                let name = p.file_name().unwrap().to_string_lossy().to_string(); // "<name>.pack"
+                let key = format!("packs/{name}");
+                let bytes = std::fs::read(&p).map_err(LedgeError::Io)?;
+                let n = bytes.len() as u64;
+                cold.put(&key, bytes).await?;
+                // Verify durability BEFORE deleting the only local copy.
+                if !cold.head(&key).await? {
+                    return Err(LedgeError::Unavailable(format!(
+                        "s3 tier verify failed for {key}"
+                    )));
+                }
+                std::fs::write(&marker, key.as_bytes()).map_err(LedgeError::Io)?;
+                std::fs::remove_file(&p).map_err(LedgeError::Io)?;
+                stats.packs_tiered += 1;
+                stats.bytes_uploaded += n;
+            }
+        }
+        // Reflect reality: the in-memory pack set must re-open from `.lidx` so a
+        // subsequent read sees a tiered (body-absent) pack and restores it.
+        self.reload_packs();
+        Ok(stats)
     }
 
     /// Canonical path for an object identified by `id`.
@@ -658,7 +804,11 @@ impl DiskObjectStore {
             None => {
                 // Pack tier: GitPackFile.read resolves REF_DELTA internally and
                 // returns the full content. First pack carrying the id wins.
-                for pf in self.packs.load().iter() {
+                let packs = self.packs.load();
+                for pf in packs.iter() {
+                    // Ensure the body is local before reading: a tiered pack has
+                    // its `.pack` in S3, restored on demand from the marker.
+                    self.ensure_pack_local(pf).await?;
                     if let Some(c) = pf.read(id)? {
                         return Ok(Bytes::from(c));
                     }
@@ -738,8 +888,9 @@ impl ObjectStore for DiskObjectStore {
                 let data_dir = self.data_dir.clone();
                 let packs = self.packs.clone();
                 let sha1_cache = self.sha1_cache.clone();
+                let cold = self.cold.clone();
                 tokio::spawn(async move {
-                    DiskObjectStore { data_dir, packs, sha1_cache }.write(c).await
+                    DiskObjectStore { data_dir, packs, sha1_cache, cold }.write(c).await
                 })
             })
             .collect();
@@ -1287,6 +1438,47 @@ mod tests {
         let b = store.sha1_index().await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&a, &b), "write invalidated the cache");
         assert!(b.contains_key(&store.sha1_of(id).await.unwrap()));
+    }
+
+    // ── Task 2 (S3 cold tier): spill pack body → S3 + restore-on-read ─────────
+
+    #[tokio::test]
+    async fn tier_then_restore_and_durable() {
+        let (store, _d) = make_store();
+        store.set_cold(std::sync::Arc::new(crate::s3::S3Tier::in_memory("ledge")));
+        let mut ids = Vec::new();
+        let mut wants = Vec::new();
+        for v in 0..6 {
+            let c: Vec<u8> = (0..400).flat_map(|i| format!("l{i} v{v}\n").into_bytes()).collect();
+            ids.push(store.write_git_object(3, Bytes::from(c.clone())).await.unwrap());
+            wants.push(c);
+        }
+        crate::repack::repack(&store).await.unwrap();
+        let pack_exists = || std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|x| x == "pack"));
+        assert!(pack_exists(), "a .pack exists after repack");
+
+        // TIER: pack body -> S3, local .pack removed
+        let stats = store.tier_packs().await.unwrap();
+        assert!(stats.packs_tiered >= 1, "tiered at least one pack");
+        assert!(!pack_exists(), "local .pack removed after tiering");
+
+        // READ restores the .pack from S3 and is byte-exact
+        assert_eq!(ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(), wants[3].as_slice());
+        assert!(pack_exists(), ".pack restored locally on read");
+
+        // DURABILITY: wipe the restored .pack + reload packs -> still reads from S3
+        for e in std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok()) {
+            if e.path().extension().is_some_and(|x| x == "pack") { std::fs::remove_file(e.path()).unwrap(); }
+        }
+        store.reload_packs();
+        assert_eq!(ObjectStore::read(&store, ids[0]).await.unwrap().as_ref(), wants[0].as_slice());
+    }
+
+    #[tokio::test]
+    async fn tier_disabled_without_cold() {
+        let (store, _d) = make_store();
+        assert!(store.tier_packs().await.is_err(), "tier without a cold tier is an error");
     }
 
     #[tokio::test]
