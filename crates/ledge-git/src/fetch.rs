@@ -310,6 +310,85 @@ pub async fn handle_upload_pack_discovery(
     Ok(out)
 }
 
+/// Build the NAK-framed upload-pack response for a wanted SHA-1 set.
+///
+/// BFS the reachable object closure (commit → tree(s)/parent(s) → tree children)
+/// from `wanted_sha1s` via the SHA-1 index, read each object's content once,
+/// encode the packfile, and prefix the `"NAK\n"` acknowledgement. Pure in the
+/// (want-set, store content): the same wants over the same objects always yield
+/// byte-identical output — which is exactly what makes the upload-pack cache
+/// sound (and what lets us precompute it ahead of the first clone).
+async fn build_upload_pack_response(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    wanted_sha1s: &[[u8; 20]],
+) -> ledge_core::Result<Vec<u8>> {
+    let sha1_to_obj = sha1_store.sha1_index().await;
+
+    let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<[u8; 20]> =
+        wanted_sha1s.iter().copied().collect();
+
+    while let Some(sha1) = queue.pop_front() {
+        if !seen.insert(sha1) {
+            continue;
+        }
+        let Some(obj_id) = sha1_to_obj.get(&sha1).copied() else {
+            // Unknown SHA-1: skip rather than abort (client may `want` an id we
+            // do not have; git will report the missing object).
+            continue;
+        };
+        let Ok(content) = objects.read(obj_id).await else {
+            continue;
+        };
+        // Default to blob (3) if the type byte is somehow unavailable.
+        let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
+
+        // Enqueue children so the entire reachable graph is packed.
+        match git_type {
+            1 => {
+                if let Some(tree) = commit_tree_sha1(&content) {
+                    queue.push_back(tree);
+                }
+                for parent in commit_parent_sha1s(&content) {
+                    queue.push_back(parent);
+                }
+            }
+            2 => {
+                for child in tree_child_sha1s(&content) {
+                    queue.push_back(child);
+                }
+            }
+            _ => {}
+        }
+
+        pack_objects.push((git_type, content));
+    }
+
+    let pack = encode_pack(&pack_objects);
+    // Smart-HTTP upload-pack response: the NAK acknowledgement is pkt-line
+    // framed ("0008NAK\n"); the pack data follows directly as raw bytes.
+    let nak = encode(b"NAK\n");
+    let mut response = Vec::with_capacity(nak.len() + pack.len());
+    response.extend_from_slice(&nak);
+    response.extend_from_slice(&pack);
+    Ok(response)
+}
+
+/// Read the object count from a NAK-framed upload-pack response: the pack
+/// header's big-endian u32 object count, which sits at bytes [8..12] of the
+/// PACK header — itself preceded by the 8-byte "0008NAK\n" pkt-line. Used only
+/// to report a warm's closure size; returns 0 if the bytes are not a pack.
+fn count_pack_objects(resp: &[u8]) -> usize {
+    let pack = &resp[8.min(resp.len())..];
+    if pack.len() >= 12 && &pack[..4] == b"PACK" {
+        u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize
+    } else {
+        0
+    }
+}
+
 /// Handle `POST /:repo/git-upload-pack`.
 ///
 /// Parses the client's pkt-line request body to collect `want` lines,
@@ -378,73 +457,116 @@ pub async fn handle_upload_pack(
         }
     }
 
-    // ── Build the global SHA-1 → ObjectId index ──────────────────────────────
+    // ── Build the response ────────────────────────────────────────────────────
     // A clone must receive the full object closure reachable from each wanted
-    // commit (commit → tree(s) → blob(s)), not just the wanted objects
-    // themselves.  Children are referenced by git SHA-1, so we need a reverse
-    // map from SHA-1 to the BLAKE3-addressed ObjectId for every stored object.
-    let _ = refs;
-    let sha1_to_obj = sha1_store.sha1_index().await;
-
-    // ── Walk the reachable object closure (BFS) ───────────────────────────────
-    // Starting from the wanted SHA-1s, traverse commit/tree references,
-    // collecting each object exactly once.  `seen` guards against cycles and
-    // shared sub-trees; `queue` drives the breadth-first traversal.
-    let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
-    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<[u8; 20]> = wanted_sha1s.iter().copied().collect();
-
-    while let Some(sha1) = queue.pop_front() {
-        if !seen.insert(sha1) {
-            continue;
-        }
-        let Some(obj_id) = sha1_to_obj.get(&sha1).copied() else {
-            // Unknown SHA-1: skip rather than abort (client may `want` an id we
-            // do not have; git will report the missing object).
-            continue;
-        };
-        let Ok(content) = objects.read(obj_id).await else {
-            continue;
-        };
-        // Default to blob (3) if the type byte is somehow unavailable.
-        let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
-
-        // Enqueue children so the entire reachable graph is packed.
-        match git_type {
-            1 => {
-                if let Some(tree) = commit_tree_sha1(&content) {
-                    queue.push_back(tree);
-                }
-                for parent in commit_parent_sha1s(&content) {
-                    queue.push_back(parent);
-                }
-            }
-            2 => {
-                for child in tree_child_sha1s(&content) {
-                    queue.push_back(child);
-                }
-            }
-            _ => {}
-        }
-
-        pack_objects.push((git_type, content));
-    }
-
-    // ── Encode and return ─────────────────────────────────────────────────────
-    let pack = encode_pack(&pack_objects);
-
-    // Smart-HTTP upload-pack response: the NAK acknowledgement is pkt-line
-    // framed ("0008NAK\n"); the pack data follows directly as raw bytes (no
-    // side-band negotiated in Phase 1).
-    let nak = encode(b"NAK\n");
-    let mut response = Vec::with_capacity(nak.len() + pack.len());
-    response.extend_from_slice(&nak);
-    response.extend_from_slice(&pack);
+    // commit (commit → tree(s) → blob(s)), not just the wanted objects. The
+    // closure-walk + encode + NAK-framing is the same pure function used to warm
+    // the cache ahead of the first clone — so a cache hit and a cold build are
+    // byte-identical by construction.
+    let _ = refs; // refs not needed for SHA-1-keyed selection
+    let response = build_upload_pack_response(&objects, sha1_store, &wanted_sha1s).await?;
 
     if let Some(c) = cache {
         c.put(cache_key, std::sync::Arc::new(response.clone()));
     }
     Ok(response)
+}
+
+/// Build and cache the upload-pack response for a segment's full ref-tip
+/// want-set (exactly what a fresh `git clone` requests), so the FIRST clone is
+/// a cache hit instead of an on-demand graph-walk + encode. This is the
+/// cold-clone fix: the build cost moves to write/boot/admin time.
+///
+/// Idempotent: a cache `put` no-ops on an existing key. Returns the number of
+/// objects packed (0 if the segment has no refs). Best-effort by contract —
+/// callers log and ignore errors; a failed warm just means the next clone falls
+/// back to building (still correct, just not pre-warmed).
+pub async fn warm_upload_pack(
+    objects: Arc<dyn ObjectStore>,
+    refs: Arc<dyn RefStore>,
+    sha1_store: &dyn Sha1Provider,
+    segment: &str,
+    cache: &UploadPackCache,
+) -> ledge_core::Result<usize> {
+    // Same namespace discovery lists (segment=="" ⇒ "refs/").
+    let list_prefix = format!("refs/{segment}");
+    let entries = refs.list(&list_prefix).await?;
+
+    // The full clone want-set: the unique SHA-1 of every advertised tip.
+    let mut tips: Vec<[u8; 20]> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    for (_name, entry) in &entries {
+        if let Some(sha1) = sha1_store.sha1_of(entry.target).await {
+            if seen.insert(sha1) {
+                tips.push(sha1);
+            }
+        }
+    }
+    if tips.is_empty() {
+        return Ok(0);
+    }
+
+    // The key a real full clone computes (it sorts the want-set too).
+    let key = upload_pack_cache_key(segment, &tips);
+    let response = build_upload_pack_response(&objects, sha1_store, &tips).await?;
+    let n = count_pack_objects(&response);
+    // `put` is a no-op if already present, so this stays idempotent; we rebuilt
+    // to report a truthful closure size (an offline/admin path — acceptable).
+    cache.put(key, std::sync::Arc::new(response));
+    Ok(n)
+}
+
+/// Derive a stored ref's git segment: the namespace between `refs/` and the
+/// first `heads/`|`tags/` component. `refs/heads/main` → "",
+/// `refs/workspaces/<id>/heads/main` → "workspaces/<id>/",
+/// `refs/tenants/<t>/tags/v1` → "tenants/<t>/". The inverse of `store_ref`'s
+/// segment insertion; defensive (returns "" if no `heads/`|`tags/` marker).
+pub(crate) fn segment_of_ref(stored: &str) -> String {
+    let Some(rest) = stored.strip_prefix("refs/") else {
+        return String::new();
+    };
+    let mut best: Option<usize> = None;
+    for marker in ["heads/", "tags/"] {
+        if let Some(idx) = rest.find(marker) {
+            best = Some(best.map_or(idx, |b: usize| b.min(idx)));
+        }
+    }
+    match best {
+        Some(idx) => rest[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Warm the upload-pack cache for every distinct segment present in the ref
+/// store. Returns (segments_warmed, total_objects_packed). Per-segment errors
+/// are logged and skipped so one bad segment never aborts the sweep. For boot
+/// and the `POST /admin/warm` ops trigger.
+pub async fn warm_all_segments(
+    objects: Arc<dyn ObjectStore>,
+    refs: Arc<dyn RefStore>,
+    sha1_store: &dyn Sha1Provider,
+    cache: &UploadPackCache,
+) -> ledge_core::Result<(usize, usize)> {
+    let all = refs.list("refs/").await?;
+    let mut segments: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (name, _entry) in &all {
+        segments.insert(segment_of_ref(name.as_str()));
+    }
+
+    let mut warmed = 0usize;
+    let mut total = 0usize;
+    for seg in &segments {
+        match warm_upload_pack(objects.clone(), refs.clone(), sha1_store, seg, cache).await {
+            Ok(n) => {
+                warmed += 1;
+                total += n;
+            }
+            Err(e) => {
+                tracing::warn!(segment = %seg, error = %e, "warm_upload_pack failed for segment");
+            }
+        }
+    }
+    Ok((warmed, total))
 }
 
 /// Bounded LRU cache of encoded upload-pack responses, keyed by a hash of the
@@ -1064,5 +1186,172 @@ mod tests {
         assert_eq!(&p[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(p[8..12].try_into().unwrap()), 1u32);
         assert!(p.len() > 32);
+    }
+
+    // ── Cold-clone eager warming ──────────────────────────────────────────────
+
+    /// Encode a clone request body for a set of wanted SHA-1s (want-lines + flush
+    /// + done), matching what `git clone` sends.
+    fn encode_want_body(wants: &[[u8; 20]]) -> Bytes {
+        let mut req = Vec::new();
+        for w in wants {
+            req.extend_from_slice(&crate::pkt_line::encode(
+                format!("want {}\n", hex::encode(w)).as_bytes(),
+            ));
+        }
+        req.extend_from_slice(&crate::pkt_line::encode_flush());
+        req.extend_from_slice(&crate::pkt_line::encode(b"done\n"));
+        Bytes::from(req)
+    }
+
+    #[tokio::test]
+    async fn build_helper_matches_handler_bytes() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x31);
+        let id = objects.seed(Bytes::from(b"helper parity".to_vec()), sha1);
+        refs.insert("refs/heads/main", id);
+        let wants = vec![sha1];
+
+        let via_helper = build_upload_pack_response(
+            &(objects.clone() as Arc<dyn ledge_core::ObjectStore>),
+            objects.as_ref(),
+            &wants,
+        )
+        .await
+        .unwrap();
+
+        let via_handler = handle_upload_pack(
+            encode_want_body(&wants),
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(via_helper, via_handler, "helper must match handler bytes");
+    }
+
+    #[tokio::test]
+    async fn warm_then_first_clone_is_a_hit() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x32);
+        let id = objects.seed(Bytes::from(b"warm me".to_vec()), sha1);
+        refs.insert("refs/heads/main", id);
+        let cache = UploadPackCache::new(8, 64 * 1024 * 1024);
+
+        let n = warm_upload_pack(
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            "",
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert!(n > 0, "warmed object count should be > 0");
+
+        // A real full clone's want-set == {tip}; after warm it must HIT.
+        let before_misses = cache.misses();
+        let resp = handle_upload_pack(
+            encode_want_body(&[sha1]),
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            "",
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.misses(), before_misses, "first clone must not miss after warm");
+        assert!(cache.hits() >= 1);
+
+        // Bytes identical to a cold build.
+        let cold = build_upload_pack_response(
+            &(objects.clone() as Arc<dyn ledge_core::ObjectStore>),
+            objects.as_ref(),
+            &[sha1],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp, cold);
+    }
+
+    #[tokio::test]
+    async fn warm_is_idempotent_and_empty_segment_is_zero() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x33);
+        let id = objects.seed(Bytes::from(b"idempotent".to_vec()), sha1);
+        refs.insert("refs/heads/main", id);
+        let cache = UploadPackCache::new(8, 64 * 1024 * 1024);
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs_arc = refs.clone() as Arc<dyn ledge_core::RefStore>;
+
+        let a = warm_upload_pack(store.clone(), refs_arc.clone(), objects.as_ref(), "", &cache)
+            .await
+            .unwrap();
+        let b = warm_upload_pack(store.clone(), refs_arc.clone(), objects.as_ref(), "", &cache)
+            .await
+            .unwrap();
+        assert_eq!(a, b, "idempotent warm returns the same count");
+
+        // A segment with no refs warms nothing.
+        let empty = warm_upload_pack(
+            store.clone(),
+            refs_arc.clone(),
+            objects.as_ref(),
+            "workspaces/none/",
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn segment_of_ref_derives_all_forms() {
+        assert_eq!(segment_of_ref("refs/heads/main"), "");
+        assert_eq!(segment_of_ref("refs/tags/v1"), "");
+        assert_eq!(segment_of_ref("refs/workspaces/abc/heads/main"), "workspaces/abc/");
+        assert_eq!(segment_of_ref("refs/tenants/acme/tags/v1"), "tenants/acme/");
+        // Roundtrip against store_ref for every segment form.
+        for seg in ["", "workspaces/abc/", "tenants/acme/"] {
+            for client in ["refs/heads/main", "refs/tags/v1", "refs/heads/feature/x"] {
+                assert_eq!(segment_of_ref(&store_ref(client, seg)), seg);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_all_segments_covers_each_segment() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let sha1 = make_sha1(0x34);
+        let id = objects.seed(Bytes::from(b"two segments".to_vec()), sha1);
+        // Same tip advertised in two segments.
+        refs.insert("refs/heads/main", id);
+        refs.insert("refs/workspaces/abc/heads/main", id);
+        let cache = UploadPackCache::new(8, 64 * 1024 * 1024);
+
+        let (segs, objs) = warm_all_segments(
+            objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            refs.clone() as Arc<dyn ledge_core::RefStore>,
+            objects.as_ref(),
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(segs, 2, "both segments warmed");
+        assert!(objs > 0);
+
+        for seg in ["", "workspaces/abc/"] {
+            let key = upload_pack_cache_key(seg, &[sha1]);
+            assert!(cache.get(&key).is_some(), "segment {seg} should be warm");
+        }
     }
 }
