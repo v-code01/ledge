@@ -1,0 +1,15 @@
+Ledge cold-clone eager warming — 2026-06-13T23:30:27Z
+source: /Users/vanshverma/ledge (Ledge's own source)
+
+COLD  first clone (cache empty)          : 0.79s
+WARM  first clone (boot-warmed, one-shot): 0.13s
+WARM  clone best-of-3                     : 0.13s
+git   clone best-of-3 (git://)           : 0.31s
+
+HEAD cold=630f268c2b271108a505a7d93e3f26d24862e179 warm=630f268c2b271108a505a7d93e3f26d24862e179 git=630f268c2b271108a505a7d93e3f26d24862e179
+
+PASS: cold and warm clone the same HEAD
+PASS: warm first clone is faster than cold
+PASS: warm first clone beats git cold clone
+
+RESULT: 3 PASS / 0 FAIL

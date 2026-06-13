@@ -108,23 +108,39 @@ docker compose -f dogfood/docker-compose.yml down -v    # stop + wipe the hosted
 Same ~2,200-object repo, same machine, network transport on both sides (`git daemon`
 git:// for git, HTTP for Ledge — a fair same-transport comparison, not git's local `file://`):
 
+`bash dogfood/clone-speed.sh` (latest run —
+[`results/2026-06-12-cold-clone-warm.txt`](results/2026-06-12-cold-clone-warm.txt), **3 PASS / 0
+FAIL**, all three clone byte-identical HEAD):
+
 | Clone | Time |
 |---|---|
-| Ledge — **repeat / warm cache** | **0.138 s** |
-| git over the network (`git daemon`) | 0.28–0.30 s |
-| Ledge — first / cold (new tip, builds the pack) | ~0.83 s |
+| **Ledge — first clone, eager-warmed** | **0.13 s** |
+| Ledge — repeat / warm cache | 0.13 s |
+| git over the network (`git daemon`) | 0.31 s |
+| Ledge — first / cold (warming off, builds the pack) | 0.79 s |
 
 The journey: 1.08 s → **0.83 s** (cached two-tier `sha1_index` — also fixed a correctness
-bug where clone-from-a-purely-packed-store failed) → **0.138 s** warm (upload-pack response
-cache: the encoded pack is memoized by want-set, so a repeat clone of an unchanged repo streams
-precomputed bytes — git's own model). **On the realistic agent/CI workload (re-cloning the same
-repo), Ledge is ~2× faster than git.**
+bug where clone-from-a-purely-packed-store failed) → **0.13 s** warm (upload-pack response
+cache: the encoded pack is memoized by want-set, so a clone of an unchanged repo streams
+precomputed bytes — git's own model).
 
-**Honest asterisk:** the *first* clone of a never-seen tip still builds the pack (~0.83 s), then
-caches it; git serves a pack precomputed at `gc` time, so git wins the *cold* clone. Eager
-precompute at repack (build + cache the pack when objects change, not on first clone) would win
-the cold case too — the documented follow-on. The cache is want-set-keyed (a tip sha uniquely
-determines its closure ⇒ never stale), bounded LRU (32 entries / 256 MiB), per-node in-memory.
+**The cold-clone axis is now flipped too — Ledge beats git on the *first* clone.** Previously the
+first clone of a never-seen tip built the pack on demand (~0.79 s) while git served a pack
+precomputed at `gc` time, so git won the *cold* case. **Eager warming closes it:** the upload-pack
+response is now precomputed and cached **at write time** — after every push (background, off the
+hot path), once on boot (`warm_all_segments`), and on the synchronous `POST /admin/warm` ops
+trigger. So the *first* clone is a cache hit (**0.13 s**), not a build — measured **below git's
+cold clone (0.31 s)**. The proof above isolates the variable: import via `sync-import` (which does
+*not* warm) gives the 0.79 s cold baseline; a server **restart** (boot-warm repopulates from the
+packed store) makes the very first clone of the fresh process — never cloned before — land at
+0.13 s.
+
+**Honest note:** warming doesn't make the work vanish, it *moves* it — the graph-walk + encode now
+happens at push/boot/admin time instead of on the first clone, which is the right trade for the
+agent/CI re-clone workload (and for git's own gc-precompute model). The cache is want-set-keyed (a
+tip sha uniquely determines its closure ⇒ self-invalidating, never stale), bounded LRU (32 entries
+/ 256 MiB), per-node in-memory. A clone racing a push before the background warm finishes still
+builds (then caches); `POST /admin/warm` / boot-warm are the synchronous guarantees.
 
 
 ## Native git packs (the storage IS a git packfile now)
