@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ledge_core::delta::apply_delta;
+use ledge_core::delta::{apply_delta, read_ofs_varint};
 use ledge_core::{LedgeError, ObjectId, Result};
 
 /// One row of the `.lidx` sidecar: a blake3 ObjectId mapped to its git identity
@@ -86,6 +86,7 @@ pub struct GitPackFile {
     sha1_to_offset: HashMap<[u8; 20], u64>, // REF_DELTA base resolution
     sha1_to_oid: HashMap<[u8; 20], ObjectId>, // delta_base_of + sha1 index
     oid_to_sha1: HashMap<ObjectId, [u8; 20]>,
+    offset_to_oid: HashMap<u64, ObjectId>, // OFS_DELTA base resolution (offset → oid)
 }
 
 impl GitPackFile {
@@ -107,11 +108,13 @@ impl GitPackFile {
         let mut sha1_to_offset = HashMap::with_capacity(entries.len());
         let mut sha1_to_oid = HashMap::with_capacity(entries.len());
         let mut oid_to_sha1 = HashMap::with_capacity(entries.len());
+        let mut offset_to_oid = HashMap::with_capacity(entries.len());
         for e in entries {
             by_oid.insert(e.oid, (e.git_type, e.offset));
             sha1_to_offset.insert(e.sha1, e.offset);
             sha1_to_oid.insert(e.sha1, e.oid);
             oid_to_sha1.insert(e.oid, e.sha1);
+            offset_to_oid.insert(e.offset, e.oid);
         }
         Ok(Self {
             pack_path: pack_path.to_path_buf(),
@@ -119,6 +122,7 @@ impl GitPackFile {
             sha1_to_offset,
             sha1_to_oid,
             oid_to_sha1,
+            offset_to_oid,
         })
     }
 
@@ -215,16 +219,29 @@ impl GitPackFile {
                 let base = self.read_at(pack, base_off, depth + 1)?;
                 apply_delta(&base, &delta)
             }
-            6 => Err(LedgeError::Corruption(
-                "git_pack_file: OFS_DELTA unsupported".into(),
-            )),
+            6 => {
+                // OFS_DELTA: header, base-offset varint (the positive distance
+                // from THIS object's offset back to its base's offset), zlib(delta).
+                let (rel, after_ofs) = read_ofs_varint(data, hdr_len)?;
+                let base_off = offset.checked_sub(rel).ok_or_else(|| {
+                    LedgeError::Corruption("git_pack_file: ofs-delta base underflow".into())
+                })?;
+                let delta_z = data.get(after_ofs..).ok_or_else(|| {
+                    LedgeError::Corruption("git_pack_file: truncated ofs-delta body".into())
+                })?;
+                let delta = zlib_inflate(delta_z)?;
+                let base = self.read_at(pack, base_off, depth + 1)?;
+                apply_delta(&base, &delta)
+            }
             other => Err(LedgeError::Corruption(format!(
                 "git_pack_file: unknown pack object type {other}"
             ))),
         }
     }
 
-    /// If `id` is stored as a REF_DELTA, return the ObjectId of its base; else `None`.
+    /// If `id` is stored as a delta (REF_DELTA or OFS_DELTA), return the ObjectId
+    /// of its base; else `None`. The GC keep-set uses this to retain a kept
+    /// delta's base even when the base is itself ref-unreachable.
     pub fn delta_base_of(&self, id: ObjectId) -> Result<Option<ObjectId>> {
         let Some(&(_, off)) = self.by_oid.get(&id) else {
             return Ok(None);
@@ -233,15 +250,26 @@ impl GitPackFile {
         let data = (pack.get(off as usize..))
             .ok_or_else(|| LedgeError::Corruption("git_pack_file: offset out of range".into()))?;
         let (git_type, _size, hdr_len) = parse_pack_obj_header(data)?;
-        if git_type != 7 {
-            return Ok(None);
+        match git_type {
+            7 => {
+                let base_sha1: [u8; 20] = data
+                    .get(hdr_len..hdr_len + 20)
+                    .ok_or_else(|| {
+                        LedgeError::Corruption("git_pack_file: truncated ref-delta base".into())
+                    })?
+                    .try_into()
+                    .expect("slice of length 20");
+                Ok(self.sha1_to_oid.get(&base_sha1).copied())
+            }
+            6 => {
+                let (rel, _) = read_ofs_varint(data, hdr_len)?;
+                let base_off = off.checked_sub(rel).ok_or_else(|| {
+                    LedgeError::Corruption("git_pack_file: ofs-delta base underflow".into())
+                })?;
+                Ok(self.offset_to_oid.get(&base_off).copied())
+            }
+            _ => Ok(None),
         }
-        let base_sha1: [u8; 20] = data
-            .get(hdr_len..hdr_len + 20)
-            .ok_or_else(|| LedgeError::Corruption("git_pack_file: truncated ref-delta base".into()))?
-            .try_into()
-            .expect("slice of length 20");
-        Ok(self.sha1_to_oid.get(&base_sha1).copied())
     }
 }
 

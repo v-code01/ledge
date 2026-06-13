@@ -49,6 +49,25 @@ pub fn read_ofs_varint(data: &[u8], mut pos: usize) -> Result<(u64, usize)> {
     Ok((off, pos))
 }
 
+/// Encode git's OFS_DELTA base-offset varint — the exact inverse of
+/// [`read_ofs_varint`]. The value is the positive distance from the delta
+/// object's pack offset back to its (earlier) base's offset. Uses git's
+/// `((off+1)<<7)|x` continuation form: big-endian, with each continuation byte's
+/// 7-bit group decremented so the decoder's `+1` on every continuation round-trips.
+pub fn write_ofs_varint(out: &mut Vec<u8>, mut off: u64) {
+    // Fill a scratch buffer from the back: the last byte has the low 7 bits and
+    // no continuation flag; each preceding byte carries 7 more bits with 0x80 set.
+    let mut tmp = [0u8; 16];
+    let mut pos = tmp.len() - 1;
+    tmp[pos] = (off & 0x7f) as u8;
+    while off >> 7 != 0 {
+        off = (off >> 7) - 1;
+        pos -= 1;
+        tmp[pos] = 0x80 | (off & 0x7f) as u8;
+    }
+    out.extend_from_slice(&tmp[pos..]);
+}
+
 /// Apply a git delta to `base`, producing the full reconstructed object content.
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let (base_size, mut p) = read_size_varint(delta, 0)?;
@@ -255,6 +274,16 @@ mod tests {
         assert_eq!(read_ofs_varint(&[0x01], 0).unwrap(), (1, 1));
         assert_eq!(read_ofs_varint(&[0x80, 0x00], 0).unwrap(), (128, 2));
         assert!(read_ofs_varint(&[0x80], 0).is_err()); // truncated
+    }
+    #[test]
+    fn write_ofs_varint_roundtrips_read() {
+        for &off in &[0u64, 1, 2, 126, 127, 128, 129, 16_383, 16_384, 16_385, 1 << 21, (1 << 28) + 7] {
+            let mut buf = Vec::new();
+            write_ofs_varint(&mut buf, off);
+            let (got, used) = read_ofs_varint(&buf, 0).unwrap();
+            assert_eq!(got, off, "ofs varint roundtrip for {off}");
+            assert_eq!(used, buf.len(), "consumed all bytes for {off}");
+        }
     }
     #[test]
     fn apply_delta_copy_insert_copy() {

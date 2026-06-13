@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use ledge_core::delta::{apply_delta, encode_delta};
+use ledge_core::delta::{apply_delta, encode_delta, write_ofs_varint};
 use ledge_core::{LedgeError, Result};
 
 /// Cap on delta-chain depth. git's own default is `--depth=50`; we honour the
@@ -137,10 +137,13 @@ pub fn write_git_pack(
         let start = pack.len();
         match &chosen[i] {
             Some((b, delta)) => {
-                // REF_DELTA (type 7): header size is the delta length, then the
-                // 20-byte base sha1, then zlib(delta).
-                write_obj_header(&mut pack, 7, delta.len());
-                pack.extend_from_slice(&objects[*b].sha1);
+                // OFS_DELTA (type 6): header size is the delta length, then the
+                // base's NEGATIVE offset varint (distance back to the base, which
+                // is always earlier in `order` ⇒ a smaller offset), then zlib(delta).
+                // OFS over REF saves the 20-byte base sha1 (the offset varint is
+                // ~1-3 bytes) — git's own default and the disk-parity lever.
+                write_obj_header(&mut pack, 6, delta.len());
+                write_ofs_varint(&mut pack, offset - offsets[*b]);
                 pack.extend_from_slice(&zlib(delta));
             }
             None => {
