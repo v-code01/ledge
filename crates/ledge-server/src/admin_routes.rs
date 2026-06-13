@@ -196,6 +196,38 @@ pub async fn admin_recover(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `POST /admin/warm` — precompute & cache the upload-pack (clone) response for
+/// every ref segment, so the next clone of any workspace is a cache hit rather
+/// than an on-demand pack build. This is the synchronous, deterministic form of
+/// the cold-clone warming that also runs in the background after each push and
+/// once on boot. Always available (no cold-tier gating).
+///
+/// Returns **200** `{segments_warmed, objects_packed}`. A warm is idempotent and
+/// self-invalidating (the cache key is the tip want-set), so repeated calls are
+/// safe. Per-segment failures are logged and skipped inside `warm_all_segments`,
+/// so a single bad segment never fails the whole sweep — only a ref-store list
+/// failure surfaces as **500**.
+pub async fn admin_warm(State(state): State<AppState>) -> Response {
+    match ledge_git::fetch::warm_all_segments(
+        state.objects.clone(),
+        state.refs.clone(),
+        state.objects_disk.as_ref(),
+        ledge_git::fetch::global_upload_cache(),
+    )
+    .await
+    {
+        Ok((segments_warmed, objects_packed)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "segments_warmed": segments_warmed,
+                "objects_packed": objects_packed,
+            })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +426,50 @@ mod route_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `POST /admin/warm` precomputes the clone response for every ref segment.
+    /// Seed a git blob (so its SHA-1 resolves) and a ref pointing at it, then
+    /// assert the endpoint reports the segment warmed and at least one object
+    /// packed — proving the warm wiring builds a real, cacheable response.
+    #[tokio::test]
+    async fn warm_endpoint_warms_seeded_segment() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+
+        // A git object the warm path can resolve SHA-1 → ObjectId for.
+        let id = state
+            .objects_disk
+            .write_git_object(3, axum::body::Bytes::from_static(b"warm blob"))
+            .await
+            .unwrap();
+        state
+            .refs
+            .update(&RefName::new("refs/heads/main").unwrap(), id, None)
+            .await
+            .unwrap();
+
+        let app = crate::build_app(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/warm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["segments_warmed"].as_u64().unwrap() >= 1,
+            "expected >=1 segment warmed, got {v}"
+        );
+        assert!(
+            v["objects_packed"].as_u64().unwrap() >= 1,
+            "expected >=1 object packed, got {v}"
+        );
     }
 }

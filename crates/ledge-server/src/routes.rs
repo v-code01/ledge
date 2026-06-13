@@ -229,12 +229,42 @@ pub async fn receive_pack(
     .await;
     metrics::record_git_request_duration("receive-pack", start.elapsed());
     match result {
-        Ok(r) => git_response("application/x-git-receive-pack-result", r),
+        Ok(r) => {
+            spawn_warm(&state, segment);
+            git_response("application/x-git-receive-pack-result", r)
+        }
         Err(e) => {
             warn!(error = %e, "receive-pack failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Eager-warm a segment's upload-pack (clone) response off the request hot path.
+///
+/// After a successful push the segment's tip changed, so the FIRST subsequent
+/// clone would otherwise pay a full graph-walk + encode. Spawning the warm in
+/// the background populates the cache without adding any latency to the push
+/// response. Best-effort: a failed warm just means that first clone falls back
+/// to building (still correct). The clone is a cache hit only if the warm wins
+/// the race; `POST /admin/warm` is the synchronous guarantee.
+fn spawn_warm(state: &AppState, segment: String) {
+    let objects = state.objects.clone();
+    let refs = state.refs.clone();
+    let objects_disk = state.objects_disk.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ledge_git::fetch::warm_upload_pack(
+            objects,
+            refs,
+            objects_disk.as_ref(),
+            &segment,
+            ledge_git::fetch::global_upload_cache(),
+        )
+        .await
+        {
+            warn!(error = %e, segment = %segment, "post-push upload-pack warm failed");
+        }
+    });
 }
 
 /// GET /ws/{id}/info/refs — workspace-scoped discovery.
@@ -350,7 +380,10 @@ pub async fn ws_receive_pack(
     .await;
     metrics::record_git_request_duration("receive-pack", start.elapsed());
     match r {
-        Ok(r) => git_response("application/x-git-receive-pack-result", r),
+        Ok(r) => {
+            spawn_warm(&state, segment);
+            git_response("application/x-git-receive-pack-result", r)
+        }
         Err(e) => {
             warn!(error = %e, "ws receive-pack failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

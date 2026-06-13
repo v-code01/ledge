@@ -491,6 +491,30 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Boot-warm the upload-pack cache so a freshly-started or S3-recovered node
+    // is clone-fast on the FIRST request, not after it. Uses the same sources the
+    // serve path does — the `objects_dyn` seam for reads (replicated in cluster
+    // mode), the concrete node-local disk store as the SHA-1 provider — so the
+    // cached bytes are identical to a cold build. Best-effort; never fatal.
+    {
+        let warm_objects = objects_dyn.clone();
+        let warm_refs = refs_dyn.clone();
+        let warm_disk = objects.clone();
+        match ledge_git::fetch::warm_all_segments(
+            warm_objects,
+            warm_refs,
+            warm_disk.as_ref(),
+            ledge_git::fetch::global_upload_cache(),
+        )
+        .await
+        {
+            Ok((segs, objs)) => {
+                tracing::info!(segments = segs, objects = objs, "boot upload-pack warm complete")
+            }
+            Err(e) => tracing::warn!(error = %e, "boot upload-pack warm failed"),
+        }
+    }
+
     let app = build_app(AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
         // concrete local stores up-cast in single-node mode (byte-identical to
