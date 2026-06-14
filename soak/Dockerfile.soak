@@ -1,0 +1,27 @@
+# Soak/chaos test image: ledge + network-emulation and clock-skew tooling.
+# NOT a release artifact — used only by soak/wan-chaos.sh to subject a real
+# multi-process cluster to emulated WAN conditions and per-node clock skew.
+#
+#   - iproute2  : `tc netem` for latency / jitter / loss / reordering / partition
+#   - libfaketime: per-node CLOCK_REALTIME offset via LD_PRELOAD (skews HLC wall
+#                  time but NOT CLOCK_MONOTONIC, so Raft election timers are
+#                  unaffected — the realistic "wall clocks disagree" scenario).
+#
+# libfaketime is inert unless FAKETIME is set in the environment, so nodes
+# without a FAKETIME run on the real clock.
+FROM ledge:latest
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libfaketime iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf "$(find / -name 'libfaketime.so.1' 2>/dev/null | head -1)" /usr/local/lib/libfaketime.so.1
+
+# Preload libfaketime for every process; a no-op while FAKETIME is unset.
+ENV LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+# Don't fake the monotonic clock — Raft/tokio timers must keep ticking truly.
+ENV FAKETIME_DONT_FAKE_MONOTONIC=1
+
+# Drop back to the unprivileged runtime user from the base image (uid 10001).
+# tc is run via `docker exec -u 0` by the harness, which has CAP_NET_ADMIN.
+USER 10001

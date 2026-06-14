@@ -82,6 +82,30 @@ Notes (honest):
   full TLS object peers on restart (the route's rebuilt peers carry the bearer but
   not the per-node TLS client config — a v1 limitation).
 
+## Emulated WAN + clock skew (`soak/wan-chaos.sh`)
+
+`bash soak/wan-chaos.sh` extends the clean-partition suite above with the two
+conditions 4f deferred: **degraded networks** and **clock skew**. It runs the
+3-node cluster on the `ledge:soak` image (libfaketime + iproute2) where node-2's
+clock is **+5s** and node-3's is **−7s** (skewing `CLOCK_REALTIME`/HLC only —
+`CLOCK_MONOTONIC`, and thus the Raft/tokio timers, stays real), and uses
+`tc netem` to inject latency, jitter, loss, reordering, and a one-way partition.
+
+Latest run — **16 PASS / 0 FAIL**
+([`results/2026-06-14-wan-chaos-skew.txt`](results/2026-06-14-wan-chaos-skew.txt)):
+
+1. **Clock skew is real + baseline holds** — asserts the nodes actually run on
+   wall clocks that differ by seconds, and membership still commits+applies on all 3.
+2. **Data durability under skew + 80ms latency** — a real `git push` (2 commits)
+   replicates and clones back **byte-identical**, `commit_index` advances, and all
+   3 replicas converge — while the clocks disagree.
+3. **Latency + jitter** (120ms ±40ms) — leader does not churn, no commit regression.
+4. **Packet loss** (12%) — cluster holds exactly one leader, recovers, no regression.
+5. **Reordering** (30%) — stays consistent (single leader).
+6. **Asymmetric partition** (leader egress 100% loss) — the majority elects a *new*
+   leader, the reachable majority agrees on one leader (no split-brain), heals and
+   reconverges, and the committed log never regresses.
+
 ## Honest limitations (the single-host ceiling)
 
 - **One physical host.** Real processes, real container network, real clean
@@ -89,13 +113,15 @@ Notes (honest):
   latency, no genuine inter-host clock skew (the clock is one host's clock). 4f
   closes the *in-process* gap, not the *geo* gap; a true geo-distributed soak needs
   real hosts (cloud/lab).
-- **Clean partitions only** (`disconnect`/`connect`). Lossy / asymmetric / flapping /
-  latency degradation (`tc`/`pumba`, needs NET_ADMIN) is a follow-on; the clean cut
-  already proves the safety-critical no-split-brain property.
-- **Consensus-layer focus.** The harness asserts on replicated Raft state
-  (leader / term / commit_index / last_applied). Per-key data-write durability under
-  chaos remains covered by the (proven) in-process 2PC/Raft tests — wiring a
-  git-push data probe into the chaos loop is a follow-on.
+- ~~Clean partitions only~~ **Addressed by `wan-chaos.sh`:** latency, jitter, loss,
+  reordering, and an asymmetric (one-way) partition via `tc netem`. Flapping is the
+  remaining follow-on.
+- ~~No clock skew~~ **Addressed by `wan-chaos.sh`:** per-node CLOCK_REALTIME offsets
+  via libfaketime (+5s/−7s). Caveat: it's process-level faked time on one host, not
+  two machines' independent hardware clocks.
+- ~~Consensus-layer only~~ **Addressed by `wan-chaos.sh`:** scenario 2 drives a real
+  `git push` through Raft under skew+latency and asserts a byte-identical clone-back
+  plus replica convergence — a genuine per-key data-durability probe in the chaos loop.
 - **Bounded soak** (minutes), **crash-fault model only** (no byzantine / disk
   corruption), **local/manual** (not in CI — docker-network chaos needs privileged
   runners).

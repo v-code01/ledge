@@ -1,0 +1,72 @@
+# Soak/chaos cluster: same 3-node topology as docker-compose.cluster.yml, but on
+# the `ledge:soak` image (libfaketime + iproute2), with CAP_NET_ADMIN so the
+# harness can apply `tc netem`, and per-node clock skew via FAKETIME:
+#   ledge-1: real clock      ledge-2: +5s ahead      ledge-3: -7s behind
+# Skew hits CLOCK_REALTIME (HLC wall time) only; CLOCK_MONOTONIC (Raft/tokio
+# timers) is left real via FAKETIME_DONT_FAKE_MONOTONIC=1 in the image.
+#
+#   docker compose -f deploy/compose/docker-compose.soak.yml up -d
+# Driven by soak/wan-chaos.sh.
+x-ledge-common: &ledge-common
+  image: ledge:soak
+  command: ["start", "--config", "/etc/ledge/config.toml"]
+  cap_add:
+    - NET_ADMIN
+  environment: &ledge-env
+    LEDGE__AUTH__ENABLED: "true"
+    LEDGE__AUTH__CLUSTER_SECRET: "dev-cluster-secret-change-me"
+    LEDGE__AUTH__BOOTSTRAP_ADMIN_TOKEN: "ledge_9b7ee379e0250464_6ixCz0hl7icRM_WuUtzu-uHAVsDqF9teIkUTyR69VZQ"
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:9090/healthz"]
+    interval: 15s
+    timeout: 3s
+    retries: 5
+    start_period: 15s
+
+services:
+  ledge-1:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "1"
+      FAKETIME: "+0"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ledge-1-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+  ledge-2:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "2"
+      FAKETIME: "+5"
+    volumes:
+      - ledge-2-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+  ledge-3:
+    <<: *ledge-common
+    environment:
+      <<: *ledge-env
+      LEDGE__CLUSTER__NODE_ID: "3"
+      FAKETIME: "-7"
+    volumes:
+      - ledge-3-data:/var/lib/ledge
+      - type: bind
+        source: ./cluster-config.toml
+        target: /etc/ledge/config.toml
+        read_only: true
+
+volumes:
+  ledge-1-data:
+  ledge-2-data:
+  ledge-3-data:

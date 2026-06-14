@@ -1,0 +1,43 @@
+
+=== bring up skewed soak cluster (ledge:soak; n2 +5s, n3 -7s) ===
+  PASS 3 nodes healthy
+  PASS leader elected under clock skew
+
+=== 1. clock skew verified + baseline consensus under skew ===
+     host=1781473009  ledge-2=1781473014 (+5s)  ledge-3=1781473002 (-7s)
+  PASS nodes run on genuinely skewed wall clocks (+/- seconds)
+     ledge-1: leader=1 commit=1 applied=1
+     ledge-2: leader=1 commit=1 applied=1
+     ledge-3: leader=1 commit=1 applied=1
+  PASS membership committed+applied on all 3 despite skew
+
+=== 2. data durability: git push under skew + 80ms latency, clone-back identical ===
+     ws=19ec810e3dc000000000000000000000 push_ok=1 commit 1->2  src=126dc987773f clone=126dc987773f
+  PASS git push replicated + cloned back byte-identical under skew+latency
+  PASS all 3 replicas converged to the post-push commit index
+
+=== 3. latency+jitter (120ms +/-40ms, all links): leader stable, no commit regression ===
+     leader held=1 (1)  commit 2->2
+  PASS leader did not churn under latency+jitter
+  PASS commit index did not regress under latency
+
+=== 4. packet loss (12% all links): single leader, no commit regression ===
+  PASS cluster holds exactly one leader under 12% loss
+  PASS single leader after loss cleared
+  PASS no commit regression across loss episode
+
+=== 5. packet reordering (delay 60ms, 30% reordered): stays consistent ===
+  PASS single leader under reordering
+
+=== 6. asymmetric partition (leader egress 100% loss): majority re-elects, no split-brain ===
+     isolating ledge-1 (was leader); observing from ledge-2
+  PASS majority elected a NEW leader (!= isolated old leader)
+  PASS the reachable majority agrees on one leader (no split-brain)
+  PASS cluster reconverged to a single leader after heal
+  PASS no committed-log regression across the partition
+
+=== summary ===
+RESULT: 16 PASS / 0 FAIL
+
+=== teardown ===
+EXIT=0

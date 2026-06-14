@@ -109,9 +109,16 @@ Benchmark methodology and reproduction scripts are in [`dogfood/`](dogfood/).
 Ledge is weeks old. It is a strong artifact and a real engine, but here's exactly
 what is **not** ready — so you can decide where it fits:
 
-- **Multi-host is untested on real networks.** All cluster/Raft/chaos/soak runs
-  are single-host (Docker). Treat multi-node as experimental until it's run
-  across real machines with real partitions and clock skew.
+- **Multi-host is validated under emulated WAN + clock skew, but not yet on
+  separate physical machines.** The 3-node cluster passes a chaos suite
+  ([`soak/wan-chaos.sh`](soak/wan-chaos.sh), **16/0**) under injected latency,
+  jitter, packet loss, reordering, and an asymmetric partition, with the nodes on
+  genuinely skewed wall clocks (+5s / −7s via libfaketime) — including a real
+  `git push` that replicates byte-identically while the clocks disagree, plus
+  leader-stability and no-split-brain / no-commit-regression assertions. Residual:
+  it still runs on **one host** (shared kernel + monotonic clock), so this
+  emulates WAN conditions rather than proving real geographically-separate
+  hardware. That last step needs actual machines.
 - **Incremental `git fetch` re-sends the closure.** The fetch path doesn't yet do
   `have`-line negotiation, so a fetch streams the full closure of the wanted tips
   (the client dedups locally, but the wire transfer is not incremental). High on
