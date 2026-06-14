@@ -132,6 +132,6 @@ Ledge is **source-available** under the **Business Source License 1.1** (see
 production freely — the one thing you can't do is offer Ledge to third parties as
 a competing hosted/managed service. Each release **converts to Apache-2.0** on
 its Change Date (2030-06-13). This is *not* OSI "open source"; it's "fair source."
-Commercial licensing: vanshverma.code@gmail.com.
+Commercial licensing: vanshverma.dev@gmail.com.
 
 Contributions: see [`CONTRIBUTING.md`](CONTRIBUTING.md) (DCO sign-off, no CLA).

@@ -10,7 +10,7 @@ on the public internet yet. See "Known limitations" below before deploying.
 
 Please report security issues privately. **Do not open a public issue.**
 
-- Email: **vanshverma.code@gmail.com** with subject `SECURITY: <short summary>`.
+- Email: **vanshverma.dev@gmail.com** with subject `SECURITY: <short summary>`.
 - Include: affected version/commit, a description, and a reproduction if possible.
 - You'll get an acknowledgement within 72 hours and a remediation timeline after triage.
 
