@@ -748,6 +748,172 @@ pub fn global_upload_cache() -> &'static UploadPackCache {
     C.get_or_init(|| UploadPackCache::new(32, 256 * 1024 * 1024))
 }
 
+// ── Stream transport (the interactive git protocol over SSH / git://) ─────────
+//
+// Smart-HTTP splits discovery (GET) and transfer (POST) into two stateless
+// requests. A direct connection (SSH, git daemon) is ONE bidirectional stream:
+// the server advertises refs, then negotiates and streams the pack live. These
+// functions are transport-agnostic — they take any `AsyncRead + AsyncWrite`, so
+// the SSH server in `ledge-server` just hands them the channel.
+
+/// A pkt-line read from a stream.
+enum PktIn {
+    Data(Vec<u8>),
+    Flush,
+    Delim,
+    Eof,
+}
+
+/// Read one pkt-line from `s`. Returns `Eof` on a clean end of stream.
+async fn read_pkt<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> std::io::Result<PktIn> {
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 4];
+    let mut got = 0;
+    while got < 4 {
+        let n = s.read(&mut hdr[got..]).await?;
+        if n == 0 {
+            return Ok(PktIn::Eof); // clean (or partial) EOF — treat as end
+        }
+        got += n;
+    }
+    let len = std::str::from_utf8(&hdr)
+        .ok()
+        .and_then(|h| usize::from_str_radix(h, 16).ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pkt-line length"))?;
+    match len {
+        0 => Ok(PktIn::Flush),
+        1 => Ok(PktIn::Delim),
+        2 | 3 => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid pkt-line length",
+        )),
+        _ => {
+            let mut buf = vec![0u8; len - 4];
+            s.read_exact(&mut buf).await?;
+            Ok(PktIn::Data(buf))
+        }
+    }
+}
+
+/// Parse a 40-hex SHA-1 (with optional trailing capabilities) into 20 bytes.
+fn parse_pkt_sha1(rest: &str) -> Option<[u8; 20]> {
+    let hex_s = rest.split_whitespace().next().unwrap_or("");
+    if hex_s.len() != 40 {
+        return None;
+    }
+    let bytes = hex::decode(hex_s).ok()?;
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Strip the HTTP-only `# service=…` line + its trailing flush from a smart-HTTP
+/// advertisement, leaving the bare ref advertisement a direct connection uses.
+fn ssh_advert_from_http(http: &[u8]) -> Vec<u8> {
+    if let Ok((_, rem)) = decode_line(http) {
+        if let Ok((_, rem2)) = decode_line(rem) {
+            return rem2.to_vec();
+        }
+    }
+    http.to_vec()
+}
+
+/// Serve `git-upload-pack` (clone / fetch) over a bidirectional stream.
+///
+/// Advertises refs, reads the client's `want`/`have`/`done`, and streams the
+/// pack. Negotiation is the basic single-ACK protocol (no `multi_ack`): each
+/// have-round without `done` is answered `NAK`; on `done` we send `ACK <common>`
+/// (or `NAK`) followed by the incremental pack — the wanted closure minus
+/// everything reachable from the `have`s we hold (a clone, with no haves, gets
+/// the full closure). Same selection logic as the HTTP path, just live.
+pub async fn upload_pack_stream<S>(
+    stream: &mut S,
+    objects: Arc<dyn ObjectStore>,
+    refs: Arc<dyn RefStore>,
+    sha1_store: &dyn Sha1Provider,
+    segment: &str,
+) -> ledge_core::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    // 1. Advertise refs (the bare, no-"# service" form).
+    let http = handle_upload_pack_discovery(objects.clone(), refs.clone(), sha1_store, segment).await?;
+    let advert = ssh_advert_from_http(&http);
+    stream.write_all(&advert).await.map_err(LedgeError::Io)?;
+    stream.flush().await.map_err(LedgeError::Io)?;
+
+    // 2. Read `want`s (terminated by a flush). No wants ⇒ client hung up.
+    let mut wants: Vec<[u8; 20]> = Vec::new();
+    loop {
+        match read_pkt(stream).await.map_err(LedgeError::Io)? {
+            PktIn::Flush => break,
+            PktIn::Eof => return Ok(()),
+            PktIn::Delim => {}
+            PktIn::Data(d) => {
+                let s = String::from_utf8_lossy(&d);
+                if let Some(rest) = s.strip_prefix("want ") {
+                    if let Some(a) = parse_pkt_sha1(rest) {
+                        wants.push(a);
+                    }
+                }
+            }
+        }
+    }
+    if wants.is_empty() {
+        return Ok(());
+    }
+
+    // 3. Negotiate: collect `have`s; NAK each round until `done`.
+    let mut haves: Vec<[u8; 20]> = Vec::new();
+    let mut done = false;
+    loop {
+        match read_pkt(stream).await.map_err(LedgeError::Io)? {
+            PktIn::Eof => break,
+            PktIn::Delim => {}
+            PktIn::Flush => {
+                stream.write_all(&encode(b"NAK\n")).await.map_err(LedgeError::Io)?;
+                stream.flush().await.map_err(LedgeError::Io)?;
+            }
+            PktIn::Data(d) => {
+                let s = String::from_utf8_lossy(&d);
+                let t = s.trim_end_matches('\n');
+                if let Some(rest) = s.strip_prefix("have ") {
+                    if let Some(a) = parse_pkt_sha1(rest) {
+                        haves.push(a);
+                    }
+                } else if t == "done" {
+                    done = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !done && haves.is_empty() {
+        return Ok(()); // client aborted before requesting anything
+    }
+
+    // 4. Build the (incremental) pack and stream it after the ack line.
+    let idx = sha1_store.sha1_index().await;
+    let commons: Vec<[u8; 20]> = haves.iter().copied().filter(|h| idx.contains_key(h)).collect();
+    let exclude = if commons.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        reachable_closure(&objects, sha1_store, &commons).await
+    };
+    let pack_objects = collect_pack_objects(&objects, sha1_store, &wants, &exclude).await;
+    let pack = encode_pack(&pack_objects);
+    let ack = match commons.last() {
+        Some(h) => encode(format!("ACK {}\n", hex::encode(h)).as_bytes()),
+        None => encode(b"NAK\n"),
+    };
+    stream.write_all(&ack).await.map_err(LedgeError::Io)?;
+    stream.write_all(&pack).await.map_err(LedgeError::Io)?;
+    stream.flush().await.map_err(LedgeError::Io)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,6 +1691,46 @@ mod tests {
             store.clone(), refs.clone(), objects.as_ref(), "", None,
         ).await.unwrap();
         assert_eq!(pack_count(&none), 0, "an up-to-date fetch transfers zero objects");
+    }
+
+    #[tokio::test]
+    async fn upload_pack_stream_serves_clone_and_fetch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (objects, base, child) = base_child_history().await;
+
+        // Run one interactive stream session over an in-memory duplex; return the
+        // bytes the client receives (advert + acks + pack).
+        async fn run(objects: Arc<MemObjectStore>, req: Vec<u8>) -> Vec<u8> {
+            let (mut client, mut server) = tokio::io::duplex(1 << 20);
+            let obj2 = objects.clone();
+            let task = tokio::spawn(async move {
+                let store = obj2.clone() as Arc<dyn ledge_core::ObjectStore>;
+                let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+                upload_pack_stream(&mut server, store, refs, obj2.as_ref(), "")
+                    .await
+                    .unwrap();
+            });
+            client.write_all(&req).await.unwrap();
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap();
+            task.await.unwrap();
+            out
+        }
+
+        // Clone: want child, flush, done → full closure (6 objects).
+        let mut req = Vec::new();
+        req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
+        req.extend_from_slice(&encode_flush());
+        req.extend_from_slice(&encode(b"done\n"));
+        assert_eq!(pack_count(&run(objects.clone(), req).await), 6, "stream clone = full closure");
+
+        // Fetch: want child, flush, have base, done → only the 3 new objects.
+        let mut req = Vec::new();
+        req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
+        req.extend_from_slice(&encode_flush());
+        req.extend_from_slice(&encode(format!("have {}\n", hex::encode(base)).as_bytes()));
+        req.extend_from_slice(&encode(b"done\n"));
+        assert_eq!(pack_count(&run(objects.clone(), req).await), 3, "stream fetch = incremental");
     }
 
     #[tokio::test]

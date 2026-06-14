@@ -20,6 +20,40 @@ pub struct LedgeConfig {
     pub sync: SyncConfig,
     #[serde(default)]
     pub s3: S3Config,
+    #[serde(default)]
+    pub ssh: SshConfig,
+}
+
+/// SSH transport (native `git clone/fetch ssh://…`). Disabled by default — no SSH
+/// listener is bound and no host key is created. When `enabled`, an embedded SSH
+/// server serves `git-upload-pack` over the channel.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SshConfig {
+    pub enabled: bool,
+    /// Listen address for the SSH listener.
+    #[serde(default = "ssh_def_addr")]
+    pub addr: String,
+    /// Persistent host key (OpenSSH format). Default: `<data_dir>/ssh_host_ed25519`.
+    /// Generated on first boot if absent.
+    #[serde(default)]
+    pub host_key_path: Option<String>,
+    /// OpenSSH `authorized_keys` file. When set, only those public keys may
+    /// connect. When unset, ANY key is accepted (dev only — gate this in prod).
+    #[serde(default)]
+    pub authorized_keys_path: Option<String>,
+}
+fn ssh_def_addr() -> String {
+    "0.0.0.0:2222".into()
+}
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            addr: ssh_def_addr(),
+            host_key_path: None,
+            authorized_keys_path: None,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -290,7 +324,9 @@ impl LedgeConfig {
             .set_default("tls.mtls",    false).map_err(map_cfg)?
             .set_default("webhooks.enabled", false).map_err(map_cfg)?
             .set_default("sync.enabled", false).map_err(map_cfg)?
-            .set_default("s3.enabled", false).map_err(map_cfg)?;
+            .set_default("s3.enabled", false).map_err(map_cfg)?
+            .set_default("ssh.enabled", false).map_err(map_cfg)?
+            .set_default("ssh.addr", "0.0.0.0:2222").map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())

@@ -58,6 +58,8 @@ smaller; the bridge is the content-addressing tax. (Details in
 ## What's actually in the box
 
 - **Git smart-HTTP**: clone / push / fetch, including delta-compressed packs.
+- **Git over SSH**: native embedded SSH server (no external `sshd`) serving
+  `git clone`/`git fetch` over `ssh://` (push over SSH is a follow-on).
 - **BLAKE3 content addressing** (`ObjectId = blake3(content)`), not SHA-1.
 - **Sharded Raft replication** (openraft): linearizable compare-and-swap on refs,
   leader-failover with no committed-data loss.
@@ -124,7 +126,10 @@ what is **not** ready — so you can decide where it fits:
   end-to-end against a real `git` client (clone a 25-commit repo, push one commit,
   fetch → exactly the new commit/tree/blob move, not the history). Basic single-ACK
   negotiation; `multi_ack_detailed` and shallow/partial clone are still follow-ons.
-- **No SSH transport, no LFS, no shallow/partial/sparse clone.**
+- **SSH transport does clone + fetch, not yet push** (push over SSH needs
+  streaming pack-receive; push over HTTP works). **No LFS, no shallow/partial/
+  sparse clone.** SSH auth v1 is an authorized-keys allowlist (or accept-any in
+  dev) → root tenant; per-tenant SSH keys are a follow-on.
 - **No external security audit**; tenant isolation has documented sharp edges
   (see [`SECURITY.md`](SECURITY.md)).
 - **No multi-day soak**; long-run memory behavior is unproven.

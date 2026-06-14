@@ -515,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = build_app(AppState {
+    let app_state = AppState {
         // The object/ref seams (`objects_dyn`/`refs_dyn`) were selected above:
         // concrete local stores up-cast in single-node mode (byte-identical to
         // Phase 2), or the ClusterRefStore/ReplicatedObjectStore in cluster mode.
@@ -550,7 +550,53 @@ async fn main() -> anyhow::Result<()> {
         // commit gate + gauges read fresh measurements. `enabled=false` (default)
         // ⇒ every gate is a no-op (R Q15).
         quota,
-    });
+    };
+
+    // ── SSH transport (default off). When `[ssh].enabled`, spin up an embedded
+    //    SSH server that serves `git-upload-pack` (clone/fetch) over the channel.
+    //    Host key persists at `[ssh].host_key_path` (default <data_dir>/ssh_host
+    //    _ed25519, generated on first boot). With no `authorized_keys_path`, ANY
+    //    public key is accepted (dev) — gate it in prod. ──────────────────────
+    if cfg.ssh.enabled {
+        let host_key_path = cfg
+            .ssh
+            .host_key_path
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("ssh_host_ed25519"));
+        match ledge_server::ssh::load_or_create_host_key(&host_key_path) {
+            Ok(host_key) => {
+                let authorized = match cfg.ssh.authorized_keys_path.as_deref() {
+                    Some(p) => match std::fs::read_to_string(p) {
+                        Ok(txt) => ledge_server::ssh::parse_authorized_keys(&txt),
+                        Err(e) => {
+                            tracing::warn!(path = %p, error = %e, "ssh: authorized_keys unreadable; rejecting all keys");
+                            // A configured-but-unreadable allowlist must fail closed.
+                            vec![ledge_server::ssh::unreachable_key()]
+                        }
+                    },
+                    None => {
+                        tracing::warn!("ssh: no authorized_keys_path set — accepting ANY public key (dev only)");
+                        Vec::new()
+                    }
+                };
+                let ctx = ledge_server::ssh::SshCtx {
+                    state: app_state.clone(),
+                    authorized: std::sync::Arc::new(authorized),
+                };
+                let ssh_addr = cfg.ssh.addr.clone();
+                info!(addr = %ssh_addr, "ledge ssh transport listening");
+                tokio::spawn(async move {
+                    if let Err(e) = ledge_server::ssh::serve(ctx, &ssh_addr, host_key).await {
+                        tracing::error!(error = %e, "ssh server exited");
+                    }
+                });
+            }
+            Err(e) => tracing::error!(error = %e, "ssh: failed to load/create host key; SSH disabled"),
+        }
+    }
+
+    let app = build_app(app_state);
 
     // Dedicated plain-HTTP metrics/health listener on [metrics].addr (default
     // :9090) so Prometheus + health probes have a TLS-agnostic scrape port even
