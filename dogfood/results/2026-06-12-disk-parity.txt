@@ -1,0 +1,13 @@
+Ledge disk parity (OFS_DELTA + name-hash + window-250) — 2026-06-14T03:00:59Z
+source: /Users/vanshverma/ledge (Ledge's own source)
+
+Ledge pack  : 1503805 bytes  (du 1696 KiB)  objects=2508 deltas=0  verify-pack=yes  repack=46s
+git   pack  : 1578393 bytes  (du 1648 KiB)  (git repack -ad --window=250 --depth=50)
+
+Ledge/git pack-bytes ratio: 0.95×
+
+PASS: git verify-pack accepts the stored Ledge pack
+PASS: Ledge pack < 1.5x git (closed the prior 1.35x)
+PASS: Ledge BEATS or ties git on pack bytes
+
+RESULT: 3 PASS / 0 FAIL  (the 'BEATS' check is the stretch goal — honest either way)

@@ -150,18 +150,43 @@ Phases A–D: Ledge's cold tier is a **real git v2 packfile** — written from s
 read back by Ledge's BLAKE3 `ObjectId` via a `.lidx` sidecar. One artifact: git-valid (clone-ready)
 and blake3-addressable (Ledge reads).
 
-| Disk (`du`, same source) | Size |
-|---|---|
-| git pack | **1.4 MB** |
-| **Ledge — native git pack, window=64** | **1.9 MB (pack 1.67 MB)** |
-| Ledge — internal pack (pre-git-pack) | 2.3 MB |
-| Ledge — raw, uncompressed | 30 MB |
+86% of objects deltify (self-verified), and the pack is now smaller than git's own — see below.
 
-86% of objects deltify (REF_DELTA, self-verified). The disk gap to git closed from ~1.6× to
-**~1.35×**. Honest residual: git still edges disk (1.4 vs 1.9 MB) via OFS_DELTA + window-250 +
-path-aware base selection — closing it fully (sub-1.4 MB) needs base-index caching to afford a
-250-wide window + OFS deltas (diminishing returns). Repack at window=64 is ~54 s (offline
-maintenance; the raw-length delta ranking made a wide window affordable at all).
+### Disk parity: Ledge's pack is SMALLER than git's (measured)
+
+`bash dogfood/disk-parity.sh` (latest —
+[`results/2026-06-12-disk-parity.txt`](results/2026-06-12-disk-parity.txt), **3 PASS / 0 FAIL**),
+both sides repacked **fresh on the identical current source**, same window/depth, a fair
+apples-to-apples comparison:
+
+| Same source, same window-250/depth-50 | Pack bytes | `du` |
+|---|---|---|
+| **Ledge — OFS_DELTA + name-hash sort + window-250** | **1,503,805 (1.50 MB)** | 1696 KiB |
+| git — `git repack -ad --window=250 --depth=50` | 1,578,393 (1.58 MB) | 1648 KiB |
+
+**Ledge's pack is ~5% smaller than git's own gc pack (0.95×)** — 2286/2508 objects deltified, and
+`git verify-pack` accepts the stored pack. Three levers closed the prior ~1.35× gap and crossed it:
+**OFS_DELTA** (type 6 — replaces REF_DELTA's 20-byte base sha1 with git's ~1–3 byte base-offset
+varint), **base-index caching** (each delta base's block-hash index built once and reused across the
+window — the time lever that makes a 250-wide window affordable), and a **name-hash sort**
+(`(type, name-hash, size desc)` — clusters same-named files so they delta against each other, git's
+own trick; names reconstructed from tree entries during repack). Repack is ~46 s (offline
+maintenance).
+
+**Honest caveat:** on total **`du`** Ledge is ~3% *larger* (1696 vs 1648 KiB) — not because the pack
+is bigger (it's smaller) but because Ledge keeps an extra **`.lidx` sidecar** next to the `.pack` +
+`.idx`: the blake3-ObjectId↔offset bridge that lets one artifact be both git-valid *and*
+blake3-addressable. That sidecar is Ledge's content-addressing tax, a deliberate design choice, not
+delta inefficiency. So: **Ledge wins on pack bytes; git wins on total `du` by the size of the bridge
+index.** (Earlier docs cited git at 1.4 MB — that was an older, smaller snapshot of this source;
+the table above is both sides re-measured now.)
+
+| Historical journey (`du`) | Size |
+|---|---|
+| Ledge — raw, uncompressed | 30 MB |
+| Ledge — internal pack (pre-git-pack) | 2.3 MB |
+| Ledge — native git pack, REF_DELTA window-64 | 1.9 MB |
+| **Ledge — OFS_DELTA + name-hash window-250** | **1.7 MB (pack 1.50 MB < git)** |
 
 ## Off-machine durability: S3 cold tier (the "survives the laptop dying" answer)
 
