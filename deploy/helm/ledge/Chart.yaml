@@ -4,9 +4,9 @@ description: Ledge — agent-native Git storage (sharded Raft, content-addressed
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
-home: https://github.com/vanshverma/ledge
+home: https://github.com/v-code01/ledge
 sources:
-  - https://github.com/vanshverma/ledge
+  - https://github.com/v-code01/ledge
 keywords:
   - git
   - storage

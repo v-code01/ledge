@@ -12,7 +12,7 @@
 
 using Go = import "/go.capnp";
 $Go.package("ledgepb");
-$Go.import("github.com/vanshverma/ledge/sdk/go/ledgepb");
+$Go.import("github.com/v-code01/ledge/sdk/go/ledgepb");
 
 # A 32-byte BLAKE3 content address.
 struct ObjectId {

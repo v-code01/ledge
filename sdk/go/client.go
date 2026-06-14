@@ -20,7 +20,7 @@ import (
 
 	capnp "capnproto.org/go/capnp/v3"
 
-	"github.com/vanshverma/ledge/sdk/go/ledgepb"
+	"github.com/v-code01/ledge/sdk/go/ledgepb"
 )
 
 // contentType is the wire content type for capnp /rpc request and response bodies.

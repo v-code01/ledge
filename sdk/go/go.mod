@@ -1,4 +1,4 @@
-module github.com/vanshverma/ledge/sdk/go
+module github.com/v-code01/ledge/sdk/go
 
 go 1.24.1
 

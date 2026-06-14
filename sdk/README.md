@@ -84,7 +84,7 @@ cd python && python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 ### Go ([`go/`](./go/README.md))
 
 ```go
-import ledge "github.com/vanshverma/ledge/sdk/go"
+import ledge "github.com/v-code01/ledge/sdk/go"
 client := ledge.NewClient("http://127.0.0.1:8080")
 id, _ := client.WriteObject(3, []byte("hello"))
 content, _ := client.ReadObject(id) // []byte "hello"

@@ -1,6 +1,6 @@
 [Unit]
 Description=Ledge — agent-native Git storage
-Documentation=https://github.com/vanshverma/ledge
+Documentation=https://github.com/v-code01/ledge
 After=network-online.target
 Wants=network-online.target
 

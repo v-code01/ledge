@@ -13,7 +13,7 @@ with **real generated bindings** (`ledgepb/ledge_go.capnp.go`) and a passing
 ## Usage
 
 ```go
-import ledge "github.com/vanshverma/ledge/sdk/go"
+import ledge "github.com/v-code01/ledge/sdk/go"
 
 client := ledge.NewClient("http://127.0.0.1:8080") // no trailing /rpc
 

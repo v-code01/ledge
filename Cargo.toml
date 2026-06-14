@@ -21,7 +21,7 @@ rust-version = "1.78"
 license      = "BUSL-1.1"
 authors      = ["Vansh Verma"]
 description  = "Git-compatible, content-addressed storage infrastructure for agent-scale workloads."
-repository   = "https://github.com/vanshverma/ledge"
+repository   = "https://github.com/v-code01/ledge"
 
 [workspace.dependencies]
 blake3            = "1"
