@@ -310,42 +310,80 @@ pub async fn handle_upload_pack_discovery(
     Ok(out)
 }
 
-/// Build the NAK-framed upload-pack response for a wanted SHA-1 set.
-///
-/// BFS the reachable object closure (commit → tree(s)/parent(s) → tree children)
-/// from `wanted_sha1s` via the SHA-1 index, read each object's content once,
-/// encode the packfile, and prefix the `"NAK\n"` acknowledgement. Pure in the
-/// (want-set, store content): the same wants over the same objects always yield
-/// byte-identical output — which is exactly what makes the upload-pack cache
-/// sound (and what lets us precompute it ahead of the first clone).
-async fn build_upload_pack_response(
+/// BFS the git object graph from `roots`, returning every reachable SHA-1
+/// (commit → tree + parents, tree → children) over the objects this store
+/// actually holds. Used to compute the "exclude" set for `have`-line
+/// negotiation: everything reachable from a client's `have` is already on the
+/// client, so it must not be re-sent.
+async fn reachable_closure(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    roots: &[[u8; 20]],
+) -> std::collections::HashSet<[u8; 20]> {
+    let idx = sha1_store.sha1_index().await;
+    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<[u8; 20]> = roots.iter().copied().collect();
+    while let Some(sha1) = queue.pop_front() {
+        if !seen.insert(sha1) {
+            continue;
+        }
+        let Some(obj_id) = idx.get(&sha1).copied() else {
+            continue; // a have we don't hold: nothing to traverse/exclude under it
+        };
+        let Ok(content) = objects.read(obj_id).await else {
+            continue;
+        };
+        match sha1_store.git_type_of(obj_id).await.unwrap_or(3) {
+            1 => {
+                if let Some(tree) = commit_tree_sha1(&content) {
+                    queue.push_back(tree);
+                }
+                for parent in commit_parent_sha1s(&content) {
+                    queue.push_back(parent);
+                }
+            }
+            2 => {
+                for child in tree_child_sha1s(&content) {
+                    queue.push_back(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Collect the `(git_type, content)` objects to pack for `wanted_sha1s`, BFS-ing
+/// the reachable closure but **never including or descending into anything in
+/// `exclude`**. With an empty `exclude` this is the full clone closure; with the
+/// have-closure as `exclude` it is the incremental fetch set (only objects the
+/// client lacks). Objects the store does not hold are skipped (git reports any
+/// genuinely missing wanted object).
+async fn collect_pack_objects(
     objects: &Arc<dyn ObjectStore>,
     sha1_store: &dyn Sha1Provider,
     wanted_sha1s: &[[u8; 20]],
-) -> ledge_core::Result<Vec<u8>> {
+    exclude: &std::collections::HashSet<[u8; 20]>,
+) -> Vec<(u8, Bytes)> {
     let sha1_to_obj = sha1_store.sha1_index().await;
-
     let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
-    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<[u8; 20]> =
-        wanted_sha1s.iter().copied().collect();
+    // Pre-seed `seen` with the exclude set: an excluded object is treated as
+    // already-visited, so it is neither packed nor traversed (its whole subtree
+    // is in `exclude` too, since exclude is itself a reachable closure).
+    let mut seen: std::collections::HashSet<[u8; 20]> = exclude.clone();
+    let mut queue: std::collections::VecDeque<[u8; 20]> = wanted_sha1s.iter().copied().collect();
 
     while let Some(sha1) = queue.pop_front() {
         if !seen.insert(sha1) {
             continue;
         }
         let Some(obj_id) = sha1_to_obj.get(&sha1).copied() else {
-            // Unknown SHA-1: skip rather than abort (client may `want` an id we
-            // do not have; git will report the missing object).
             continue;
         };
         let Ok(content) = objects.read(obj_id).await else {
             continue;
         };
-        // Default to blob (3) if the type byte is somehow unavailable.
         let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
-
-        // Enqueue children so the entire reachable graph is packed.
         match git_type {
             1 => {
                 if let Some(tree) = commit_tree_sha1(&content) {
@@ -362,10 +400,23 @@ async fn build_upload_pack_response(
             }
             _ => {}
         }
-
         pack_objects.push((git_type, content));
     }
+    pack_objects
+}
 
+/// Build the NAK-framed upload-pack response for a wanted SHA-1 set (a full
+/// clone: no `have` negotiation, the entire reachable closure). Pure in the
+/// (want-set, store content) — the same wants over the same objects always yield
+/// byte-identical output, which is what makes the upload-pack cache sound (and
+/// lets us precompute it ahead of the first clone).
+async fn build_upload_pack_response(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    wanted_sha1s: &[[u8; 20]],
+) -> ledge_core::Result<Vec<u8>> {
+    let empty = std::collections::HashSet::new();
+    let pack_objects = collect_pack_objects(objects, sha1_store, wanted_sha1s, &empty).await;
     let pack = encode_pack(&pack_objects);
     // Smart-HTTP upload-pack response: the NAK acknowledgement is pkt-line
     // framed ("0008NAK\n"); the pack data follows directly as raw bytes.
@@ -413,62 +464,102 @@ pub async fn handle_upload_pack(
     segment: &str,
     cache: Option<&UploadPackCache>,
 ) -> ledge_core::Result<Vec<u8>> {
-    // Fetch is resolved by SHA-1 through `sha1_index`, never by ref name, so the
-    // workspace segment does not change object selection. The parameter exists
-    // for call-site uniformity with discovery/receive.
-    let _ = segment;
-    // ── Parse `want` lines from the request body ──────────────────────────────
+    let _ = refs; // selection is SHA-1-keyed via sha1_index, not ref-name-scoped
+
+    // ── Parse the request: `want`s, `have`s, and whether the client said `done` ──
+    // The body is `want…` lines, a flush, then (for a fetch) `have…` lines and
+    // either another flush (more negotiation coming) or `done`. We must NOT stop
+    // at the first flush — the haves follow it.
     let mut cursor: &[u8] = &body;
     let mut wanted_sha1s: Vec<[u8; 20]> = Vec::new();
-    loop {
-        if cursor.is_empty() {
-            break;
+    let mut have_sha1s: Vec<[u8; 20]> = Vec::new();
+    let mut done = false;
+    let parse_sha1 = |rest: &str| -> Option<[u8; 20]> {
+        let hex_s = rest.split_whitespace().next().unwrap_or("");
+        if hex_s.len() != 40 {
+            return None;
         }
+        let bytes = hex::decode(hex_s).ok()?;
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    };
+    while !cursor.is_empty() {
         let (line, rem) = decode_line(cursor)?;
         cursor = rem;
         match line {
-            // Flush terminates the want list.
-            PktLine::Flush => break,
+            PktLine::Flush | PktLine::Delimiter => {} // keep reading — haves follow
             PktLine::Data(d) => {
                 let s = String::from_utf8_lossy(&d);
+                let t = s.trim_end_matches('\n');
                 if let Some(rest) = s.strip_prefix("want ") {
-                    // The want line may carry capability flags after the SHA-1.
-                    let sha1_hex = rest.split_whitespace().next().unwrap_or("").trim_end_matches('\n');
-                    if sha1_hex.len() == 40 {
-                        if let Ok(bytes) = hex::decode(sha1_hex) {
-                            let mut arr = [0u8; 20];
-                            arr.copy_from_slice(&bytes);
-                            wanted_sha1s.push(arr);
-                        }
+                    if let Some(a) = parse_sha1(rest) {
+                        wanted_sha1s.push(a);
                     }
+                } else if let Some(rest) = s.strip_prefix("have ") {
+                    if let Some(a) = parse_sha1(rest) {
+                        have_sha1s.push(a);
+                    }
+                } else if t == "done" {
+                    done = true;
                 }
             }
-            PktLine::Delimiter => {}
         }
     }
 
-    // ── Cache lookup: a wanted tip sha uniquely determines its object closure ──
-    // so a hit on (segment, sorted wants) serves identical bytes without re-walking
-    // the graph or re-encoding the pack. A changed repo yields different wants → miss.
-    let cache_key = upload_pack_cache_key(segment, &wanted_sha1s);
-    if let Some(c) = cache {
-        if let Some(bytes) = c.get(&cache_key) {
-            return Ok((*bytes).clone());
+    // ── Clone fast-path: no `have`s ⇒ full closure, NAK-framed, cacheable. ──────
+    // A wanted tip sha uniquely determines its closure, so the want-set-keyed
+    // cache (eager warming) is sound here and only here. A fetch (haves present)
+    // is request-specific and never served from / written to this cache.
+    if have_sha1s.is_empty() {
+        let cache_key = upload_pack_cache_key(segment, &wanted_sha1s);
+        if let Some(c) = cache {
+            if let Some(bytes) = c.get(&cache_key) {
+                return Ok((*bytes).clone());
+            }
         }
+        let response = build_upload_pack_response(&objects, sha1_store, &wanted_sha1s).await?;
+        if let Some(c) = cache {
+            c.put(cache_key, std::sync::Arc::new(response.clone()));
+        }
+        return Ok(response);
     }
 
-    // ── Build the response ────────────────────────────────────────────────────
-    // A clone must receive the full object closure reachable from each wanted
-    // commit (commit → tree(s) → blob(s)), not just the wanted objects. The
-    // closure-walk + encode + NAK-framing is the same pure function used to warm
-    // the cache ahead of the first clone — so a cache hit and a cold build are
-    // byte-identical by construction.
-    let _ = refs; // refs not needed for SHA-1-keyed selection
-    let response = build_upload_pack_response(&objects, sha1_store, &wanted_sha1s).await?;
+    // ── Fetch path: `have`-line negotiation (basic single-ACK protocol). ────────
+    // "common" = the haves we actually hold; everything reachable from them is on
+    // the client already and must be excluded from the pack.
+    let idx = sha1_store.sha1_index().await;
+    let commons: Vec<[u8; 20]> = have_sha1s
+        .iter()
+        .copied()
+        .filter(|h| idx.contains_key(h))
+        .collect();
 
-    if let Some(c) = cache {
-        c.put(cache_key, std::sync::Arc::new(response.clone()));
+    if !done {
+        // Negotiation round (no `done` yet): always `NAK`, never a bare `ACK`.
+        // We advertise no `multi_ack`, so in the original protocol a bare
+        // `ACK <id>` means "common found — the packfile follows NOW"; replying
+        // that here (with no pack) makes the client read a "bad pack header".
+        // `NAK` correctly means "keep offering haves / send done", at which point
+        // the final round below sends the ACK + the incremental pack. (In
+        // stateless HTTP the client re-sends its full have-set each round, so the
+        // `done` round still sees every common.)
+        return Ok(encode(b"NAK\n"));
     }
+
+    // Final round: ACK the last common (or NAK), then the INCREMENTAL pack — the
+    // wanted closure minus everything reachable from the commons. In stateless
+    // HTTP the client re-sends all haves each round, so `commons` here is complete.
+    let exclude = reachable_closure(&objects, sha1_store, &commons).await;
+    let pack_objects = collect_pack_objects(&objects, sha1_store, &wanted_sha1s, &exclude).await;
+    let pack = encode_pack(&pack_objects);
+    let ack = match commons.last() {
+        Some(h) => encode(format!("ACK {}\n", hex::encode(h)).as_bytes()),
+        None => encode(b"NAK\n"),
+    };
+    let mut response = Vec::with_capacity(ack.len() + pack.len());
+    response.extend_from_slice(&ack);
+    response.extend_from_slice(&pack);
     Ok(response)
 }
 
@@ -680,11 +771,14 @@ mod tests {
             })
         }
         fn seed(&self, content: Bytes, sha1: [u8; 20]) -> ObjectId {
+            self.seed_typed(content, sha1, 3) // blob
+        }
+        fn seed_typed(&self, content: Bytes, sha1: [u8; 20], git_type: u8) -> ObjectId {
             let hash = *blake3::hash(&content).as_bytes();
             let id = ObjectId::from_bytes(hash);
             self.objects.lock().unwrap().insert(hash, content);
             self.sha1s.lock().unwrap().insert(hash, sha1);
-            self.types.lock().unwrap().insert(hash, 3); // blob
+            self.types.lock().unwrap().insert(hash, git_type);
             id
         }
     }
@@ -1325,6 +1419,127 @@ mod tests {
                 assert_eq!(segment_of_ref(&store_ref(client, seg)), seg);
             }
         }
+    }
+
+    // ── have-line negotiation (incremental fetch) ─────────────────────────────
+
+    /// git object id: sha1 of "<type> <len>\0<body>".
+    fn git_oid(kind: &str, body: &[u8]) -> [u8; 20] {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("{kind} {}\0", body.len()).as_bytes());
+        h.update(body);
+        h.finalize().into()
+    }
+    fn tree_entry(mode: &str, name: &str, oid: &[u8; 20]) -> Vec<u8> {
+        let mut e = format!("{mode} {name}\0").into_bytes();
+        e.extend_from_slice(oid);
+        e
+    }
+    /// Encode an upload-pack fetch request: wants, flush, haves, then done|flush.
+    fn fetch_body(wants: &[[u8; 20]], haves: &[[u8; 20]], done: bool) -> Bytes {
+        let mut r = Vec::new();
+        for w in wants {
+            r.extend_from_slice(&encode(format!("want {}\n", hex::encode(w)).as_bytes()));
+        }
+        r.extend_from_slice(&encode_flush());
+        for h in haves {
+            r.extend_from_slice(&encode(format!("have {}\n", hex::encode(h)).as_bytes()));
+        }
+        if done {
+            r.extend_from_slice(&encode(b"done\n"));
+        } else {
+            r.extend_from_slice(&encode_flush());
+        }
+        Bytes::from(r)
+    }
+    /// Object count from a (possibly ACK-prefixed) upload-pack response.
+    fn pack_count(resp: &[u8]) -> u32 {
+        let p = resp.windows(4).position(|w| w == b"PACK").expect("pack present");
+        u32::from_be_bytes([resp[p + 8], resp[p + 9], resp[p + 10], resp[p + 11]])
+    }
+
+    /// Build a base→child history sharing a blob, return (store, refs, base_commit,
+    /// child_commit). child adds one new blob in a new tree on top of base.
+    async fn base_child_history() -> (Arc<MemObjectStore>, [u8; 20], [u8; 20]) {
+        let objects = MemObjectStore::new();
+        // shared + new blobs
+        let blob_a = b"shared content\n".to_vec();
+        let blob_b = b"brand new\n".to_vec();
+        let oid_a = git_oid("blob", &blob_a);
+        let oid_b = git_oid("blob", &blob_b);
+        objects.seed_typed(Bytes::from(blob_a), oid_a, 3);
+        objects.seed_typed(Bytes::from(blob_b), oid_b, 3);
+        // base tree: {a}; child tree: {a, b}  (entries sorted by name)
+        let tree_base = tree_entry("100644", "a.txt", &oid_a);
+        let mut tree_child = tree_entry("100644", "a.txt", &oid_a);
+        tree_child.extend_from_slice(&tree_entry("100644", "b.txt", &oid_b));
+        let oid_tb = git_oid("tree", &tree_base);
+        let oid_tc = git_oid("tree", &tree_child);
+        objects.seed_typed(Bytes::from(tree_base), oid_tb, 2);
+        objects.seed_typed(Bytes::from(tree_child), oid_tc, 2);
+        // base commit (no parent), child commit (parent = base)
+        let cb = format!(
+            "tree {}\nauthor t <t@l> 0 +0000\ncommitter t <t@l> 0 +0000\n\nc1\n",
+            hex::encode(oid_tb)
+        );
+        let oid_cb = git_oid("commit", cb.as_bytes());
+        objects.seed_typed(Bytes::from(cb.into_bytes()), oid_cb, 1);
+        let cc = format!(
+            "tree {}\nparent {}\nauthor t <t@l> 0 +0000\ncommitter t <t@l> 0 +0000\n\nc2\n",
+            hex::encode(oid_tc),
+            hex::encode(oid_cb)
+        );
+        let oid_cc = git_oid("commit", cc.as_bytes());
+        objects.seed_typed(Bytes::from(cc.into_bytes()), oid_cc, 1);
+        (objects, oid_cb, oid_cc)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_have_sends_only_new_objects() {
+        let (objects, base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+
+        // Full clone (no haves): the whole closure = 6 objects
+        // (2 commits + 2 trees + 2 blobs).
+        let full = handle_upload_pack(
+            fetch_body(&[child], &[], true),
+            store.clone(), refs.clone(), objects.as_ref(), "", None,
+        ).await.unwrap();
+        assert!(full.starts_with(b"0008NAK\n"), "clone is NAK-framed");
+        assert_eq!(pack_count(&full), 6, "clone sends the full closure");
+
+        // Incremental fetch (have base): only child commit + child tree + new blob = 3.
+        let incr = handle_upload_pack(
+            fetch_body(&[child], &[base], true),
+            store.clone(), refs.clone(), objects.as_ref(), "", None,
+        ).await.unwrap();
+        let ack = format!("ACK {}\n", hex::encode(base));
+        assert!(incr.starts_with(&encode(ack.as_bytes())), "fetch ACKs the common base");
+        assert_eq!(pack_count(&incr), 3, "fetch sends ONLY the new objects, not the closure");
+
+        // Up-to-date fetch (have child): nothing new.
+        let none = handle_upload_pack(
+            fetch_body(&[child], &[child], true),
+            store.clone(), refs.clone(), objects.as_ref(), "", None,
+        ).await.unwrap();
+        assert_eq!(pack_count(&none), 0, "an up-to-date fetch transfers zero objects");
+    }
+
+    #[tokio::test]
+    async fn fetch_negotiation_round_naks_without_pack() {
+        let (objects, base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+        // No `done`: a negotiation round. We advertise no multi_ack, so a bare ACK
+        // would mean "pack follows" — we must NAK and send no pack until `done`.
+        let resp = handle_upload_pack(
+            fetch_body(&[child], &[base], false),
+            store, refs, objects.as_ref(), "", None,
+        ).await.unwrap();
+        assert_eq!(resp, encode(b"NAK\n"));
+        assert!(!resp.windows(4).any(|w| w == b"PACK"), "no pack in a negotiation round");
     }
 
     #[tokio::test]

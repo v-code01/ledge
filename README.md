@@ -119,10 +119,11 @@ what is **not** ready — so you can decide where it fits:
   it still runs on **one host** (shared kernel + monotonic clock), so this
   emulates WAN conditions rather than proving real geographically-separate
   hardware. That last step needs actual machines.
-- **Incremental `git fetch` re-sends the closure.** The fetch path doesn't yet do
-  `have`-line negotiation, so a fetch streams the full closure of the wanted tips
-  (the client dedups locally, but the wire transfer is not incremental). High on
-  the roadmap.
+- **Incremental `git fetch` is now negotiated** (`have`-line support): a fetch
+  transfers only the objects the client lacks, not the full closure — verified
+  end-to-end against a real `git` client (clone a 25-commit repo, push one commit,
+  fetch → exactly the new commit/tree/blob move, not the history). Basic single-ACK
+  negotiation; `multi_ack_detailed` and shallow/partial clone are still follow-ons.
 - **No SSH transport, no LFS, no shallow/partial/sparse clone.**
 - **No external security audit**; tenant isolation has documented sharp edges
   (see [`SECURITY.md`](SECURITY.md)).
