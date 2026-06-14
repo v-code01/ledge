@@ -96,6 +96,46 @@ async fn obj_total(repo: &Path) -> u64 {
 }
 
 #[tokio::test]
+async fn shallow_clone_bounds_history() {
+    let (base_url, _dd) = start_server().await;
+    let remote = format!("{base_url}/shallow-repo");
+
+    // 8-commit repo.
+    let src = TempDir::new().unwrap();
+    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
+    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
+    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    for i in 0..8 {
+        std::fs::write(src.path().join("f.txt"), format!("v{i}\n")).unwrap();
+        ok(&git(&["add", "."], src.path()).await, "add");
+        ok(&git(&["commit", "-m", &format!("c{i}")], src.path()).await, "commit");
+    }
+    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push");
+    let tip = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout).unwrap().trim().to_string();
+
+    // --depth 1: exactly one commit, marked shallow, working tree intact.
+    let c1 = TempDir::new().unwrap();
+    let c1p = c1.path().join("c");
+    ok(&git(&["clone", "--depth", "1", "--quiet", &remote, c1p.to_str().unwrap()], Path::new("/")).await, "depth-1 clone");
+    let n1 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c1p).await.stdout).unwrap().trim().to_string();
+    assert_eq!(n1, "1", "depth-1 clone has exactly one commit");
+    assert!(c1p.join(".git/shallow").exists(), "clone is marked shallow");
+    assert_eq!(
+        String::from_utf8(git(&["rev-parse", "HEAD"], &c1p).await.stdout).unwrap().trim(),
+        tip,
+        "shallow clone HEAD is the tip"
+    );
+    assert_eq!(std::fs::read_to_string(c1p.join("f.txt")).unwrap(), "v7\n", "working tree is correct");
+
+    // --depth 3: exactly three commits.
+    let c3 = TempDir::new().unwrap();
+    let c3p = c3.path().join("c");
+    ok(&git(&["clone", "--depth", "3", "--quiet", &remote, c3p.to_str().unwrap()], Path::new("/")).await, "depth-3 clone");
+    let n3 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c3p).await.stdout).unwrap().trim().to_string();
+    assert_eq!(n3, "3", "depth-3 clone has exactly three commits");
+}
+
+#[tokio::test]
 async fn incremental_fetch_transfers_only_new_objects() {
     let (base_url, _dd) = start_server().await;
     let remote = format!("{base_url}/fetch-inc-repo");

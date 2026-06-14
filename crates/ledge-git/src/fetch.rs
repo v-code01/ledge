@@ -284,10 +284,11 @@ pub async fn handle_upload_pack_discovery(
         let head_sha1_hex = hex::encode(head_sha1);
         let default_name = default_ref.0.clone();
 
-        // HEAD line carries the capabilities, including the symref hint.
+        // HEAD line carries the capabilities: the symref hint + `shallow` so a
+        // client may request a depth-limited (`--depth N`) clone/fetch.
         out.extend_from_slice(&encode(
             format!(
-                "{} HEAD\0symref=HEAD:{}\n",
+                "{} HEAD\0symref=HEAD:{} shallow\n",
                 head_sha1_hex, default_name
             )
             .as_bytes(),
@@ -405,6 +406,102 @@ async fn collect_pack_objects(
     pack_objects
 }
 
+/// Collect objects for a SHALLOW request (`deepen <depth>`): include each wanted
+/// commit and its ancestors up to `depth` commits deep (depth 1 = just the wanted
+/// commit), plus every included commit's FULL tree closure (shallow truncates
+/// history, not tree contents). Returns `(objects, shallow_boundaries)` where the
+/// boundaries are included commits whose parents were cut — the `shallow <sha>`
+/// lines the client must be told. `exclude` (haves) is still honoured.
+async fn collect_shallow(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    wanted_sha1s: &[[u8; 20]],
+    exclude: &std::collections::HashSet<[u8; 20]>,
+    depth: usize,
+) -> (Vec<(u8, Bytes)>, Vec<[u8; 20]>) {
+    let idx = sha1_store.sha1_index().await;
+    let depth = depth.max(1);
+
+    // Phase 1: walk the commit graph breadth-first to `depth`, recording the
+    // included commits and the shallow boundary (deepest commits with live parents).
+    let mut commit_seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    let mut roots: Vec<[u8; 20]> = Vec::new(); // commits (and any non-commit wants) to closure-walk
+    let mut shallow: Vec<[u8; 20]> = Vec::new();
+    let mut q: std::collections::VecDeque<([u8; 20], usize)> =
+        wanted_sha1s.iter().map(|w| (*w, 1usize)).collect();
+    while let Some((sha, d)) = q.pop_front() {
+        if exclude.contains(&sha) || !commit_seen.insert(sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(&sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        roots.push(sha);
+        if ty != 1 {
+            continue; // a non-commit want (tag/tree/blob): just closure-walk it
+        }
+        let parents = commit_parent_sha1s(&content);
+        let live_parents: Vec<[u8; 20]> = parents
+            .into_iter()
+            .filter(|p| !exclude.contains(p) && idx.contains_key(p))
+            .collect();
+        if d < depth {
+            for p in live_parents {
+                q.push_back((p, d + 1));
+            }
+        } else if !live_parents.is_empty() {
+            shallow.push(sha); // boundary: included, but its parents are cut
+        }
+    }
+
+    // Phase 2: pack every included commit + the FULL tree closure of each, never
+    // following commit parents (history is already bounded by phase 1).
+    let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 20]> = exclude.clone();
+    let mut tq: std::collections::VecDeque<[u8; 20]> = std::collections::VecDeque::new();
+    for sha in &roots {
+        if !seen.insert(*sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(sha).copied() else { continue };
+        let Ok(content) = objects.read(oid).await else { continue };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        match ty {
+            1 => {
+                if let Some(tree) = commit_tree_sha1(&content) {
+                    tq.push_back(tree);
+                }
+            }
+            2 => {
+                for c in tree_child_sha1s(&content) {
+                    tq.push_back(c);
+                }
+            }
+            _ => {}
+        }
+        pack_objects.push((ty, content));
+    }
+    while let Some(sha) = tq.pop_front() {
+        if !seen.insert(sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(&sha).copied() else { continue };
+        let Ok(content) = objects.read(oid).await else { continue };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        if ty == 2 {
+            for c in tree_child_sha1s(&content) {
+                tq.push_back(c);
+            }
+        }
+        pack_objects.push((ty, content));
+    }
+    (pack_objects, shallow)
+}
+
 /// Build the NAK-framed upload-pack response for a wanted SHA-1 set (a full
 /// clone: no `have` negotiation, the entire reachable closure). Pure in the
 /// (want-set, store content) — the same wants over the same objects always yield
@@ -474,6 +571,7 @@ pub async fn handle_upload_pack(
     let mut wanted_sha1s: Vec<[u8; 20]> = Vec::new();
     let mut have_sha1s: Vec<[u8; 20]> = Vec::new();
     let mut done = false;
+    let mut depth: Option<usize> = None;
     let parse_sha1 = |rest: &str| -> Option<[u8; 20]> {
         let hex_s = rest.split_whitespace().next().unwrap_or("");
         if hex_s.len() != 40 {
@@ -500,11 +598,35 @@ pub async fn handle_upload_pack(
                     if let Some(a) = parse_sha1(rest) {
                         have_sha1s.push(a);
                     }
+                } else if let Some(rest) = t.strip_prefix("deepen ") {
+                    depth = rest.trim().parse::<usize>().ok();
                 } else if t == "done" {
                     done = true;
                 }
             }
         }
+    }
+
+    // ── Shallow path (`deepen N`): a depth-limited clone. Send the shallow-info
+    //    (`shallow <sha>` boundary lines + flush) then NAK + the depth-bounded
+    //    pack. Bypasses the want-set cache (depth-specific). v1 targets the
+    //    `--depth N` CLONE (no haves); shallow deepen-with-haves is a follow-on. ─
+    if let Some(d) = depth {
+        let empty = std::collections::HashSet::new();
+        let (pack_objects, shallow) =
+            collect_shallow(&objects, sha1_store, &wanted_sha1s, &empty, d).await;
+        let mut resp = Vec::new();
+        for s in &shallow {
+            resp.extend_from_slice(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()));
+        }
+        resp.extend_from_slice(&encode_flush()); // end of shallow-info
+        // The no-`done` probe round gets ONLY the shallow-info; the `done` round
+        // additionally gets NAK + the depth-bounded pack.
+        if done {
+            resp.extend_from_slice(&encode(b"NAK\n"));
+            resp.extend_from_slice(&encode_pack(&pack_objects));
+        }
+        return Ok(resp);
     }
 
     // ── Clone fast-path: no `have`s ⇒ full closure, NAK-framed, cacheable. ──────
@@ -844,8 +966,9 @@ where
     stream.write_all(&advert).await.map_err(LedgeError::Io)?;
     stream.flush().await.map_err(LedgeError::Io)?;
 
-    // 2. Read `want`s (terminated by a flush). No wants ⇒ client hung up.
+    // 2. Read `want`s + an optional `deepen N` (terminated by a flush).
     let mut wants: Vec<[u8; 20]> = Vec::new();
+    let mut depth: Option<usize> = None;
     loop {
         match read_pkt(stream).await.map_err(LedgeError::Io)? {
             PktIn::Flush => break,
@@ -853,15 +976,53 @@ where
             PktIn::Delim => {}
             PktIn::Data(d) => {
                 let s = String::from_utf8_lossy(&d);
+                let t = s.trim_end_matches('\n');
                 if let Some(rest) = s.strip_prefix("want ") {
                     if let Some(a) = parse_pkt_sha1(rest) {
                         wants.push(a);
                     }
+                } else if let Some(rest) = t.strip_prefix("deepen ") {
+                    depth = rest.trim().parse::<usize>().ok();
                 }
             }
         }
     }
     if wants.is_empty() {
+        return Ok(());
+    }
+
+    // 2b. Shallow (`deepen N`): send the shallow-info (boundary lines + flush)
+    // immediately, before negotiation — the protocol requires it right after the
+    // deepen. v1 targets the `--depth N` clone (haves ignored for the pack).
+    if let Some(d) = depth {
+        let empty = std::collections::HashSet::new();
+        let (pack_objects, shallow) =
+            collect_shallow(&objects, sha1_store, &wants, &empty, d).await;
+        for s in &shallow {
+            stream
+                .write_all(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()))
+                .await
+                .map_err(LedgeError::Io)?;
+        }
+        stream.write_all(&encode_flush()).await.map_err(LedgeError::Io)?;
+        stream.flush().await.map_err(LedgeError::Io)?;
+        // Drain the client's remaining negotiation (haves/done) until done/EOF.
+        loop {
+            match read_pkt(stream).await.map_err(LedgeError::Io)? {
+                PktIn::Eof => break,
+                PktIn::Flush => {}
+                PktIn::Delim => {}
+                PktIn::Data(d2) => {
+                    if String::from_utf8_lossy(&d2).trim_end_matches('\n') == "done" {
+                        break;
+                    }
+                }
+            }
+        }
+        let pack = encode_pack(&pack_objects);
+        stream.write_all(&encode(b"NAK\n")).await.map_err(LedgeError::Io)?;
+        stream.write_all(&pack).await.map_err(LedgeError::Io)?;
+        stream.flush().await.map_err(LedgeError::Io)?;
         return Ok(());
     }
 
@@ -1731,6 +1892,47 @@ mod tests {
         req.extend_from_slice(&encode(format!("have {}\n", hex::encode(base)).as_bytes()));
         req.extend_from_slice(&encode(b"done\n"));
         assert_eq!(pack_count(&run(objects.clone(), req).await), 3, "stream fetch = incremental");
+    }
+
+    #[tokio::test]
+    async fn shallow_depth_bounds_history_and_reports_boundary() {
+        let (objects, _base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let empty = std::collections::HashSet::new();
+
+        // depth 1: only the tip snapshot (child commit + its tree + 2 blobs = 4),
+        // and `child` is the shallow boundary (its parent is cut).
+        let (objs, shallow) = collect_shallow(&store, objects.as_ref(), &[child], &empty, 1).await;
+        assert_eq!(shallow, vec![child], "depth-1 boundary is the tip");
+        assert_eq!(objs.len(), 4, "depth-1 packs only the tip snapshot, not history");
+
+        // depth 2 covers the whole 2-commit history → no boundary, full closure (6).
+        let (objs2, shallow2) =
+            collect_shallow(&store, objects.as_ref(), &[child], &empty, 2).await;
+        assert!(shallow2.is_empty(), "depth covering all history has no boundary");
+        assert_eq!(objs2.len(), 6, "depth-2 packs both commits' closure");
+    }
+
+    #[tokio::test]
+    async fn handle_upload_pack_shallow_emits_shallow_line_and_bounded_pack() {
+        let (objects, _base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+        // Request: want child, deepen 1, flush, done.
+        let mut req = Vec::new();
+        req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
+        req.extend_from_slice(&encode(b"deepen 1\n"));
+        req.extend_from_slice(&encode_flush());
+        req.extend_from_slice(&encode(b"done\n"));
+        let resp = handle_upload_pack(
+            Bytes::from(req), store, refs, objects.as_ref(), "", None,
+        ).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains(&format!("shallow {}", hex::encode(child))),
+            "response must advertise the shallow boundary"
+        );
+        assert_eq!(pack_count(&resp), 4, "shallow depth-1 pack holds only the tip snapshot");
     }
 
     #[tokio::test]
