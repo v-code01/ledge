@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: BSL 1.1" src="https://img.shields.io/badge/license-BSL%201.1-blue.svg"></a>
-  <img alt="Rust" src="https://img.shields.io/badge/rust-1.78%2B-orange.svg">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-1.89%2B-orange.svg">
   <img alt="Status" src="https://img.shields.io/badge/status-early%2Fsource--available-yellow.svg">
 </p>
 
