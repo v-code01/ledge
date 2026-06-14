@@ -377,6 +377,7 @@ mod tests {
                 git_type,
                 content,
                 sha1,
+                name_hash: 0,
             });
         }
         objs
