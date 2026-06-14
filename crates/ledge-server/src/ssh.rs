@@ -1,12 +1,10 @@
 //! SSH transport: a native embedded SSH server that serves `git-upload-pack`
-//! (clone / fetch) over the channel using the interactive git protocol.
+//! (clone / fetch) and `git-receive-pack` (push) over the channel using the
+//! interactive git protocol.
 //!
-//! Reuses the transport-agnostic [`ledge_git::fetch::upload_pack_stream`] — the
-//! channel is just an `AsyncRead + AsyncWrite`. Default-off (`[ssh] enabled`).
-//!
-//! v1 scope: `git-upload-pack` only (clone + fetch). `git-receive-pack` (push
-//! over SSH) returns a clear error — push over HTTP works today; SSH push is a
-//! follow-on (it needs streaming pack-length detection on the read side).
+//! Reuses the transport-agnostic [`ledge_git::fetch::upload_pack_stream`] and
+//! [`ledge_git::push::receive_pack_stream`] — the channel is just an
+//! `AsyncRead + AsyncWrite`. Default-off (`[ssh] enabled`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -177,12 +175,22 @@ impl Handler for SshHandler {
                         }
                     }
                 }
-                Some((GitService::Receive, _)) => {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stream
-                        .write_all(b"\x01Ledge: push over SSH is not yet supported; use the HTTP remote.\n")
-                        .await;
-                    1
+                Some((GitService::Receive, path)) => {
+                    let segment = segment_from_path(&path);
+                    match ledge_git::push::receive_pack_stream(
+                        &mut stream,
+                        state.refs.clone(),
+                        state.objects_disk.as_ref(),
+                        &segment,
+                    )
+                    .await
+                    {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ssh receive-pack failed");
+                            1
+                        }
+                    }
                 }
                 None => {
                     tracing::warn!(cmd = %cmd, "ssh: unsupported exec command");

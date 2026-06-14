@@ -565,6 +565,119 @@ async fn decode_pack_objects(
     Ok(resolved.into_iter().map(|o| o.unwrap()).collect())
 }
 
+// ── Stream transport: receive-pack (push) over SSH / a direct connection ──────
+
+/// Total byte length of a complete git packfile at the front of `buf`, or `None`
+/// if `buf` does not yet hold a full pack (read more and retry). Walks the 12-byte
+/// header, then each object's varint header plus its self-delimiting zlib stream
+/// (sized via `total_in`), then the 20-byte trailer — the same parse the decoder
+/// uses, but only to find the end so we know exactly how many bytes to read off a
+/// live stream.
+fn git_pack_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 12 || &buf[..4] != b"PACK" {
+        return None;
+    }
+    let n = u32::from_be_bytes(buf[8..12].try_into().ok()?) as usize;
+    let mut pos = 12usize;
+    for _ in 0..n {
+        let slice = buf.get(pos..)?;
+        let (_t, _s, hdr_len, _base) = parse_pack_object_header(slice).ok()?;
+        pos = pos.checked_add(hdr_len)?;
+        let compressed = buf.get(pos..)?;
+        let mut dec = flate2::read::ZlibDecoder::new(compressed);
+        // Drain to the zlib stream end; `total_in` is this object's compressed
+        // byte count. A truncated stream errors → need more bytes.
+        if std::io::copy(&mut dec, &mut std::io::sink()).is_err() {
+            return None;
+        }
+        pos = pos.checked_add(dec.total_in() as usize)?;
+    }
+    pos = pos.checked_add(20)?; // pack trailer (SHA-1)
+    if buf.len() >= pos {
+        Some(pos)
+    } else {
+        None
+    }
+}
+
+/// Serve `git-receive-pack` (push) over a bidirectional stream.
+///
+/// Advertises refs, reads the ref-update commands and (when any command is not a
+/// pure delete) the packfile off the stream, applies them via
+/// [`handle_receive_pack`], and writes the report-status back. Detecting the pack
+/// boundary on a live stream is what [`git_pack_len`] is for — the client sends
+/// commands + pack then waits for the report without closing the channel.
+///
+/// v1 scope: create/update pushes (which carry a pack). Delete-only pushes (no
+/// pack) are a follow-on, consistent with the HTTP receive path.
+pub async fn receive_pack_stream<S>(
+    stream: &mut S,
+    refs: Arc<dyn RefStore>,
+    sha1_store: &dyn Sha1Provider,
+    segment: &str,
+) -> ledge_core::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use crate::fetch::{read_pkt, ssh_advert_from_http, PktIn};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. Advertise refs (bare, no HTTP "# service" preamble).
+    let http = handle_receive_pack_discovery(refs.clone(), sha1_store, segment).await?;
+    let advert = ssh_advert_from_http(&http);
+    stream.write_all(&advert).await.map_err(LedgeError::Io)?;
+    stream.flush().await.map_err(LedgeError::Io)?;
+
+    // 2. Read ref-update commands (re-encoding them into `body` for reuse), to flush.
+    let mut body: Vec<u8> = Vec::new();
+    let mut saw_any = false;
+    loop {
+        match read_pkt(stream).await.map_err(LedgeError::Io)? {
+            PktIn::Eof => return Ok(()), // client hung up before sending commands
+            PktIn::Delim => {}
+            PktIn::Flush => {
+                body.extend_from_slice(&encode_flush());
+                break;
+            }
+            PktIn::Data(d) => {
+                saw_any = true;
+                body.extend_from_slice(&encode(&d));
+            }
+        }
+    }
+    if !saw_any {
+        return Ok(()); // empty push (flush only) — nothing to do
+    }
+
+    // 3. If any command updates a ref to a non-zero target, a packfile follows.
+    let cmds = parse_ref_commands(&body)?;
+    let expect_pack = cmds.iter().any(|c| c.new_sha1 != [0u8; 20]);
+    if expect_pack {
+        let mut pack: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            if let Some(len) = git_pack_len(&pack) {
+                pack.truncate(len);
+                break;
+            }
+            let n = stream.read(&mut chunk).await.map_err(LedgeError::Io)?;
+            if n == 0 {
+                return Err(LedgeError::Corruption(
+                    "receive-pack: stream closed mid-pack".into(),
+                ));
+            }
+            pack.extend_from_slice(&chunk[..n]);
+        }
+        body.extend_from_slice(&pack);
+    }
+
+    // 4. Apply + write the report-status back.
+    let report = handle_receive_pack(Bytes::from(body), refs, sha1_store, segment).await?;
+    stream.write_all(&report).await.map_err(LedgeError::Io)?;
+    stream.flush().await.map_err(LedgeError::Io)?;
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -575,6 +688,25 @@ mod tests {
     use ledge_core::{LedgeError, ObjectId, RefEntry, RefName, RefSnapshot};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn git_pack_len_detects_complete_and_partial() {
+        // A real, complete pack (encode_pack appends the 20-byte SHA-1 trailer).
+        let pack = crate::fetch::encode_pack(&[
+            (3u8, Bytes::from_static(b"hello")),
+            (3u8, Bytes::from_static(b"world, a slightly longer blob")),
+        ]);
+        assert_eq!(git_pack_len(&pack), Some(pack.len()), "full pack → its length");
+        // Truncated trailer / mid-object / header → None (need more bytes).
+        assert_eq!(git_pack_len(&pack[..pack.len() - 5]), None, "missing trailer bytes");
+        assert_eq!(git_pack_len(&pack[..14]), None, "mid first object");
+        assert_eq!(git_pack_len(&pack[..8]), None, "shorter than header");
+        assert_eq!(git_pack_len(b"NOTAPACK....."), None, "bad magic");
+        // Trailing bytes after a complete pack don't extend the reported length.
+        let mut extra = pack.clone();
+        extra.extend_from_slice(b"trailing");
+        assert_eq!(git_pack_len(&extra), Some(pack.len()), "stops at the pack end");
+    }
 
     // ── In-memory stores for testing ─────────────────────────────────────
 

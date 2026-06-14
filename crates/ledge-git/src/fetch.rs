@@ -757,7 +757,7 @@ pub fn global_upload_cache() -> &'static UploadPackCache {
 // the SSH server in `ledge-server` just hands them the channel.
 
 /// A pkt-line read from a stream.
-enum PktIn {
+pub(crate) enum PktIn {
     Data(Vec<u8>),
     Flush,
     Delim,
@@ -765,7 +765,7 @@ enum PktIn {
 }
 
 /// Read one pkt-line from `s`. Returns `Eof` on a clean end of stream.
-async fn read_pkt<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> std::io::Result<PktIn> {
+pub(crate) async fn read_pkt<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> std::io::Result<PktIn> {
     use tokio::io::AsyncReadExt;
     let mut hdr = [0u8; 4];
     let mut got = 0;
@@ -809,7 +809,7 @@ fn parse_pkt_sha1(rest: &str) -> Option<[u8; 20]> {
 
 /// Strip the HTTP-only `# service=…` line + its trailing flush from a smart-HTTP
 /// advertisement, leaving the bare ref advertisement a direct connection uses.
-fn ssh_advert_from_http(http: &[u8]) -> Vec<u8> {
+pub(crate) fn ssh_advert_from_http(http: &[u8]) -> Vec<u8> {
     if let Ok((_, rem)) = decode_line(http) {
         if let Ok((_, rem2)) = decode_line(rem) {
             return rem2.to_vec();

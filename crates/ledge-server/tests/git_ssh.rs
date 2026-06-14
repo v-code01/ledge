@@ -1,7 +1,8 @@
-//! End-to-end proof of the native SSH transport: a real `git` client clones and
-//! fetches over `ssh://` against Ledge's embedded SSH server (russh), with a real
-//! client key and the system `ssh` binary. We seed the repo over HTTP, then drive
-//! clone + incremental fetch entirely over SSH.
+//! End-to-end proof of the native SSH transport: a real `git` client clones,
+//! fetches, AND pushes over `ssh://` against Ledge's embedded SSH server (russh),
+//! with a real client key and the system `ssh` binary. We seed over HTTP, then
+//! drive clone + incremental fetch + push entirely over SSH (the push is verified
+//! durable by re-cloning over HTTP).
 
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tempfile::TempDir;
@@ -93,7 +94,7 @@ fn ok(o: &std::process::Output, ctx: &str) {
 }
 
 #[tokio::test]
-async fn clone_and_fetch_over_ssh() {
+async fn clone_fetch_push_over_ssh() {
     let (http, ssh_port, _dd) = start().await;
 
     // Client SSH key.
@@ -144,4 +145,23 @@ async fn clone_and_fetch_over_ssh() {
     ok(&fe, "ssh fetch");
     let after = String::from_utf8(git(&["rev-parse", "origin/main"], &clone_path, None).await.stdout).unwrap().trim().to_string();
     assert_eq!(after, tip2, "ssh fetch advanced origin/main to the new tip");
+
+    // PUSH over SSH: commit in the clone, push via ssh://, verify it landed by
+    // cloning the repo back over HTTP and checking the tip.
+    ok(&git(&["merge", "--ff-only", "origin/main"], &clone_path, None).await, "ff to origin");
+    ok(&git(&["config", "user.email", "c@l"], &clone_path, None).await, "clone email");
+    ok(&git(&["config", "user.name", "c"], &clone_path, None).await, "clone name");
+    std::fs::write(clone_path.join("pushed.txt"), "via ssh\n").unwrap();
+    ok(&git(&["add", "."], &clone_path, None).await, "add push");
+    ok(&git(&["commit", "-m", "pushed-over-ssh"], &clone_path, None).await, "commit push");
+    let pushed_tip = String::from_utf8(git(&["rev-parse", "HEAD"], &clone_path, None).await.stdout).unwrap().trim().to_string();
+    let pr = git(&["push", "origin", "HEAD:refs/heads/main"], &clone_path, Some(&ssh_cmd)).await;
+    ok(&pr, "ssh push");
+
+    // Verify over HTTP that the server now has the SSH-pushed commit.
+    let verify = TempDir::new().unwrap();
+    let vpath = verify.path().join("v");
+    ok(&git(&["clone", "--quiet", &remote_http, vpath.to_str().unwrap()], Path::new("/"), None).await, "verify clone");
+    let landed = String::from_utf8(git(&["rev-parse", "main"], &vpath, None).await.stdout).unwrap().trim().to_string();
+    assert_eq!(landed, pushed_tip, "the SSH-pushed commit is durable on the server");
 }
