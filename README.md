@@ -102,7 +102,7 @@ A Rust workspace of focused crates:
 | `ledge-rpc` | Cap'n Proto native protocol |
 | `ledge-server` | the Axum binary that wires it all together |
 
-Design notes and per-phase specs are in [`docs/`](docs/).
+Benchmark methodology and reproduction scripts are in [`dogfood/`](dogfood/).
 
 ## Status & honest limitations
 

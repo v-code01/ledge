@@ -1,5 +1,10 @@
 /target
 
+# Local-only planning/process docs (superpowers specs+plans, launch brief) —
+# kept out of the published repo and its history on purpose.
+/docs/superpowers/
+/docs/launch/
+
 # TLC model-checker run artifacts (traces, state dirs, error traces)
 formal/states/
 formal/*_TTrace_*.tla

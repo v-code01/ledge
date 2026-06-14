@@ -4,7 +4,7 @@ Native, typed clients for the Ledge control plane over **Cap'n Proto**, all
 generated from one cross-language schema and talking to the Rust server's binary
 `POST /rpc` endpoint. The named benefit is zero-copy deserialization — a
 property of the Cap'n Proto message format — over the proven Axum HTTP
-transport. (Phase 2b; see `docs/superpowers/specs/2026-06-01-ledge-phase2b-sdk-design.md`.)
+transport.
 
 ## The contract: `schema/ledge.capnp`
 
