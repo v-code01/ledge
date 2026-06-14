@@ -1,0 +1,49 @@
+# Security Policy
+
+## Status
+
+Ledge is early-stage and has **not** had an external security audit. Run it
+behind your own trust boundary; do not expose an instance to untrusted tenants
+on the public internet yet. See "Known limitations" below before deploying.
+
+## Reporting a vulnerability
+
+Please report security issues privately. **Do not open a public issue.**
+
+- Email: **vanshverma.code@gmail.com** with subject `SECURITY: <short summary>`.
+- Include: affected version/commit, a description, and a reproduction if possible.
+- You'll get an acknowledgement within 72 hours and a remediation timeline after triage.
+
+Please give a reasonable disclosure window before publishing. Credit is given to
+reporters who want it.
+
+## Supported versions
+
+Pre-1.0: only the latest `main` is supported. Fixes land on `main`.
+
+## Security model (what Ledge does today)
+
+- **Authentication:** opaque API keys, hashed at rest (BLAKE3), constant-time
+  compare, instantly revocable. Default-off; enable `[auth]`.
+- **Transport:** optional TLS, and mutual TLS for node-to-node cluster traffic
+  (`[tls]`). **Tokens are cleartext unless TLS is enabled** — terminate TLS.
+- **Tenant isolation:** per-tenant ref namespaces; workspace access is gated by
+  an ownership check; a foreign/unknown workspace returns 404 (no existence leak).
+- **Quotas:** per-tenant workspace-count, request-rate, durable-bytes, and
+  object-count limits (`[quotas]`, default-off).
+
+## Known limitations (read before deploying)
+
+These are honest, documented gaps — not undisclosed bugs:
+
+- **No external audit.** The isolation and crypto choices are unaudited.
+- **Object confidentiality is reachability-based, not per-object ACLs.** Objects
+  are content-addressed and deduplicated across tenants; isolation rests on
+  ObjectId unguessability + ref reachability. An out-of-band ObjectId leak can
+  permit a cross-tenant read of that object.
+- **`root` is a superuser namespace.** Do not issue root-tenant keys to
+  untrusted clients.
+- **Webhook URLs are tenant-controlled (SSRF surface).** Gate egress / allowlist
+  hosts before enabling webhooks for untrusted tenants.
+- **Single-host testing only.** Cluster/replication has not run on real
+  multi-host networks; treat multi-node as experimental.

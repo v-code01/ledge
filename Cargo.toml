@@ -18,8 +18,10 @@ members = [
 version      = "0.1.0"
 edition      = "2021"
 rust-version = "1.78"
-license      = "MIT OR Apache-2.0"
+license      = "BUSL-1.1"
 authors      = ["Vansh Verma"]
+description  = "Git-compatible, content-addressed storage infrastructure for agent-scale workloads."
+repository   = "https://github.com/vanshverma/ledge"
 
 [workspace.dependencies]
 blake3            = "1"

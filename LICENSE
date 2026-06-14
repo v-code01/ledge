@@ -1,0 +1,34 @@
+Business Source License 1.1
+
+Licensor:             Vansh Verma
+Licensed Work:        Ledge. (c) 2026 Vansh Verma.
+Additional Use Grant: You may make production use of the Licensed Work, provided
+                      your use does not include offering the Licensed Work to
+                      third parties on a hosted or managed basis that competes
+                      with Vansh Verma's products or services.
+Change Date:          2030-06-13
+Change License:       Apache License, Version 2.0
+
+-----------------------------------------------------------------------------
+
+Notice: The Business Source License (this License) is NOT an Open Source
+license. The Licensed Work is "source-available." On the Change Date above it
+converts, automatically and irrevocably, to the Change License (Apache-2.0).
+
+Summary of terms (the full canonical text governs — see below):
+
+- You may copy, modify, create derivative works of, redistribute, and make
+  non-production use of the Licensed Work freely.
+- You may make PRODUCTION use of the Licensed Work to the extent permitted by
+  the Additional Use Grant above. Production use OUTSIDE that grant (notably,
+  offering Ledge to third parties as a competing hosted/managed service)
+  requires a separate commercial license from the Licensor.
+- For each version, on its Change Date the Licensed Work becomes available
+  under the Change License (Apache-2.0), and the restrictions above end for
+  that version.
+- The Licensed Work is provided "as is", without warranty of any kind.
+
+The complete, governing Business Source License 1.1 text is published at:
+https://mariadb.com/bsl11/
+
+For alternative or commercial licensing, contact: vanshverma.code@gmail.com
