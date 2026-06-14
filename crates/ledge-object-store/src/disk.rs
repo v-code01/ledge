@@ -1023,6 +1023,7 @@ mod tests {
                 git_type: *t,
                 content: c.clone(),
                 sha1: *s,
+                name_hash: 0,
             })
             .collect();
         let (pack, idx, offs) = crate::git_pack::write_git_pack(&pobjs, 16).unwrap();

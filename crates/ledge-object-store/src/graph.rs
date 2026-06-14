@@ -85,6 +85,40 @@ pub fn tree_child_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
     children
 }
 
+/// Extract `(name, child SHA-1)` pairs from a git tree object body.
+///
+/// Same wire layout as [`tree_child_sha1s`] (`<mode> SP <name> NUL <sha1>`), but
+/// keeps the entry name — the repack uses it to compute git's name-hash so
+/// same-named files cluster adjacently and delta against each other. `name` is
+/// the raw bytes of the path component (git permits non-UTF-8 names).
+pub fn tree_entries(content: &[u8]) -> Vec<(Vec<u8>, [u8; 20])> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < content.len() {
+        // entry = "<mode> <name>\0<20 bytes>"; the name starts after the first SP.
+        let nul = match content[pos..].iter().position(|&b| b == 0) {
+            Some(n) => pos + n,
+            None => break,
+        };
+        let sha1_start = nul + 1;
+        let sha1_end = sha1_start + 20;
+        if sha1_end > content.len() {
+            break;
+        }
+        // The header up to NUL is "<mode> <name>"; split on the first space.
+        let header = &content[pos..nul];
+        let name = match header.iter().position(|&b| b == b' ') {
+            Some(sp) => header[sp + 1..].to_vec(),
+            None => header.to_vec(),
+        };
+        let mut sha1 = [0u8; 20];
+        sha1.copy_from_slice(&content[sha1_start..sha1_end]);
+        out.push((name, sha1));
+        pos = sha1_end;
+    }
+    out
+}
+
 /// Compute the set of [`ObjectId`]s reachable from `roots`, walking the git
 /// object graph (commit → tree + parents, tree → children, blob/tag → leaf).
 ///
@@ -170,6 +204,29 @@ mod tests {
     use ledge_core::ObjectId;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn tree_entries_parses_names_and_shas() {
+        // Two entries: a blob "a.txt" and a subtree "dir".
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 a.txt\0");
+        tree.extend_from_slice(&[0x11u8; 20]);
+        tree.extend_from_slice(b"40000 dir\0");
+        tree.extend_from_slice(&[0x22u8; 20]);
+        let entries = tree_entries(&tree);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (b"a.txt".to_vec(), [0x11u8; 20]));
+        assert_eq!(entries[1], (b"dir".to_vec(), [0x22u8; 20]));
+        // names line up with the sha-only parser
+        assert_eq!(
+            tree_child_sha1s(&tree),
+            entries.iter().map(|(_, s)| *s).collect::<Vec<_>>()
+        );
+        // a truncated trailing entry is dropped, not panicked
+        let mut torn = tree.clone();
+        torn.extend_from_slice(b"100644 b.txt\0\x01\x02"); // sha cut short
+        assert_eq!(tree_entries(&torn).len(), 2);
+    }
 
     fn make_store() -> (DiskObjectStore, tempfile::TempDir) {
         let dir = tempdir().unwrap();

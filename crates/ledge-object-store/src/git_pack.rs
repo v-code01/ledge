@@ -17,6 +17,24 @@ pub struct PackObject {
     pub git_type: u8, // 1=commit 2=tree 3=blob 4=tag
     pub content: Vec<u8>,
     pub sha1: [u8; 20],
+    /// git's path name-hash (0 = unknown). Objects with the same name-hash sort
+    /// adjacently so same-named files (every `mod.rs`, every `Cargo.toml`) delta
+    /// against each other — git's clustering trick. 0 falls back to size sort.
+    pub name_hash: u32,
+}
+
+/// git's pack name-hash (`pack-objects.c: pack_name_hash`): suffix-weighted hash
+/// over a path's non-space bytes, so files sharing a suffix/basename collide and
+/// cluster. Replicated exactly so our base selection mirrors git's locality.
+pub fn pack_name_hash(name: &[u8]) -> u32 {
+    let mut hash: u32 = 0;
+    for &c in name {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        hash = (hash >> 2).wrapping_add((c as u32) << 24);
+    }
+    hash
 }
 
 fn zlib(data: &[u8]) -> Vec<u8> {
@@ -67,11 +85,17 @@ pub fn write_git_pack(
     // smaller target against a larger (already-written) base. `order` is the
     // pack write order; `chosen[i]` is the picked (base_index, delta_bytes) for
     // object i (or None = store full); `depth[i]` is its delta-chain depth.
+    // Sort order = git's: (type, name-hash, size desc). Grouping by name-hash
+    // puts same-named files adjacent so a smaller version deltas against a larger
+    // one; within a name-hash, largest-first so deltas describe a smaller target
+    // against a larger base. name_hash 0 (unknown) sorts together and degrades to
+    // pure size order — identical to the pre-L3 behavior when no names are set.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
         objects[a]
             .git_type
             .cmp(&objects[b].git_type)
+            .then(objects[a].name_hash.cmp(&objects[b].name_hash))
             .then(objects[b].content.len().cmp(&objects[a].content.len()))
     });
     let mut chosen: Vec<Option<(usize, Vec<u8>)>> = vec![None; n];
@@ -245,6 +269,18 @@ mod tests {
     }
 
     #[test]
+    fn pack_name_hash_clusters_by_suffix() {
+        // Same basename ⇒ same hash (the clustering property we rely on).
+        assert_eq!(pack_name_hash(b"src/mod.rs"), pack_name_hash(b"src/mod.rs"));
+        // Whitespace is skipped (git does this); different names differ.
+        assert_eq!(pack_name_hash(b"a.rs"), pack_name_hash(b"a .rs"));
+        assert_ne!(pack_name_hash(b"mod.rs"), pack_name_hash(b"lib.rs"));
+        // Deterministic, non-zero for non-empty input; empty ⇒ 0.
+        assert_eq!(pack_name_hash(b""), 0);
+        assert_ne!(pack_name_hash(b"Cargo.toml"), 0);
+    }
+
+    #[test]
     fn obj_header_roundtrips() {
         // Cover boundary sizes around the 4-bit and each 7-bit varint chunk.
         for &size in &[
@@ -318,6 +354,7 @@ mod tests {
                 git_type,
                 content,
                 sha1,
+                name_hash: 0,
             });
         }
         assert!(objs.len() >= 3);
@@ -430,6 +467,7 @@ mod tests {
                 git_type,
                 content,
                 sha1,
+                name_hash: 0,
             });
         }
         objs
@@ -506,6 +544,55 @@ mod tests {
                 o.content,
                 "object {hex} mismatch"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn name_hash_sort_stays_git_valid() {
+        // Assigning name_hash changes the pack write ORDER (and OFS base offsets);
+        // git must still accept it and round-trip every object. Give each object a
+        // synthetic per-name hash so the sort actually reorders.
+        let mut objs = deltifiable_objects().await;
+        for (k, o) in objs.iter_mut().enumerate() {
+            o.name_hash = pack_name_hash(format!("file{}.txt", k % 3).as_bytes());
+        }
+        let (pack, idx, _off) = write_git_pack(&objs, 64).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let pd = out.path().join("pk");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(pd.join("n.pack"), &pack).unwrap();
+        std::fs::write(pd.join("n.idx"), &idx).unwrap();
+        let vp = std::process::Command::new("git")
+            .args(["verify-pack", "-v", pd.join("n.idx").to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            vp.status.success(),
+            "verify-pack rejected name-hash-sorted pack:\n{}\n{}",
+            String::from_utf8_lossy(&vp.stdout),
+            String::from_utf8_lossy(&vp.stderr)
+        );
+        let dst = tempfile::tempdir().unwrap();
+        git(&["init", "--bare", "."], dst.path());
+        let st = std::process::Command::new("git")
+            .args(["unpack-objects"])
+            .current_dir(dst.path())
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(pd.join("n.pack")).unwrap(),
+            ))
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "unpack: {}", String::from_utf8_lossy(&st.stderr));
+        for o in &objs {
+            let hex: String = o.sha1.iter().map(|b| format!("{b:02x}")).collect();
+            let ty = match o.git_type {
+                1 => "commit",
+                2 => "tree",
+                3 => "blob",
+                4 => "tag",
+                _ => unreachable!(),
+            };
+            assert_eq!(git(&["cat-file", ty, &hex], dst.path()), o.content, "object {hex} mismatch");
         }
     }
 }

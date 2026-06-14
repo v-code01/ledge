@@ -26,7 +26,9 @@ pub struct RepackStats {
 }
 
 /// Number of larger same-type neighbours considered as a delta base per object.
-const WINDOW: usize = 64;
+/// git's own default is 250; affordable here because the pack writer caches each
+/// base's block-hash index (built once, reused across the window) — see L2.
+const WINDOW: usize = 250;
 
 /// Run one offline repack pass over `store`.
 ///
@@ -61,6 +63,25 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
     let mut pobjs: Vec<crate::git_pack::PackObject> = Vec::with_capacity(all_ids.len());
     // (oid, sha1, type) parallel to `pobjs`, used to build the `.lidx` rows.
     let mut meta: Vec<(ObjectId, [u8; 20], u8)> = Vec::with_capacity(all_ids.len());
+
+    // First pass: reconstruct each object's path name-hash from the tree entries
+    // that NAME it (git's clustering signal). Walk every tree, record
+    // child-sha1 → pack_name_hash(name) (last writer wins, like git). Blobs and
+    // sub-trees get their namer's hash; commits/tags and never-named objects get
+    // 0 (which sorts together and degrades to pure size order — no regression).
+    let mut name_hash_by_sha1: std::collections::HashMap<[u8; 20], u32> =
+        std::collections::HashMap::new();
+    for id in &all_ids {
+        if store.git_type_of(*id).await.unwrap_or(0) != 2 {
+            continue; // only tree objects carry names
+        }
+        if let Ok(content) = ledge_core::ObjectStore::read(store, *id).await {
+            for (name, child_sha1) in crate::graph::tree_entries(&content) {
+                name_hash_by_sha1.insert(child_sha1, crate::git_pack::pack_name_hash(&name));
+            }
+        }
+    }
+
     for id in &all_ids {
         let content = match ledge_core::ObjectStore::read(store, *id).await {
             Ok(c) => c.to_vec(),
@@ -68,7 +89,8 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         };
         let git_type = store.git_type_of(*id).await?;
         let sha1 = store.sha1_of(*id).await?;
-        pobjs.push(crate::git_pack::PackObject { git_type, content, sha1 });
+        let name_hash = name_hash_by_sha1.get(&sha1).copied().unwrap_or(0);
+        pobjs.push(crate::git_pack::PackObject { git_type, content, sha1, name_hash });
         meta.push((*id, sha1, git_type));
     }
 
