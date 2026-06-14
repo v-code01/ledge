@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use ledge_core::delta::{apply_delta, encode_delta, write_ofs_varint};
+use ledge_core::delta::{apply_delta, encode_delta, DeltaIndex, write_ofs_varint};
 use ledge_core::{LedgeError, Result};
 
 /// Cap on delta-chain depth. git's own default is `--depth=50`; we honour the
@@ -78,13 +78,18 @@ pub fn write_git_pack(
     let mut depth: Vec<usize> = vec![0; n];
     // `recent`: window of already-processed indices, most-recent first.
     let mut recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    // L2 base-index cache: each in-window base's block-hash index, built ONCE
+    // (when the object is processed) and reused across every later target that
+    // probes it. Without this, a `window`-wide search rebuilt each base's index
+    // per target — the cost wall that made a 250-wide window unaffordable.
+    let mut indices: std::collections::HashMap<usize, DeltaIndex> = std::collections::HashMap::new();
     for &i in &order {
         if window > 0 {
             let target = &objects[i].content;
             // Rank candidates by RAW delta length (no zlib per candidate — zlib'ing
-            // every candidate was the cost wall that made a wide window unaffordable).
-            // zlib + self-verify only the single winner. A useful delta must be
-            // smaller than the raw content; keep the smallest such delta in the window.
+            // every candidate was a second cost wall). zlib + self-verify only the
+            // single winner. A useful delta must be smaller than the raw content;
+            // keep the smallest such delta in the window.
             let mut best: Option<(usize, Vec<u8>)> = None;
             let mut best_len = target.len();
             for &b in recent.iter().take(window) {
@@ -94,7 +99,11 @@ pub fn write_git_pack(
                 if depth[b] >= MAX_DELTA_DEPTH {
                     continue;
                 }
-                let delta = encode_delta(&objects[b].content, target);
+                // Reuse the base's cached index (built when b was processed).
+                let delta = match indices.get(&b) {
+                    Some(idx) => idx.delta(target),
+                    None => encode_delta(&objects[b].content, target),
+                };
                 if delta.len() < best_len {
                     best_len = delta.len();
                     best = Some((b, delta));
@@ -110,9 +119,16 @@ pub fn write_git_pack(
                 }
             }
         }
+        // Build this object's base index before it can serve as a base for later
+        // targets, and register it in the window.
+        if window > 0 {
+            indices.insert(i, DeltaIndex::new(&objects[i].content));
+        }
         recent.push_front(i);
         if recent.len() > window.max(1) {
-            recent.pop_back();
+            if let Some(old) = recent.pop_back() {
+                indices.remove(&old); // evict the index of a base leaving the window
+            }
         }
     }
 

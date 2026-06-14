@@ -147,55 +147,89 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encode a git-format delta transforming `base` into `target`. Output:
-/// `[base_size varint][target_size varint][ops]` — the exact format `apply_delta`
-/// consumes. Greedy block-hash matcher: not optimal, but always valid.
-pub fn encode_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
-    const WIN: usize = 16;
-    let mut out = Vec::new();
-    write_size_varint(&mut out, base.len());
-    write_size_varint(&mut out, target.len());
+/// Block-hash window width for the delta matcher.
+const DELTA_WIN: usize = 16;
 
-    let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
-    if base.len() >= WIN {
-        for i in 0..=base.len() - WIN {
-            index.entry(hash_window(&base[i..i + WIN])).or_default().push(i);
+/// A reusable index over a delta *base*: the block-hash map is built ONCE in
+/// [`DeltaIndex::new`], then [`DeltaIndex::delta`] can encode any number of
+/// targets against it without rebuilding. This is the load-bearing optimization
+/// for a wide pack delta-window: probing N targets against one base costs one
+/// index build, not N (the per-probe rebuild was the wall that made a 250-wide
+/// window unaffordable).
+pub struct DeltaIndex<'a> {
+    base: &'a [u8],
+    index: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl<'a> DeltaIndex<'a> {
+    /// Build the block-hash index of `base` once.
+    pub fn new(base: &'a [u8]) -> Self {
+        let mut index: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        if base.len() >= DELTA_WIN {
+            for i in 0..=base.len() - DELTA_WIN {
+                index
+                    .entry(hash_window(&base[i..i + DELTA_WIN]))
+                    .or_default()
+                    .push(i);
+            }
         }
+        Self { base, index }
     }
 
-    let mut pending: Vec<u8> = Vec::new();
-    let mut t = 0usize;
-    while t < target.len() {
-        let mut best_off = 0usize;
-        let mut best_len = 0usize;
-        if base.len() >= WIN && t + WIN <= target.len() {
-            if let Some(cands) = index.get(&hash_window(&target[t..t + WIN])) {
-                for &b in cands.iter().take(64) {
-                    if base[b..b + WIN] != target[t..t + WIN] {
-                        continue;
-                    }
-                    let mut len = WIN;
-                    while b + len < base.len() && t + len < target.len() && base[b + len] == target[t + len] {
-                        len += 1;
-                    }
-                    if len > best_len {
-                        best_len = len;
-                        best_off = b;
+    /// Encode a git-format delta transforming this index's `base` into `target`.
+    /// Output: `[base_size varint][target_size varint][ops]` — the exact format
+    /// [`apply_delta`] consumes. Greedy block-hash matcher: not optimal, always valid.
+    pub fn delta(&self, target: &[u8]) -> Vec<u8> {
+        let base = self.base;
+        let mut out = Vec::new();
+        write_size_varint(&mut out, base.len());
+        write_size_varint(&mut out, target.len());
+
+        let mut pending: Vec<u8> = Vec::new();
+        let mut t = 0usize;
+        while t < target.len() {
+            let mut best_off = 0usize;
+            let mut best_len = 0usize;
+            if base.len() >= DELTA_WIN && t + DELTA_WIN <= target.len() {
+                if let Some(cands) = self.index.get(&hash_window(&target[t..t + DELTA_WIN])) {
+                    for &b in cands.iter().take(64) {
+                        if base[b..b + DELTA_WIN] != target[t..t + DELTA_WIN] {
+                            continue;
+                        }
+                        let mut len = DELTA_WIN;
+                        while b + len < base.len()
+                            && t + len < target.len()
+                            && base[b + len] == target[t + len]
+                        {
+                            len += 1;
+                        }
+                        if len > best_len {
+                            best_len = len;
+                            best_off = b;
+                        }
                     }
                 }
             }
+            if best_len >= DELTA_WIN {
+                flush_insert(&mut out, &mut pending);
+                emit_copy(&mut out, best_off, best_len);
+                t += best_len;
+            } else {
+                pending.push(target[t]);
+                t += 1;
+            }
         }
-        if best_len >= WIN {
-            flush_insert(&mut out, &mut pending);
-            emit_copy(&mut out, best_off, best_len);
-            t += best_len;
-        } else {
-            pending.push(target[t]);
-            t += 1;
-        }
+        flush_insert(&mut out, &mut pending);
+        out
     }
-    flush_insert(&mut out, &mut pending);
-    out
+}
+
+/// Encode a git-format delta transforming `base` into `target`. Thin wrapper over
+/// [`DeltaIndex`] (builds the base index, encodes once) — kept for callers that
+/// delta a single target; the pack writer uses `DeltaIndex` directly to amortize.
+pub fn encode_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    DeltaIndex::new(base).delta(target)
 }
 
 fn hash_window(w: &[u8]) -> u64 {
@@ -337,6 +371,27 @@ mod tests {
             assert_eq!(out, target, "round-trip (base {} target {})", base.len(), target.len());
         }
     }
+    #[test]
+    fn delta_index_matches_encode_delta() {
+        // The reusable DeltaIndex must produce byte-identical deltas to the
+        // one-shot encode_delta over the full roundtrip corpus.
+        let base500: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let edited = String::from_utf8(base500.clone()).unwrap().replace("line 250\n", "X\n").into_bytes();
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (base500.clone(), edited),
+            (base500.clone(), base500.clone()),
+            (base500.clone(), [base500.clone(), b"tail\n".to_vec()].concat()),
+            (b"".to_vec(), b"hello".to_vec()),
+            (b"hello".to_vec(), b"".to_vec()),
+        ];
+        for (base, target) in cases {
+            let idx = DeltaIndex::new(&base);
+            assert_eq!(idx.delta(&target), encode_delta(&base, &target));
+            // and the index-built delta still round-trips
+            assert_eq!(apply_delta(&base, &idx.delta(&target)).unwrap(), target);
+        }
+    }
+
     #[test]
     fn encode_delta_small_edit_is_small() {
         let base: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
