@@ -53,7 +53,12 @@ These are honest, documented gaps — not undisclosed bugs:
   permit a cross-tenant read of that object.
 - **`root` is a superuser namespace.** Do not issue root-tenant keys to
   untrusted clients.
-- **Webhook URLs are tenant-controlled (SSRF surface).** Gate egress / allowlist
-  hosts before enabling webhooks for untrusted tenants.
+- **Webhook SSRF is guarded by default.** Webhook URLs are tenant-controlled, so
+  the dispatcher resolves each target and **blocks non-public destinations**
+  (loopback, RFC-1918 private, link-local incl. cloud metadata `169.254.169.254`,
+  CGNAT, IPv6 ULA/link-local) unless `[webhooks].allow_private_targets=true` (dev /
+  single-tenant). Residual: a resolve-then-connect check is open to DNS rebinding
+  (a pinned-IP connector is the follow-on); literal private IPs and hostnames that
+  resolve to them are blocked.
 - **Single-host testing only.** Cluster/replication has not run on real
   multi-host networks; treat multi-node as experimental.

@@ -93,9 +93,10 @@ async fn app_with_webhooks(dir: &TempDir) -> (axum::Router, Arc<RefStoreImpl>, S
         store,
         cluster_secret: None,
     };
-    let webhooks = Some(Arc::new(WebhookDispatcher::new(Arc::new(
-        WebhookStore::in_memory(),
-    ))));
+    // Tests deliver to a local 127.0.0.1 sink, so opt into private targets.
+    let webhooks = Some(Arc::new(
+        WebhookDispatcher::new(Arc::new(WebhookStore::in_memory())).allow_private_targets(true),
+    ));
     let state = AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),

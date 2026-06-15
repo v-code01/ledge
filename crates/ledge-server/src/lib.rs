@@ -9,6 +9,7 @@ pub mod quota;
 pub mod routes;
 pub mod rpc_routes;
 pub mod ssh;
+pub mod ssrf;
 pub mod sync;
 pub mod sync_routes;
 pub mod tls;

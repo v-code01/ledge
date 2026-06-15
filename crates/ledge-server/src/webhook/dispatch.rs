@@ -8,6 +8,10 @@ use super::{sign, store::WebhookStore, EventKind, WebhookConfig};
 pub struct WebhookDispatcher {
     store: Arc<WebhookStore>,
     client: reqwest::Client,
+    /// When false (the secure default), webhook targets that resolve to a
+    /// non-public address are blocked (SSRF guard). Set true for single-tenant /
+    /// dev where delivering to localhost/internal hosts is intentional.
+    allow_private: bool,
 }
 
 impl WebhookDispatcher {
@@ -16,7 +20,18 @@ impl WebhookDispatcher {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_default();
-        Self { store, client }
+        Self {
+            store,
+            client,
+            allow_private: false,
+        }
+    }
+
+    /// Allow webhook delivery to private/loopback/internal targets (dev /
+    /// single-tenant). Default is to block them as an SSRF guard.
+    pub fn allow_private_targets(mut self, allow: bool) -> Self {
+        self.allow_private = allow;
+        self
     }
 
     pub fn store(&self) -> &Arc<WebhookStore> {
@@ -34,12 +49,26 @@ impl WebhookDispatcher {
             let client = self.client.clone();
             let body = body.clone();
             let evt = kind.wire();
-            tokio::spawn(async move { deliver(client, wh, evt, body).await });
+            let allow_private = self.allow_private;
+            tokio::spawn(async move { deliver(client, wh, evt, body, allow_private).await });
         }
     }
 }
 
-async fn deliver(client: reqwest::Client, wh: WebhookConfig, evt: &'static str, body: Vec<u8>) {
+async fn deliver(
+    client: reqwest::Client,
+    wh: WebhookConfig,
+    evt: &'static str,
+    body: Vec<u8>,
+    allow_private: bool,
+) {
+    // SSRF guard: never deliver to a tenant-supplied URL that resolves to a
+    // non-public address (cloud metadata, loopback, private ranges).
+    if let Err(reason) = crate::ssrf::guard_outbound(&wh.url, allow_private).await {
+        crate::metrics::record_webhook_delivery("blocked");
+        tracing::warn!(webhook = %wh.id.to_hex(), url = %wh.url, %reason, "webhook target blocked (SSRF guard)");
+        return;
+    }
     let sig = sign(&wh.secret, &body);
     let delivery_id = blake3::hash(&body).to_hex().to_string();
     let start = std::time::Instant::now();

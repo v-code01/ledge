@@ -469,7 +469,10 @@ async fn main() -> anyhow::Result<()> {
         )?);
         store.spawn_compaction_task(8 * 1024 * 1024);
         ledge_server::metrics::set_webhooks_registered(store.count() as f64);
-        Some(Arc::new(ledge_server::webhook::dispatch::WebhookDispatcher::new(store)))
+        Some(Arc::new(
+            ledge_server::webhook::dispatch::WebhookDispatcher::new(store)
+                .allow_private_targets(cfg.webhooks.allow_private_targets),
+        ))
     } else {
         None
     };

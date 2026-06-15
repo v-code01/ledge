@@ -213,6 +213,11 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct WebhooksConfig {
     pub enabled: bool,
+    /// Allow webhook delivery to private/loopback/internal targets. Default false
+    /// (SSRF guard on). Set true only for single-tenant / dev deployments where
+    /// delivering to internal hosts is intentional.
+    #[serde(default)]
+    pub allow_private_targets: bool,
 }
 
 /// Git remote sync configuration. Disabled by default (byte-identical when off:
