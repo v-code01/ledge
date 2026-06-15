@@ -284,11 +284,13 @@ pub async fn handle_upload_pack_discovery(
         let head_sha1_hex = hex::encode(head_sha1);
         let default_name = default_ref.0.clone();
 
-        // HEAD line carries the capabilities: the symref hint + `shallow` so a
-        // client may request a depth-limited (`--depth N`) clone/fetch.
+        // HEAD line carries the capabilities: the symref hint, `shallow` (depth-
+        // limited `--depth N`), `filter` (partial clone), and the
+        // allow-*-sha1-in-want caps so a partial clone can lazily fetch a missing
+        // object by its (unadvertised) SHA on first access.
         out.extend_from_slice(&encode(
             format!(
-                "{} HEAD\0symref=HEAD:{} shallow\n",
+                "{} HEAD\0symref=HEAD:{} shallow filter allow-tip-sha1-in-want allow-reachable-sha1-in-want\n",
                 head_sha1_hex, default_name
             )
             .as_bytes(),
@@ -365,6 +367,7 @@ async fn collect_pack_objects(
     sha1_store: &dyn Sha1Provider,
     wanted_sha1s: &[[u8; 20]],
     exclude: &std::collections::HashSet<[u8; 20]>,
+    filter: BlobFilter,
 ) -> Vec<(u8, Bytes)> {
     let sha1_to_obj = sha1_store.sha1_index().await;
     let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
@@ -372,6 +375,10 @@ async fn collect_pack_objects(
     // already-visited, so it is neither packed nor traversed (its whole subtree
     // is in `exclude` too, since exclude is itself a reachable closure).
     let mut seen: std::collections::HashSet<[u8; 20]> = exclude.clone();
+    // Explicitly-wanted objects are ALWAYS packed, even under a `--filter` — the
+    // filter only drops objects discovered via traversal, never a direct `want`
+    // (this is what makes a partial clone's lazy `want <blob>` fetch work).
+    let wanted_set: std::collections::HashSet<[u8; 20]> = wanted_sha1s.iter().copied().collect();
     let mut queue: std::collections::VecDeque<[u8; 20]> = wanted_sha1s.iter().copied().collect();
 
     while let Some(sha1) = queue.pop_front() {
@@ -381,10 +388,29 @@ async fn collect_pack_objects(
         let Some(obj_id) = sha1_to_obj.get(&sha1).copied() else {
             continue;
         };
+        let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
+
+        // Partial clone (`--filter`): blobs are leaves, so an omitted blob just
+        // isn't packed — the client fetches it lazily by SHA on first access.
+        // `blob:none` skips the read entirely; `blob:limit=N` needs the size.
+        // An explicitly-wanted blob is never filtered (it was asked for directly).
+        if git_type == 3 && !wanted_set.contains(&sha1) {
+            match filter {
+                BlobFilter::NoBlobs => continue,
+                BlobFilter::BlobLimit(n) => {
+                    let Ok(content) = objects.read(obj_id).await else { continue };
+                    if content.len() <= n {
+                        pack_objects.push((3, content));
+                    }
+                    continue;
+                }
+                BlobFilter::All => {}
+            }
+        }
+
         let Ok(content) = objects.read(obj_id).await else {
             continue;
         };
-        let git_type = sha1_store.git_type_of(obj_id).await.unwrap_or(3);
         match git_type {
             1 => {
                 if let Some(tree) = commit_tree_sha1(&content) {
@@ -404,6 +430,42 @@ async fn collect_pack_objects(
         pack_objects.push((git_type, content));
     }
     pack_objects
+}
+
+/// A partial-clone object filter (`--filter=…`). Unsupported filters resolve to
+/// [`BlobFilter::All`] (a full pack), which git tolerates — extra objects are fine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BlobFilter {
+    /// No filtering — pack the full closure.
+    All,
+    /// `blob:none` — omit every blob.
+    NoBlobs,
+    /// `blob:limit=<n>` — omit blobs strictly larger than `n` bytes.
+    BlobLimit(usize),
+}
+
+impl BlobFilter {
+    /// Parse a git filter-spec. Returns `All` for anything we don't special-case
+    /// (`tree:*`, `sparse:*`, …) so the clone safely degrades to a full pack.
+    fn parse(spec: &str) -> BlobFilter {
+        if spec == "blob:none" {
+            return BlobFilter::NoBlobs;
+        }
+        if let Some(rest) = spec.strip_prefix("blob:limit=") {
+            // Accept a bare byte count or a k/m/g suffix (git's syntax).
+            let rest = rest.trim();
+            let (num, mult) = match rest.chars().last() {
+                Some('k') | Some('K') => (&rest[..rest.len() - 1], 1024usize),
+                Some('m') | Some('M') => (&rest[..rest.len() - 1], 1024 * 1024),
+                Some('g') | Some('G') => (&rest[..rest.len() - 1], 1024 * 1024 * 1024),
+                _ => (rest, 1),
+            };
+            if let Ok(n) = num.trim().parse::<usize>() {
+                return BlobFilter::BlobLimit(n.saturating_mul(mult));
+            }
+        }
+        BlobFilter::All
+    }
 }
 
 /// Collect objects for a SHALLOW request (`deepen <depth>`): include each wanted
@@ -513,7 +575,8 @@ async fn build_upload_pack_response(
     wanted_sha1s: &[[u8; 20]],
 ) -> ledge_core::Result<Vec<u8>> {
     let empty = std::collections::HashSet::new();
-    let pack_objects = collect_pack_objects(objects, sha1_store, wanted_sha1s, &empty).await;
+    let pack_objects =
+        collect_pack_objects(objects, sha1_store, wanted_sha1s, &empty, BlobFilter::All).await;
     let pack = encode_pack(&pack_objects);
     // Smart-HTTP upload-pack response: the NAK acknowledgement is pkt-line
     // framed ("0008NAK\n"); the pack data follows directly as raw bytes.
@@ -588,6 +651,7 @@ pub async fn handle_upload_pack(
     let mut have_sha1s: Vec<[u8; 20]> = Vec::new();
     let mut done = false;
     let mut depth: Option<usize> = None;
+    let mut filter = BlobFilter::All;
     let parse_sha1 = |rest: &str| -> Option<[u8; 20]> {
         let hex_s = rest.split_whitespace().next().unwrap_or("");
         if hex_s.len() != 40 {
@@ -616,6 +680,8 @@ pub async fn handle_upload_pack(
                     }
                 } else if let Some(rest) = t.strip_prefix("deepen ") {
                     depth = rest.trim().parse::<usize>().ok();
+                } else if let Some(rest) = t.strip_prefix("filter ") {
+                    filter = BlobFilter::parse(rest.trim());
                 } else if t == "done" {
                     done = true;
                 }
@@ -651,6 +717,17 @@ pub async fn handle_upload_pack(
     // cache (eager warming) is sound here and only here. A fetch (haves present)
     // is request-specific and never served from / written to this cache.
     if have_sha1s.is_empty() {
+        // A partial clone (`--filter`) is filter-specific, so it bypasses the
+        // want-set cache and builds a filtered pack directly.
+        if filter != BlobFilter::All {
+            let empty = std::collections::HashSet::new();
+            let pack_objects =
+                collect_pack_objects(&objects, sha1_store, &wanted_sha1s, &empty, filter).await;
+            record_upload_pack("clone", "http", pack_objects.len());
+            let mut resp = encode(b"NAK\n");
+            resp.extend_from_slice(&encode_pack(&pack_objects));
+            return Ok(resp);
+        }
         let cache_key = upload_pack_cache_key(segment, &wanted_sha1s);
         if let Some(c) = cache {
             if let Some(bytes) = c.get(&cache_key) {
@@ -694,7 +771,8 @@ pub async fn handle_upload_pack(
     // wanted closure minus everything reachable from the commons. In stateless
     // HTTP the client re-sends all haves each round, so `commons` here is complete.
     let exclude = reachable_closure(&objects, sha1_store, &commons).await;
-    let pack_objects = collect_pack_objects(&objects, sha1_store, &wanted_sha1s, &exclude).await;
+    let pack_objects =
+        collect_pack_objects(&objects, sha1_store, &wanted_sha1s, &exclude, filter).await;
     record_upload_pack("fetch", "http", pack_objects.len());
     let pack = encode_pack(&pack_objects);
     let ack = match commons.last() {
@@ -988,9 +1066,10 @@ where
     stream.write_all(&advert).await.map_err(LedgeError::Io)?;
     stream.flush().await.map_err(LedgeError::Io)?;
 
-    // 2. Read `want`s + an optional `deepen N` (terminated by a flush).
+    // 2. Read `want`s + optional `deepen N` / `filter <spec>` (terminated by flush).
     let mut wants: Vec<[u8; 20]> = Vec::new();
     let mut depth: Option<usize> = None;
+    let mut filter = BlobFilter::All;
     loop {
         match read_pkt(stream).await.map_err(LedgeError::Io)? {
             PktIn::Flush => break,
@@ -1005,6 +1084,8 @@ where
                     }
                 } else if let Some(rest) = t.strip_prefix("deepen ") {
                     depth = rest.trim().parse::<usize>().ok();
+                } else if let Some(rest) = t.strip_prefix("filter ") {
+                    filter = BlobFilter::parse(rest.trim());
                 }
             }
         }
@@ -1086,7 +1167,7 @@ where
     } else {
         reachable_closure(&objects, sha1_store, &commons).await
     };
-    let pack_objects = collect_pack_objects(&objects, sha1_store, &wants, &exclude).await;
+    let pack_objects = collect_pack_objects(&objects, sha1_store, &wants, &exclude, filter).await;
     record_upload_pack(
         if commons.is_empty() { "clone" } else { "fetch" },
         "ssh",
@@ -1920,6 +2001,33 @@ mod tests {
         req.extend_from_slice(&encode(format!("have {}\n", hex::encode(base)).as_bytes()));
         req.extend_from_slice(&encode(b"done\n"));
         assert_eq!(pack_count(&run(objects.clone(), req).await), 3, "stream fetch = incremental");
+    }
+
+    #[test]
+    fn blob_filter_parse() {
+        assert_eq!(BlobFilter::parse("blob:none"), BlobFilter::NoBlobs);
+        assert_eq!(BlobFilter::parse("blob:limit=1024"), BlobFilter::BlobLimit(1024));
+        assert_eq!(BlobFilter::parse("blob:limit=1k"), BlobFilter::BlobLimit(1024));
+        assert_eq!(BlobFilter::parse("blob:limit=2m"), BlobFilter::BlobLimit(2 * 1024 * 1024));
+        assert_eq!(BlobFilter::parse("tree:0"), BlobFilter::All); // unsupported ⇒ full
+        assert_eq!(BlobFilter::parse("garbage"), BlobFilter::All);
+    }
+
+    #[tokio::test]
+    async fn filter_omits_blobs_from_pack() {
+        let (objects, _base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let empty = std::collections::HashSet::new();
+        // Full: 2 commits + 2 trees + 2 blobs = 6.
+        let full = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::All).await;
+        assert_eq!(full.len(), 6);
+        // blob:none → no blobs (4 objects), and none are type 3.
+        let none = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::NoBlobs).await;
+        assert_eq!(none.len(), 4, "blob:none omits both blobs");
+        assert!(none.iter().all(|(t, _)| *t != 3), "no blobs packed");
+        // blob:limit=12 keeps the 10-byte blob, drops the 15-byte one → 5.
+        let lim = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::BlobLimit(12)).await;
+        assert_eq!(lim.len(), 5, "blob:limit keeps small, drops large");
     }
 
     #[tokio::test]

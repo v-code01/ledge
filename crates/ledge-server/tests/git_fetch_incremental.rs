@@ -96,6 +96,42 @@ async fn obj_total(repo: &Path) -> u64 {
 }
 
 #[tokio::test]
+async fn partial_clone_blob_none_lazily_fetches() {
+    let (base_url, _dd) = start_server().await;
+    let remote = format!("{base_url}/partial-repo");
+
+    let src = TempDir::new().unwrap();
+    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
+    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
+    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    for i in 0..3 {
+        std::fs::write(src.path().join(format!("f{i}.txt")), format!("blob body number {i}\n")).unwrap();
+        ok(&git(&["add", "."], src.path()).await, "add");
+        ok(&git(&["commit", "-m", &format!("c{i}")], src.path()).await, "commit");
+    }
+    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push");
+
+    // --filter=blob:none: the initial pack omits blobs; the default checkout must
+    // lazily fetch each blob by SHA (exercising allow-reachable-sha1-in-want and
+    // the explicit-want-bypasses-filter rule).
+    let cl = TempDir::new().unwrap();
+    let clp = cl.path().join("c");
+    let out = git(&["clone", "--filter=blob:none", "--quiet", &remote, clp.to_str().unwrap()], Path::new("/")).await;
+    ok(&out, "partial clone");
+    assert_eq!(
+        String::from_utf8(git(&["config", "remote.origin.promisor"], &clp).await.stdout).unwrap().trim(),
+        "true",
+        "clone is a promisor (partial) repo"
+    );
+    // Checkout lazy-fetched the blobs → working tree is correct, nothing missing.
+    assert_eq!(std::fs::read_to_string(clp.join("f2.txt")).unwrap(), "blob body number 2\n");
+    let missing = String::from_utf8(
+        git(&["rev-list", "--objects", "--all", "--missing=print"], &clp).await.stdout,
+    ).unwrap().lines().filter(|l| l.starts_with('?')).count();
+    assert_eq!(missing, 0, "all blobs lazily fetched after checkout");
+}
+
+#[tokio::test]
 async fn shallow_clone_bounds_history() {
     let (base_url, _dd) = start_server().await;
     let remote = format!("{base_url}/shallow-repo");
