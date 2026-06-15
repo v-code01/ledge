@@ -95,6 +95,37 @@ Deploy artifacts (Compose, Helm, systemd) live in [`deploy/`](deploy/).
 
 ## Architecture
 
+```
+   git client  (clone / fetch / push)          native SDK
+   ┌────────────────────────────┐         ┌──────────────────┐
+   │  smart-HTTP   │   SSH       │         │ Cap'n Proto      │
+   │  (axum)       │  (russh)    │         │ rs · ts · py · go│
+   └───────┬───────────┬────────┘         └────────┬─────────┘
+           │           │  git wire protocol         │ POST /rpc
+   ┌───────▼───────────▼────────────────────────────▼─────────┐
+   │                    ledge-server  (axum)                   │
+   │  upload/receive-pack · shallow · partial · negotiation    │
+   │  auth · tenancy · quotas · TLS/mTLS · webhooks · sync     │
+   └───────┬───────────────────────────────────────────┬──────┘
+           │   dyn ObjectStore  /  dyn RefStore  (the seams)   │
+           │   single-node ↦ local stores · cluster ↦ Raft     │
+   ┌───────▼────────────────┐               ┌──────────────────▼───┐
+   │   ledge-object-store   │               │    ledge-ref-store    │
+   │ BLAKE3 content-address │               │ lock-free ART + WAL   │
+   │ native git packs       │               │ atomic compare-and-set│
+   │ delta · S3 cold tier   │               └───────────┬───────────┘
+   └────────────────────────┘                           │
+           ▲                                  ┌──────────▼───────────┐
+           └──────────────────────────────────│  ledge-cluster       │
+                 sharded Raft replication      │  openraft · 2PC · GC │
+                 (linearizable CAS on refs)    │  (TLA+ verified)     │
+                                               └──────────────────────┘
+```
+
+The load-bearing idea: every read/write goes through the **`dyn ObjectStore` /
+`dyn RefStore` seams**. Single-node binds the local stores; a cluster binds the
+Raft-replicated ones — the git surface above is byte-identical either way.
+
 A Rust workspace of focused crates:
 
 | Crate | Responsibility |
