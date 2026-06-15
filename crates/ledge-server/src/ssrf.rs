@@ -42,10 +42,19 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 /// Reject an outbound URL whose host is (or resolves to) any non-public IP.
-/// `allow_private` short-circuits to `Ok` for single-tenant / dev deployments.
-pub async fn guard_outbound(url: &str, allow_private: bool) -> Result<(), String> {
+/// `allow_private` short-circuits to `Ok(None)` for single-tenant / dev deploys.
+///
+/// On success returns the address to **pin the connection to** when the host was
+/// a DNS name (`Some(addr)`), or `None` when no pinning is needed (literal-IP
+/// host or `allow_private`). Pinning to the validated address closes the
+/// DNS-rebinding window — the request connects to the IP we checked, not to a
+/// re-resolved one.
+pub async fn guard_outbound(
+    url: &str,
+    allow_private: bool,
+) -> Result<Option<std::net::SocketAddr>, String> {
     if allow_private {
-        return Ok(());
+        return Ok(None);
     }
     let u = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
     let scheme = u.scheme();
@@ -53,31 +62,30 @@ pub async fn guard_outbound(url: &str, allow_private: bool) -> Result<(), String
         return Err(format!("scheme '{scheme}' not allowed"));
     }
     let host = u.host_str().ok_or_else(|| "url has no host".to_string())?;
-    // A literal-IP host: check directly (no DNS).
+    // A literal-IP host: check directly (no DNS, nothing to pin).
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_blocked_ip(ip) {
             Err(format!("blocked non-public address {ip}"))
         } else {
-            Ok(())
+            Ok(None)
         };
     }
-    // Hostname: resolve and check every answer (an attacker may point one name at
-    // a private IP). Async DNS so we never block the runtime.
+    // Hostname: resolve, reject if ANY answer is non-public, and pin the first
+    // public answer so the actual connection can't be rebound to a private IP.
     let port = u.port_or_known_default().unwrap_or(443);
-    let addrs = tokio::net::lookup_host((host, port))
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| format!("dns lookup failed: {e}"))?;
-    let mut resolved = false;
-    for a in addrs {
-        resolved = true;
+        .map_err(|e| format!("dns lookup failed: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} did not resolve"));
+    }
+    for a in &addrs {
         if is_blocked_ip(a.ip()) {
             return Err(format!("{host} resolves to blocked address {}", a.ip()));
         }
     }
-    if !resolved {
-        return Err(format!("{host} did not resolve"));
-    }
-    Ok(())
+    Ok(Some(addrs[0]))
 }
 
 #[cfg(test)]

@@ -57,8 +57,8 @@ These are honest, documented gaps — not undisclosed bugs:
   the dispatcher resolves each target and **blocks non-public destinations**
   (loopback, RFC-1918 private, link-local incl. cloud metadata `169.254.169.254`,
   CGNAT, IPv6 ULA/link-local) unless `[webhooks].allow_private_targets=true` (dev /
-  single-tenant). Residual: a resolve-then-connect check is open to DNS rebinding
-  (a pinned-IP connector is the follow-on); literal private IPs and hostnames that
-  resolve to them are blocked.
+  single-tenant). The connection is **pinned to the validated IP**, so the check
+  is not open to DNS rebinding (the request connects to the address that was
+  vetted, not a re-resolved one).
 - **Single-host testing only.** Cluster/replication has not run on real
   multi-host networks; treat multi-node as experimental.

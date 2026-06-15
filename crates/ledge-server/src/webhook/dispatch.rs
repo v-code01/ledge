@@ -64,11 +64,30 @@ async fn deliver(
 ) {
     // SSRF guard: never deliver to a tenant-supplied URL that resolves to a
     // non-public address (cloud metadata, loopback, private ranges).
-    if let Err(reason) = crate::ssrf::guard_outbound(&wh.url, allow_private).await {
-        crate::metrics::record_webhook_delivery("blocked");
-        tracing::warn!(webhook = %wh.id.to_hex(), url = %wh.url, %reason, "webhook target blocked (SSRF guard)");
-        return;
-    }
+    let pin = match crate::ssrf::guard_outbound(&wh.url, allow_private).await {
+        Ok(pin) => pin,
+        Err(reason) => {
+            crate::metrics::record_webhook_delivery("blocked");
+            tracing::warn!(webhook = %wh.id.to_hex(), url = %wh.url, %reason, "webhook target blocked (SSRF guard)");
+            return;
+        }
+    };
+    // For a DNS-name target, pin the connection to the validated address so it
+    // can't be rebound to a private IP between the check and the connect.
+    let client = match pin {
+        Some(addr) => reqwest::Url::parse(&wh.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|host| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .resolve(&host, addr)
+                    .build()
+                    .ok()
+            })
+            .unwrap_or(client),
+        None => client,
+    };
     let sig = sign(&wh.secret, &body);
     let delivery_id = blake3::hash(&body).to_hex().to_string();
     let start = std::time::Instant::now();
