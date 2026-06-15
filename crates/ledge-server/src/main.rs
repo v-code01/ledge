@@ -575,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
                         Err(e) => {
                             tracing::warn!(path = %p, error = %e, "ssh: authorized_keys unreadable; rejecting all keys");
                             // A configured-but-unreadable allowlist must fail closed.
-                            vec![ledge_server::ssh::unreachable_key()]
+                            vec![(ledge_server::ssh::unreachable_key(), String::new())]
                         }
                     },
                     None => {

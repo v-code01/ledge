@@ -164,8 +164,10 @@ what is **not** ready — so you can decide where it fits:
 - **SSH transport does clone + fetch + push.** Shallow (`--depth N`) and partial
   (`--filter=blob:none` / `blob:limit=N`) clone are supported over HTTP and SSH.
   **No LFS, no sparse / tree-filter clone**; shallow *deepen-with-history* is a
-  follow-on. SSH auth v1 is an authorized-keys allowlist (or accept-any in dev) →
-  root tenant; per-tenant SSH keys are a follow-on.
+  follow-on. SSH auth is an authorized-keys allowlist where each key's **comment
+  is its tenant** (`ssh-ed25519 … acme` ⇒ tenant `acme`; no comment ⇒ root), and
+  SSH access to a workspace is gated by tenant ownership — same isolation as HTTP.
+  Empty/absent allowlist accepts any key as root (dev only).
 - **No external security audit**; tenant isolation has documented sharp edges
   (see [`SECURITY.md`](SECURITY.md)).
 - **No multi-day soak**; long-run memory behavior is unproven.

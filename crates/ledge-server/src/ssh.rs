@@ -19,8 +19,10 @@ use crate::routes::AppState;
 #[derive(Clone)]
 pub struct SshCtx {
     pub state: AppState,
-    /// Allowed client public keys. EMPTY ⇒ accept any key (dev only).
-    pub authorized: Arc<Vec<ssh_key::PublicKey>>,
+    /// Allowed `(public key, tenant)` pairs. The tenant is the key's
+    /// authorized_keys comment field ("" = root). EMPTY ⇒ accept any key as root
+    /// (dev only).
+    pub authorized: Arc<Vec<(ssh_key::PublicKey, String)>>,
 }
 
 /// Load the persistent host key, generating + persisting an Ed25519 key on first
@@ -52,12 +54,18 @@ pub fn unreachable_key() -> ssh_key::PublicKey {
     ssh_key::PrivateKey::from(kp).public_key().clone()
 }
 
-/// Parse an `authorized_keys` file into public keys (one per non-comment line).
-pub fn parse_authorized_keys(text: &str) -> Vec<ssh_key::PublicKey> {
+/// Parse an `authorized_keys` file into `(public key, tenant)` pairs. The tenant
+/// is the key's comment field — `ssh-ed25519 AAAA… acme` maps that key to tenant
+/// `acme`; an empty/absent comment maps it to root (`""`).
+pub fn parse_authorized_keys(text: &str) -> Vec<(ssh_key::PublicKey, String)> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| ssh_key::PublicKey::from_openssh(l).ok())
+        .filter_map(|l| {
+            let pk = ssh_key::PublicKey::from_openssh(l).ok()?;
+            let tenant = pk.comment().to_string();
+            Some((pk, tenant))
+        })
         .collect()
 }
 
@@ -104,6 +112,7 @@ impl Server for SshServer {
         SshHandler {
             ctx: self.ctx.clone(),
             channel: None,
+            tenant: String::new(),
         }
     }
 }
@@ -111,6 +120,9 @@ impl Server for SshServer {
 struct SshHandler {
     ctx: SshCtx,
     channel: Option<Channel<Msg>>,
+    /// The authenticated connection's tenant (from the matched key's comment;
+    /// "" = root). Set on a successful `auth_publickey`.
+    tenant: String,
 }
 
 impl Handler for SshHandler {
@@ -121,8 +133,22 @@ impl Handler for SshHandler {
         _user: &str,
         key: &ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        // Empty allowlist ⇒ accept any (dev). Otherwise the key must be listed.
-        if self.ctx.authorized.is_empty() || self.ctx.authorized.iter().any(|k| k == key) {
+        // Empty allowlist ⇒ accept any key as root (dev). Otherwise the key must
+        // be listed; the connection acts as that key's tenant.
+        if self.ctx.authorized.is_empty() {
+            self.tenant = String::new();
+            return Ok(Auth::Accept);
+        }
+        // Match on key MATERIAL only — the client offers the key without the
+        // authorized_keys comment we use to carry the tenant, so comparing whole
+        // `PublicKey`s (which include the comment) would never match.
+        if let Some((_, tenant)) = self
+            .ctx
+            .authorized
+            .iter()
+            .find(|(k, _)| k.key_data() == key.key_data())
+        {
+            self.tenant = tenant.clone();
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -153,12 +179,19 @@ impl Handler for SshHandler {
         session.channel_success(id)?;
         let handle = session.handle();
         let state = self.ctx.state.clone();
+        let tenant = self.tenant.clone();
 
         tokio::spawn(async move {
             let mut stream = channel.into_stream();
             let code: u32 = match parsed {
                 Some((GitService::Upload, path)) => {
-                    let segment = segment_from_path(&path);
+                    let Some(segment) = resolve_segment(&state, &path, &tenant).await else {
+                        tracing::warn!(%tenant, %path, "ssh: workspace not owned by tenant");
+                        let _ = handle.exit_status_request(id, 1).await;
+                        let _ = handle.eof(id).await;
+                        let _ = handle.close(id).await;
+                        return;
+                    };
                     match ledge_git::fetch::upload_pack_stream(
                         &mut stream,
                         state.objects.clone(),
@@ -176,7 +209,13 @@ impl Handler for SshHandler {
                     }
                 }
                 Some((GitService::Receive, path)) => {
-                    let segment = segment_from_path(&path);
+                    let Some(segment) = resolve_segment(&state, &path, &tenant).await else {
+                        tracing::warn!(%tenant, %path, "ssh: workspace not owned by tenant");
+                        let _ = handle.exit_status_request(id, 1).await;
+                        let _ = handle.eof(id).await;
+                        let _ = handle.close(id).await;
+                        return;
+                    };
                     match ledge_git::push::receive_pack_stream(
                         &mut stream,
                         state.refs.clone(),
@@ -230,17 +269,43 @@ fn parse_git_command(cmd: &str) -> Option<(GitService, String)> {
     Some((svc, path))
 }
 
-/// Map an SSH repo path to a Ledge git segment. `'/ws/<id>'` → `workspaces/<id>/`;
-/// anything else → "" (the root durable repo). Mirrors the HTTP path mapping.
-fn segment_from_path(path: &str) -> String {
+/// Map an SSH repo path + tenant to a Ledge git segment, returning the segment
+/// and (for a workspace path) its id so the caller can gate ownership.
+/// `'/ws/<id>'` → (`workspaces/<id>/`, Some(id)); anything else → the tenant's
+/// durable namespace (`tenant_prefix`, `""` for root), with no workspace to gate.
+fn path_to_segment(path: &str, tenant: &str) -> (String, Option<String>) {
     let p = path.trim_start_matches('/');
     if let Some(rest) = p.strip_prefix("ws/") {
-        let id = rest.split('/').next().unwrap_or("");
+        let id = rest.split('/').next().unwrap_or("").to_string();
         if !id.is_empty() {
-            return format!("workspaces/{id}/");
+            return (format!("workspaces/{id}/"), Some(id));
         }
     }
-    String::new()
+    (ledge_core::tenant_prefix(tenant), None)
+}
+
+/// Resolve the tenant-scoped git segment for an SSH command's path, or `None` if
+/// the path is a workspace not owned by `tenant` (which must be rejected — no
+/// cross-tenant SSH access).
+async fn resolve_segment(state: &AppState, path: &str, tenant: &str) -> Option<String> {
+    let (segment, ws) = path_to_segment(path, tenant);
+    match ws {
+        Some(id) if !workspace_owned(state, &id, tenant).await => None,
+        _ => Some(segment),
+    }
+}
+
+/// Whether workspace `id` is owned by `tenant` (root-normalized, mirroring the
+/// HTTP `ws_tenant_ok` check). Unknown/foreign ⇒ false (no cross-tenant access).
+async fn workspace_owned(state: &AppState, id: &str, tenant: &str) -> bool {
+    let Ok(wid) = ledge_workspace::WorkspaceId::from_hex(id) else {
+        return false;
+    };
+    let norm = |t: &str| if t.is_empty() { "root" } else { t }.to_string();
+    match state.leases.get(wid).await {
+        Ok(Some(lease)) => norm(&lease.tenant_id) == norm(tenant),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -262,9 +327,40 @@ mod tests {
 
     #[test]
     fn maps_paths_to_segments() {
-        assert_eq!(segment_from_path("/myrepo"), "");
-        assert_eq!(segment_from_path("/ws/abc123"), "workspaces/abc123/");
-        assert_eq!(segment_from_path("ws/abc123/extra"), "workspaces/abc123/");
+        // Durable repo → the tenant's namespace; no workspace to gate.
+        assert_eq!(path_to_segment("/myrepo", ""), (String::new(), None));
+        assert_eq!(
+            path_to_segment("/myrepo", "acme"),
+            ("tenants/acme/".to_string(), None)
+        );
+        // Workspace path → workspaces/<id>/ + the id to gate by ownership.
+        assert_eq!(
+            path_to_segment("/ws/abc123", "acme"),
+            ("workspaces/abc123/".to_string(), Some("abc123".to_string()))
+        );
+        assert_eq!(
+            path_to_segment("ws/abc123/extra", ""),
+            ("workspaces/abc123/".to_string(), Some("abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn authorized_keys_carry_tenant_from_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = load_or_create_host_key(&dir.path().join("k")).unwrap();
+        let mut with_tenant = pk.public_key().clone();
+        with_tenant.set_comment("acme");
+        let mut no_tenant = pk.public_key().clone();
+        no_tenant.set_comment("");
+        let text = format!(
+            "{}\n# a comment line\n{}\n",
+            with_tenant.to_openssh().unwrap(),
+            no_tenant.to_openssh().unwrap()
+        );
+        let parsed = parse_authorized_keys(&text);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].1, "acme", "comment maps to tenant");
+        assert_eq!(parsed[1].1, "", "no comment ⇒ root");
     }
 
     #[test]
