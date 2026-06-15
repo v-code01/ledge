@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use clap::Parser;
 use ledge_core::HLC;
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_server::{build_app, config::LedgeConfig, AppState};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::info;
 
 /// The selected storage seams: the `dyn ObjectStore` seam, the `dyn RefStore`
@@ -95,8 +95,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .json()
         .init();
@@ -145,8 +144,10 @@ async fn main() -> anyhow::Result<()> {
     //    admin key so a fresh cluster is reachable. Idempotent — it only fires on
     //    an empty store, so a restart never re-bootstraps or duplicates the key. ──
     let auth_ctx = if cfg.auth.enabled {
-        let auth_store =
-            Arc::new(ledge_server::auth::AuthStore::open(data_dir.clone(), hlc.clone())?);
+        let auth_store = Arc::new(ledge_server::auth::AuthStore::open(
+            data_dir.clone(),
+            hlc.clone(),
+        )?);
         match cfg.auth.bootstrap_admin_token.clone() {
             Some(token) => {
                 let now = std::time::SystemTime::now()
@@ -410,7 +411,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(stats) => {
                         ledge_server::metrics::record_gc_run(&stats, start.elapsed());
                         publish_gauges(&quota_usage);
-                        tracing::info!(reclaimed = stats.reclaimed, bytes_freed = stats.bytes_freed, "scheduled gc pass");
+                        tracing::info!(
+                            reclaimed = stats.reclaimed,
+                            bytes_freed = stats.bytes_freed,
+                            "scheduled gc pass"
+                        );
                     }
                     Err(e) => tracing::warn!(error = %e, "scheduled gc pass failed"),
                 }
@@ -512,7 +517,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         {
             Ok((segs, objs)) => {
-                tracing::info!(segments = segs, objects = objs, "boot upload-pack warm complete")
+                tracing::info!(
+                    segments = segs,
+                    objects = objs,
+                    "boot upload-pack warm complete"
+                )
             }
             Err(e) => tracing::warn!(error = %e, "boot upload-pack warm failed"),
         }
@@ -595,7 +604,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
-            Err(e) => tracing::error!(error = %e, "ssh: failed to load/create host key; SSH disabled"),
+            Err(e) => {
+                tracing::error!(error = %e, "ssh: failed to load/create host key; SSH disabled")
+            }
         }
     }
 
@@ -615,9 +626,7 @@ async fn main() -> anyhow::Result<()> {
         let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
         info!(bound_addr = %metrics_listener.local_addr()?, "ledge metrics/health listener");
         tokio::spawn(async move {
-            if let Err(e) =
-                axum::serve(metrics_listener, ledge_server::build_metrics_app()).await
-            {
+            if let Err(e) = axum::serve(metrics_listener, ledge_server::build_metrics_app()).await {
                 tracing::warn!(error = %e, "metrics listener exited");
             }
         });
@@ -639,8 +648,16 @@ async fn main() -> anyhow::Result<()> {
 
     // TLS on: client listener (server-cert only). cert/key presence is guaranteed
     // by config validation (Task 3), so the expects are unreachable on a validated config.
-    let cert = cfg.tls.cert_path.as_deref().expect("validated: tls.cert_path");
-    let key = cfg.tls.key_path.as_deref().expect("validated: tls.key_path");
+    let cert = cfg
+        .tls
+        .cert_path
+        .as_deref()
+        .expect("validated: tls.cert_path");
+    let key = cfg
+        .tls
+        .key_path
+        .as_deref()
+        .expect("validated: tls.key_path");
     let client_tls = ledge_server::tls::server_config_tls_only(cert, key)?;
     let client_rustls = axum_server::tls_rustls::RustlsConfig::from_config(client_tls);
 
@@ -657,15 +674,19 @@ async fn main() -> anyhow::Result<()> {
         let peer_rustls = axum_server::tls_rustls::RustlsConfig::from_config(peer_tls);
         let peer_app = app.clone();
         info!(client_addr = %addr, peer_addr = %peer_addr, "ledge listening (https client + mTLS peer listeners)");
-        let client_fut = axum_server::bind_rustls(addr, client_rustls).serve(app.into_make_service());
-        let peer_fut = axum_server::bind_rustls(peer_addr, peer_rustls).serve(peer_app.into_make_service());
+        let client_fut =
+            axum_server::bind_rustls(addr, client_rustls).serve(app.into_make_service());
+        let peer_fut =
+            axum_server::bind_rustls(peer_addr, peer_rustls).serve(peer_app.into_make_service());
         tokio::try_join!(
             async { client_fut.await.map_err(anyhow::Error::from) },
             async { peer_fut.await.map_err(anyhow::Error::from) },
         )?;
     } else {
         info!(bound_addr = %addr, "ledge listening (https client listener)");
-        axum_server::bind_rustls(addr, client_rustls).serve(app.into_make_service()).await?;
+        axum_server::bind_rustls(addr, client_rustls)
+            .serve(app.into_make_service())
+            .await?;
     }
     Ok(())
 }

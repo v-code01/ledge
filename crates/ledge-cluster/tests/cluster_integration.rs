@@ -123,7 +123,11 @@ async fn full_ref_ops_workflow_through_dyn_refstore() {
     store.delete(&name_b, oid(0xb1)).await.unwrap();
     for node in [1, 2, 3] {
         assert!(
-            h.cluster_ref_store(node).get(&name_b).await.unwrap().is_none(),
+            h.cluster_ref_store(node)
+                .get(&name_b)
+                .await
+                .unwrap()
+                .is_none(),
             "node {node} still sees deleted name_b"
         );
     }
@@ -279,7 +283,10 @@ async fn leader_failover_mid_workload_no_data_loss() {
         }
     };
     store.update(&s1_fresh, oid(0x5b), None).await.unwrap();
-    assert_eq!(store.get(&s1_fresh).await.unwrap().unwrap().target, oid(0x5b));
+    assert_eq!(
+        store.get(&s1_fresh).await.unwrap().unwrap().target,
+        oid(0x5b)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -305,17 +312,35 @@ async fn per_shard_failover_respects_placement() {
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "inproc-1".into() },
-                Replica { node_id: 2, addr: "inproc-2".into() },
-                Replica { node_id: 3, addr: "inproc-3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "inproc-1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "inproc-2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "inproc-3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 2, addr: "inproc-2".into() },
-                Replica { node_id: 3, addr: "inproc-3".into() },
-                Replica { node_id: 4, addr: "inproc-4".into() },
+                Replica {
+                    node_id: 2,
+                    addr: "inproc-2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "inproc-3".into(),
+                },
+                Replica {
+                    node_id: 4,
+                    addr: "inproc-4".into(),
+                },
             ],
         ),
     ])
@@ -371,7 +396,8 @@ async fn per_shard_failover_respects_placement() {
     // but is never the killed leader unless it WAS the leader, in which case the
     // store still resolves a survivor leader via the registry).
     assert!(
-        h.surviving_replica_has_ref(ShardId(0), s0_leader, &name0).await,
+        h.surviving_replica_has_ref(ShardId(0), s0_leader, &name0)
+            .await,
         "committed shard0 ref must survive re-election"
     );
     assert_eq!(
@@ -389,7 +415,8 @@ async fn per_shard_failover_respects_placement() {
         "shard1 leader {s1_leader} must remain a shard1 member"
     );
     assert!(
-        h.surviving_replica_has_ref(ShardId(1), s0_leader, &name1).await,
+        h.surviving_replica_has_ref(ShardId(1), s0_leader, &name1)
+            .await,
         "shard1 ref must be intact (its quorum was never lost)"
     );
     assert_eq!(
@@ -411,7 +438,10 @@ async fn per_shard_failover_respects_placement() {
         }
     };
     store.update(&s1_fresh, oid(0xb2), None).await.unwrap();
-    assert_eq!(store.get(&s1_fresh).await.unwrap().unwrap().target, oid(0xb2));
+    assert_eq!(
+        store.get(&s1_fresh).await.unwrap().unwrap().target,
+        oid(0xb2)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +469,14 @@ async fn workspace_manager_over_cluster_ref_store() {
     let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
     let coordinator: Arc<dyn ledge_ref_store::AtomicCommit> =
         Arc::new(ledge_cluster::TxnCoordinator::new(cluster_refs));
-    let mgr = WorkspaceManager::new(Arc::clone(&refs), leases, hlc, coordinator, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()));
+    let mgr = WorkspaceManager::new(
+        Arc::clone(&refs),
+        leases,
+        hlc,
+        coordinator,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    );
 
     // Seed two durable source refs that route to DISTINCT shards, so the forked
     // workspace's refs (re-rooted under refs/workspaces/<hex>/...) land on one
@@ -451,7 +488,11 @@ async fn workspace_manager_over_cluster_ref_store() {
 
     // --- fork: copies ref deltas through the cluster (n cluster CAS-creates) ---
     let view = mgr
-        .fork(&[main.clone(), dev.clone()], Duration::from_secs(3600), "root")
+        .fork(
+            &[main.clone(), dev.clone()],
+            Duration::from_secs(3600),
+            "root",
+        )
         .await
         .unwrap();
     assert_eq!(view.refs.len(), 2, "fork copied both source refs");
@@ -480,13 +521,14 @@ async fn workspace_manager_over_cluster_ref_store() {
         other => panic!("expected Ok commit outcome, got {other:?}"),
     }
     // The durable ref now resolves through the cluster to the promoted target.
-    assert_eq!(
-        refs.get(&durable).await.unwrap().unwrap().target,
-        oid(0x01)
-    );
+    assert_eq!(refs.get(&durable).await.unwrap().unwrap().target, oid(0x01));
 
     // --- get: resolve the workspace view back through the cluster store ---
-    let got = mgr.get(view.id, "root").await.unwrap().expect("workspace present");
+    let got = mgr
+        .get(view.id, "root")
+        .await
+        .unwrap()
+        .expect("workspace present");
     let mut got_names: Vec<&str> = got.refs.iter().map(|(n, _)| n.as_str()).collect();
     got_names.sort_unstable();
     assert_eq!(

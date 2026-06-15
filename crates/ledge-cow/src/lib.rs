@@ -189,13 +189,19 @@ mod tests {
         // Content identical at every level.
         assert_eq!(fs::read(dst.join("top.txt")).unwrap(), b"top");
         assert_eq!(fs::read(dst.join("a/mid.txt")).unwrap(), b"middle file");
-        assert_eq!(fs::read(dst.join("a/b/deep.txt")).unwrap(), b"deeply nested");
+        assert_eq!(
+            fs::read(dst.join("a/b/deep.txt")).unwrap(),
+            b"deeply nested"
+        );
 
         // Symlink preserved as a symlink, with the same target.
         let link = dst.join("link-to-top");
         let lmeta = fs::symlink_metadata(&link).unwrap();
         assert!(lmeta.file_type().is_symlink(), "link must remain a symlink");
-        assert_eq!(fs::read_link(&link).unwrap(), std::path::PathBuf::from("top.txt"));
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("top.txt")
+        );
     }
 
     #[test]
@@ -208,7 +214,10 @@ mod tests {
         fs::create_dir_all(&dst).unwrap(); // pre-existing → must refuse
 
         let err = clone_tree(&src, &dst).unwrap_err();
-        assert!(matches!(err, LedgeError::Io(_)), "expected Io error, got {err:?}");
+        assert!(
+            matches!(err, LedgeError::Io(_)),
+            "expected Io error, got {err:?}"
+        );
     }
 
     #[test]

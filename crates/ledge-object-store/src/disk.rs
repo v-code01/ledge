@@ -99,16 +99,16 @@ pub struct DiskObjectStore {
     /// the loose file first, then each pack in turn (loose shadows pack). The
     /// `ArcSwap` lets a repack atomically publish a new pack set while concurrent
     /// reads continue against the old snapshot they already loaded.
-    packs: std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::git_pack_file::GitPackFile>>>>,
+    packs:
+        std::sync::Arc<arc_swap::ArcSwap<Vec<std::sync::Arc<crate::git_pack_file::GitPackFile>>>>,
     /// Cached `git-SHA-1 → ObjectId` reverse index, lazily built on first
     /// [`Self::sha1_index`] and reused across calls. `None` means "stale, rebuild
     /// on next read". Invalidated on every loose write and on `swap_packs` (the
     /// only two ways the loose/packed object set can change). Holding the map in
     /// an `Arc` lets a clone clone the pointer (not the whole map) and lets the
     /// fetch path avoid an O(N) full-store rescan on every request.
-    sha1_cache: std::sync::Arc<
-        arc_swap::ArcSwapOption<std::collections::HashMap<[u8; 20], ObjectId>>,
-    >,
+    sha1_cache:
+        std::sync::Arc<arc_swap::ArcSwapOption<std::collections::HashMap<[u8; 20], ObjectId>>>,
     /// Optional S3 cold tier. `None` ⇒ tiering disabled and the store is
     /// byte-identical to the loose+pack-only behaviour (default OFF). When set,
     /// [`Self::tier_packs`] spills each `.pack` *body* to S3 (keeping the small
@@ -133,8 +133,7 @@ impl DiskObjectStore {
     /// Creates `<data_dir>/objects/tmp/` on first call.  All subsequent calls
     /// are idempotent.
     pub fn new(data_dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(data_dir.join("objects").join("tmp"))
-            .map_err(LedgeError::Io)?;
+        std::fs::create_dir_all(data_dir.join("objects").join("tmp")).map_err(LedgeError::Io)?;
         // Pack directory holds `<blake3>.pack` + `.idx` pairs. Load every valid
         // pack present at open time; a corrupt/partial pack is skipped (best
         // effort) so a single bad pack can't make the whole store unopenable.
@@ -189,7 +188,11 @@ impl DiskObjectStore {
                 // (from its `.lidx`) and can be restored on read.
                 let pack_path = if p.extension().is_some_and(|x| x == "pack") {
                     p.clone()
-                } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".pack.s3")) {
+                } else if p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".pack.s3"))
+                {
                     // strip the trailing ".s3" to recover "<name>.pack".
                     let s = p.as_os_str().to_string_lossy();
                     PathBuf::from(&s[..s.len() - 3])
@@ -251,7 +254,10 @@ impl DiskObjectStore {
         };
         let mut stats = TierStats::default();
         let dir = self.pack_dir();
-        let entries: Vec<_> = std::fs::read_dir(&dir).map_err(LedgeError::Io)?.flatten().collect();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .map_err(LedgeError::Io)?
+            .flatten()
+            .collect();
         for e in entries {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "pack") {
@@ -280,8 +286,11 @@ impl DiskObjectStore {
                     let sib = p.with_extension(ext);
                     if sib.exists() {
                         let stem = sib.file_name().unwrap().to_string_lossy().to_string();
-                        cold.put(&format!("packs/{stem}"), std::fs::read(&sib).map_err(LedgeError::Io)?)
-                            .await?;
+                        cold.put(
+                            &format!("packs/{stem}"),
+                            std::fs::read(&sib).map_err(LedgeError::Io)?,
+                        )
+                        .await?;
                     }
                 }
                 std::fs::write(&marker, key.as_bytes()).map_err(LedgeError::Io)?;
@@ -323,7 +332,7 @@ impl DiskObjectStore {
             // key = "packs/<H>.lidx" ⇒ name = "<H>".
             let fname = key.strip_prefix("packs/").unwrap_or(key); // "<H>.lidx"
             let name = fname.trim_end_matches(".lidx"); // "<H>"
-            // local lidx already present? skip (idempotent).
+                                                        // local lidx already present? skip (idempotent).
             let local_lidx = dir.join(format!("{name}.lidx"));
             if local_lidx.exists() {
                 continue;
@@ -335,7 +344,8 @@ impl DiskObjectStore {
             std::fs::write(dir.join(format!("{name}.idx")), &idx).map_err(LedgeError::Io)?;
             // marker so reads restore the body on demand (points at the S3 body key).
             let marker = dir.join(format!("{name}.pack.s3"));
-            std::fs::write(&marker, format!("packs/{name}.pack").as_bytes()).map_err(LedgeError::Io)?;
+            std::fs::write(&marker, format!("packs/{name}.pack").as_bytes())
+                .map_err(LedgeError::Io)?;
             recovered += 1;
         }
         self.reload_packs();
@@ -371,7 +381,11 @@ impl DiskObjectStore {
     /// Paths of every currently-registered pack (snapshot at call time). Lets a
     /// repack identify which packs it just superseded so they can be unlinked.
     pub fn pack_paths(&self) -> Vec<PathBuf> {
-        self.packs.load().iter().map(|p| p.pack_path().to_path_buf()).collect()
+        self.packs
+            .load()
+            .iter()
+            .map(|p| p.pack_path().to_path_buf())
+            .collect()
     }
 
     /// The 24-byte-header loose-object file image for `id`, or `None` if no loose
@@ -456,8 +470,8 @@ impl DiskObjectStore {
         let mut payload = Vec::with_capacity(24 + content.len());
         payload.extend_from_slice(&sha1_hash);
         payload.push(git_type); // byte 20 = git type
-        // byte 21 = encoding (0=raw, 1=zlib). Never inflate: fall back to raw when
-        // zlib doesn't shrink (tiny / already-compressed inputs).
+                                // byte 21 = encoding (0=raw, 1=zlib). Never inflate: fall back to raw when
+                                // zlib doesn't shrink (tiny / already-compressed inputs).
         let compressed = zlib_compress(&content);
         let (enc, stored): (u8, &[u8]) = if compressed.len() < content.len() {
             (ENC_ZLIB, compressed.as_slice())
@@ -544,7 +558,11 @@ impl DiskObjectStore {
             let mut lvl2 = tokio::fs::read_dir(d1.path())
                 .await
                 .map_err(ledge_core::LedgeError::Io)?;
-            while let Some(d2) = lvl2.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+            while let Some(d2) = lvl2
+                .next_entry()
+                .await
+                .map_err(ledge_core::LedgeError::Io)?
+            {
                 if !d2
                     .file_type()
                     .await
@@ -556,7 +574,11 @@ impl DiskObjectStore {
                 let mut files = tokio::fs::read_dir(d2.path())
                     .await
                     .map_err(ledge_core::LedgeError::Io)?;
-                while let Some(f) = files.next_entry().await.map_err(ledge_core::LedgeError::Io)? {
+                while let Some(f) = files
+                    .next_entry()
+                    .await
+                    .map_err(ledge_core::LedgeError::Io)?
+                {
                     let hex = f.file_name();
                     let hex = match hex.to_str() {
                         Some(h) if h.len() == 64 => h,
@@ -570,7 +592,10 @@ impl DiskObjectStore {
                         .await
                         .map_err(ledge_core::LedgeError::Io)?;
                     let mut header = [0u8; 24];
-                    let n = file.read(&mut header).await.map_err(ledge_core::LedgeError::Io)?;
+                    let n = file
+                        .read(&mut header)
+                        .await
+                        .map_err(ledge_core::LedgeError::Io)?;
                     if n < 24 {
                         continue;
                     }
@@ -639,12 +664,16 @@ impl DiskObjectStore {
             if !d1.file_type().await.map_err(LedgeError::Io)?.is_dir() {
                 continue;
             }
-            let mut lvl2 = tokio::fs::read_dir(d1.path()).await.map_err(LedgeError::Io)?;
+            let mut lvl2 = tokio::fs::read_dir(d1.path())
+                .await
+                .map_err(LedgeError::Io)?;
             while let Some(d2) = lvl2.next_entry().await.map_err(LedgeError::Io)? {
                 if !d2.file_type().await.map_err(LedgeError::Io)?.is_dir() {
                     continue;
                 }
-                let mut files = tokio::fs::read_dir(d2.path()).await.map_err(LedgeError::Io)?;
+                let mut files = tokio::fs::read_dir(d2.path())
+                    .await
+                    .map_err(LedgeError::Io)?;
                 while let Some(f) = files.next_entry().await.map_err(LedgeError::Io)? {
                     let name = f.file_name();
                     let hex = match name.to_str() {
@@ -805,16 +834,12 @@ impl DiskObjectStore {
         let base_content = self.read_depth(base, 0).await?;
 
         // Preserve the target's git type and canonical SHA-1 header bytes.
-        let git_type = self
-            .git_type_of(target)
-            .await
-            .map_err(|e| match e {
-                LedgeError::NotFound(_) => e,
-                other => LedgeError::Corruption(format!(
-                    "object {}: deltify type: {other}",
-                    target.to_hex()
-                )),
-            })?;
+        let git_type = self.git_type_of(target).await.map_err(|e| match e {
+            LedgeError::NotFound(_) => e,
+            other => {
+                LedgeError::Corruption(format!("object {}: deltify type: {other}", target.to_hex()))
+            }
+        })?;
         let sha1 = self.sha1_of(target).await?;
 
         let delta = encode_delta(&base_content, &target_content);
@@ -851,7 +876,9 @@ impl DiskObjectStore {
 
         // Atomic replace: write to tmp/, then rename(2) over the canonical path.
         let tmp = self.tmp_path();
-        tokio::fs::write(&tmp, &file).await.map_err(LedgeError::Io)?;
+        tokio::fs::write(&tmp, &file)
+            .await
+            .map_err(LedgeError::Io)?;
         tokio::fs::rename(&tmp, self.object_path(&target))
             .await
             .map_err(LedgeError::Io)?;
@@ -955,7 +982,14 @@ impl ObjectStore for DiskObjectStore {
                 let sha1_cache = self.sha1_cache.clone();
                 let cold = self.cold.clone();
                 tokio::spawn(async move {
-                    DiskObjectStore { data_dir, packs, sha1_cache, cold }.write(c).await
+                    DiskObjectStore {
+                        data_dir,
+                        packs,
+                        sha1_cache,
+                        cold,
+                    }
+                    .write(c)
+                    .await
                 })
             })
             .collect();
@@ -1066,7 +1100,10 @@ mod tests {
         let mut expected = vec![id_a, id_b, id_c];
         expected.sort_by_key(|id| *id.as_bytes());
 
-        assert_eq!(ids, expected, "list_all_ids must return exactly the written ids");
+        assert_eq!(
+            ids, expected,
+            "list_all_ids must return exactly the written ids"
+        );
     }
 
     #[tokio::test]
@@ -1078,10 +1115,16 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_object_then_exists_is_false() {
         let (store, _dir) = make_store();
-        let id = store.write(Bytes::from_static(b"to be deleted")).await.unwrap();
+        let id = store
+            .write(Bytes::from_static(b"to be deleted"))
+            .await
+            .unwrap();
         assert!(store.exists(id).await.unwrap());
         store.delete(id).await.unwrap();
-        assert!(!store.exists(id).await.unwrap(), "object must be gone after delete");
+        assert!(
+            !store.exists(id).await.unwrap(),
+            "object must be gone after delete"
+        );
     }
 
     #[tokio::test]
@@ -1127,10 +1170,7 @@ mod tests {
     async fn write_file_has_24_byte_header() {
         let (store, dir) = make_store();
         let content = b"header layout check";
-        let id = store
-            .write(Bytes::copy_from_slice(content))
-            .await
-            .unwrap();
+        let id = store.write(Bytes::copy_from_slice(content)).await.unwrap();
         let hex = id.to_hex();
         let raw = std::fs::read(
             dir.path()
@@ -1155,10 +1195,7 @@ mod tests {
         use sha1::Digest as _;
         let (store, dir) = make_store();
         let content = b"git sha1 compatibility check";
-        let id = store
-            .write(Bytes::copy_from_slice(content))
-            .await
-            .unwrap();
+        let id = store.write(Bytes::copy_from_slice(content)).await.unwrap();
         let hex = id.to_hex();
         let raw = std::fs::read(
             dir.path()
@@ -1210,19 +1247,13 @@ mod tests {
     #[tokio::test]
     async fn exists_false_for_missing() {
         let (store, _dir) = make_store();
-        assert!(!store
-            .exists(ObjectId::from_bytes([0u8; 32]))
-            .await
-            .unwrap());
+        assert!(!store.exists(ObjectId::from_bytes([0u8; 32])).await.unwrap());
     }
 
     #[tokio::test]
     async fn exists_true_after_write() {
         let (store, _dir) = make_store();
-        let id = store
-            .write(Bytes::from_static(b"existence"))
-            .await
-            .unwrap();
+        let id = store.write(Bytes::from_static(b"existence")).await.unwrap();
         assert!(store.exists(id).await.unwrap());
     }
 
@@ -1231,10 +1262,7 @@ mod tests {
         use sha1::Digest as _;
         let (store, _dir) = make_store();
         let content = b"sha1_of correctness";
-        let id = store
-            .write(Bytes::copy_from_slice(content))
-            .await
-            .unwrap();
+        let id = store.write(Bytes::copy_from_slice(content)).await.unwrap();
         let sha1 = store.sha1_of(id).await.unwrap();
         let mut h = sha1::Sha1::new();
         h.update(format!("blob {}\0", content.len()).as_bytes());
@@ -1246,9 +1274,7 @@ mod tests {
     async fn sha1_of_missing_returns_not_found() {
         let (store, _dir) = make_store();
         assert!(matches!(
-            store
-                .sha1_of(ObjectId::from_bytes([0xdeu8; 32]))
-                .await,
+            store.sha1_of(ObjectId::from_bytes([0xdeu8; 32])).await,
             Err(LedgeError::NotFound(_))
         ));
     }
@@ -1323,17 +1349,29 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_compressible_binary_empty_tiny() {
         let (store, _d) = make_store();
-        let big: Vec<u8> = (0..400).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let big: Vec<u8> = (0..400)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
         let cases: Vec<Vec<u8>> = vec![
             big.clone(),
             vec![],
             b"hi".to_vec(),
-            (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect(),
+            (0..4096u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+                .collect(),
         ];
         for c in cases {
-            let id = store.write_git_object(3, Bytes::from(c.clone())).await.unwrap();
+            let id = store
+                .write_git_object(3, Bytes::from(c.clone()))
+                .await
+                .unwrap();
             let got = ObjectStore::read(&store, id).await.unwrap();
-            assert_eq!(got.as_ref(), c.as_slice(), "round-trip byte-identical (len {})", c.len());
+            assert_eq!(
+                got.as_ref(),
+                c.as_slice(),
+                "round-trip byte-identical (len {})",
+                c.len()
+            );
         }
     }
 
@@ -1349,11 +1387,19 @@ mod tests {
     #[tokio::test]
     async fn compresses_on_disk() {
         let (store, _d) = make_store();
-        let c = Bytes::from((0..2000).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>());
+        let c = Bytes::from(
+            (0..2000)
+                .flat_map(|i| format!("line {i}\n").into_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let id = store.write_git_object(3, c.clone()).await.unwrap();
         let p = store.object_path(&id);
         let on_disk = std::fs::metadata(&p).unwrap().len() as usize;
-        assert!(on_disk < 24 + c.len(), "stored ({on_disk}) < header+raw ({})", 24 + c.len());
+        assert!(
+            on_disk < 24 + c.len(),
+            "stored ({on_disk}) < header+raw ({})",
+            24 + c.len()
+        );
         let raw = std::fs::read(&p).unwrap();
         assert_eq!(raw[21], 1, "enc flag = zlib");
     }
@@ -1375,17 +1421,25 @@ mod tests {
         let p = store.object_path(&id);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, &payload).unwrap();
-        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), content.as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, id).await.unwrap().as_ref(),
+            content.as_slice()
+        );
     }
 
     #[tokio::test]
     async fn corrupt_compressed_body_is_clean_error() {
         let (store, _d) = make_store();
-        let id = store.write_git_object(3, Bytes::from(vec![1u8; 3000])).await.unwrap();
+        let id = store
+            .write_git_object(3, Bytes::from(vec![1u8; 3000]))
+            .await
+            .unwrap();
         let p = store.object_path(&id);
         let mut raw = std::fs::read(&p).unwrap();
         assert_eq!(raw[21], 1);
-        for b in raw[24..].iter_mut() { *b = 0xff; }
+        for b in raw[24..].iter_mut() {
+            *b = 0xff;
+        }
         std::fs::write(&p, &raw).unwrap();
         assert!(ObjectStore::read(&store, id).await.is_err());
     }
@@ -1395,15 +1449,29 @@ mod tests {
     #[tokio::test]
     async fn deltify_shrinks_and_reads_back() {
         let (store, _d) = make_store();
-        let base: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
-        let target = String::from_utf8(base.clone()).unwrap().replace("line 250\n", "EDITED\n").into_bytes();
-        let bid = store.write_git_object(3, Bytes::from(base.clone())).await.unwrap();
-        let tid = store.write_git_object(3, Bytes::from(target.clone())).await.unwrap();
+        let base: Vec<u8> = (0..500)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let target = String::from_utf8(base.clone())
+            .unwrap()
+            .replace("line 250\n", "EDITED\n")
+            .into_bytes();
+        let bid = store
+            .write_git_object(3, Bytes::from(base.clone()))
+            .await
+            .unwrap();
+        let tid = store
+            .write_git_object(3, Bytes::from(target.clone()))
+            .await
+            .unwrap();
         let before = std::fs::metadata(store.object_path(&tid)).unwrap().len();
         assert!(store.deltify(tid, bid).await.unwrap(), "should deltify");
         let after = std::fs::metadata(store.object_path(&tid)).unwrap().len();
         assert!(after < before, "delta file {after} < raw {before}");
-        assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), target.as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, tid).await.unwrap().as_ref(),
+            target.as_slice()
+        );
         assert_eq!(store.git_type_of(tid).await.unwrap(), 3);
         assert_eq!(store.delta_base_of(tid).await.unwrap(), Some(bid));
         assert_eq!(store.delta_base_of(bid).await.unwrap(), None);
@@ -1412,28 +1480,65 @@ mod tests {
     #[tokio::test]
     async fn deltify_refuses_when_not_smaller() {
         let (store, _d) = make_store();
-        let a = store.write_git_object(3, Bytes::from(vec![1u8; 50])).await.unwrap();
-        let b = store.write_git_object(3, Bytes::from((0..50u8).collect::<Vec<_>>())).await.unwrap();
+        let a = store
+            .write_git_object(3, Bytes::from(vec![1u8; 50]))
+            .await
+            .unwrap();
+        let b = store
+            .write_git_object(3, Bytes::from((0..50u8).collect::<Vec<_>>()))
+            .await
+            .unwrap();
         let _ = store.deltify(a, b).await.unwrap(); // may refuse (delta not smaller)
-        assert_eq!(ObjectStore::read(&store, a).await.unwrap().len(), 50, "a still reads exact");
+        assert_eq!(
+            ObjectStore::read(&store, a).await.unwrap().len(),
+            50,
+            "a still reads exact"
+        );
     }
 
     #[tokio::test]
     async fn delta_chain_reads_back() {
         let (store, _d) = make_store();
-        let v0: Vec<u8> = (0..300).flat_map(|i| format!("L{i}\n").into_bytes()).collect();
-        let v1 = String::from_utf8(v0.clone()).unwrap().replace("L100\n","A\n").into_bytes();
-        let v2 = String::from_utf8(v1.clone()).unwrap().replace("L200\n","B\n").into_bytes();
+        let v0: Vec<u8> = (0..300)
+            .flat_map(|i| format!("L{i}\n").into_bytes())
+            .collect();
+        let v1 = String::from_utf8(v0.clone())
+            .unwrap()
+            .replace("L100\n", "A\n")
+            .into_bytes();
+        let v2 = String::from_utf8(v1.clone())
+            .unwrap()
+            .replace("L200\n", "B\n")
+            .into_bytes();
         let id0 = store.write_git_object(3, Bytes::from(v0)).await.unwrap();
-        let id1 = store.write_git_object(3, Bytes::from(v1.clone())).await.unwrap();
-        let id2 = store.write_git_object(3, Bytes::from(v2.clone())).await.unwrap();
+        let id1 = store
+            .write_git_object(3, Bytes::from(v1.clone()))
+            .await
+            .unwrap();
+        let id2 = store
+            .write_git_object(3, Bytes::from(v2.clone()))
+            .await
+            .unwrap();
         assert!(store.deltify(id1, id0).await.unwrap());
         assert!(store.deltify(id2, id1).await.unwrap()); // chain: id2 -> id1 -> id0
-        assert_eq!(ObjectStore::read(&store, id2).await.unwrap().as_ref(), v2.as_slice());
-        assert_eq!(ObjectStore::read(&store, id1).await.unwrap().as_ref(), v1.as_slice());
-        assert_eq!(ObjectStore::read(&store, id0).await.unwrap().as_ref(), {
-            let v0b: Vec<u8> = (0..300).flat_map(|i| format!("L{i}\n").into_bytes()).collect(); v0b
-        }.as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, id2).await.unwrap().as_ref(),
+            v2.as_slice()
+        );
+        assert_eq!(
+            ObjectStore::read(&store, id1).await.unwrap().as_ref(),
+            v1.as_slice()
+        );
+        assert_eq!(
+            ObjectStore::read(&store, id0).await.unwrap().as_ref(),
+            {
+                let v0b: Vec<u8> = (0..300)
+                    .flat_map(|i| format!("L{i}\n").into_bytes())
+                    .collect();
+                v0b
+            }
+            .as_slice()
+        );
     }
 
     // ── Task 2 (packing): two-tier read (loose + pack) ────────────────────────
@@ -1441,13 +1546,21 @@ mod tests {
     #[tokio::test]
     async fn reads_packed_only_object() {
         let (store, _d) = make_store();
-        let content = (0..400).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>();
-        let id = store.write_git_object(3, Bytes::from(content.clone())).await.unwrap();
+        let content = (0..400)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect::<Vec<u8>>();
+        let id = store
+            .write_git_object(3, Bytes::from(content.clone()))
+            .await
+            .unwrap();
         let sha1 = store.sha1_of(id).await.unwrap();
         let pf = pack_objects(&store, &[(id, 3, content.clone(), sha1)]).await;
         store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&id)).unwrap(); // loose gone — only the pack has it
-        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), content.as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, id).await.unwrap().as_ref(),
+            content.as_slice()
+        );
         assert_eq!(store.git_type_of(id).await.unwrap(), 3);
         assert_eq!(store.sha1_of(id).await.unwrap().len(), 20);
         assert!(store.exists(id).await.unwrap());
@@ -1457,10 +1570,21 @@ mod tests {
     #[tokio::test]
     async fn packed_delta_with_packed_base_resolves() {
         let (store, _d) = make_store();
-        let base = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>();
-        let edited = String::from_utf8(base.clone()).unwrap().replace("l200\n","E\n").into_bytes();
-        let bid = store.write_git_object(3, Bytes::from(base.clone())).await.unwrap();
-        let tid = store.write_git_object(3, Bytes::from(edited.clone())).await.unwrap();
+        let base = (0..400)
+            .flat_map(|i| format!("l{i}\n").into_bytes())
+            .collect::<Vec<u8>>();
+        let edited = String::from_utf8(base.clone())
+            .unwrap()
+            .replace("l200\n", "E\n")
+            .into_bytes();
+        let bid = store
+            .write_git_object(3, Bytes::from(base.clone()))
+            .await
+            .unwrap();
+        let tid = store
+            .write_git_object(3, Bytes::from(edited.clone()))
+            .await
+            .unwrap();
         let bsha1 = store.sha1_of(bid).await.unwrap();
         let tsha1 = store.sha1_of(tid).await.unwrap();
         // Pack both: write_git_pack(window=16) will store `edited` as a REF_DELTA
@@ -1473,36 +1597,60 @@ mod tests {
         store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&bid)).unwrap();
         std::fs::remove_file(store.object_path(&tid)).unwrap();
-        assert_eq!(ObjectStore::read(&store, tid).await.unwrap().as_ref(), edited.as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, tid).await.unwrap().as_ref(),
+            edited.as_slice()
+        );
         assert_eq!(store.delta_base_of(tid).await.unwrap(), Some(bid));
     }
 
     #[tokio::test]
     async fn sha1_index_two_tier_and_cached() {
         let (store, _d) = make_store();
-        let content = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect::<Vec<u8>>();
-        let id = store.write_git_object(3, Bytes::from(content.clone())).await.unwrap();
+        let content = (0..400)
+            .flat_map(|i| format!("l{i}\n").into_bytes())
+            .collect::<Vec<u8>>();
+        let id = store
+            .write_git_object(3, Bytes::from(content.clone()))
+            .await
+            .unwrap();
         let sha1 = store.sha1_of(id).await.unwrap();
         let a = store.sha1_index().await.unwrap();
         let b = store.sha1_index().await.unwrap();
-        assert!(std::sync::Arc::ptr_eq(&a, &b), "cached: same Arc on repeat call");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "cached: same Arc on repeat call"
+        );
         assert_eq!(a.get(&sha1).copied(), Some(id));
         // pack it, prune loose, swap → cache invalidated + packed object still indexed
         let pf = pack_objects(&store, &[(id, 3, content, sha1)]).await;
         store.swap_packs(vec![pf]);
         std::fs::remove_file(store.object_path(&id)).unwrap();
         let c = store.sha1_index().await.unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&a, &c), "swap_packs invalidated the cache");
-        assert_eq!(c.get(&sha1).copied(), Some(id), "packed object present in index");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &c),
+            "swap_packs invalidated the cache"
+        );
+        assert_eq!(
+            c.get(&sha1).copied(),
+            Some(id),
+            "packed object present in index"
+        );
     }
 
     #[tokio::test]
     async fn write_invalidates_sha1_cache() {
         let (store, _d) = make_store();
         let a = store.sha1_index().await.unwrap();
-        let id = store.write_git_object(3, Bytes::from(b"new object".to_vec())).await.unwrap();
+        let id = store
+            .write_git_object(3, Bytes::from(b"new object".to_vec()))
+            .await
+            .unwrap();
         let b = store.sha1_index().await.unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&a, &b), "write invalidated the cache");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &b),
+            "write invalidated the cache"
+        );
         assert!(b.contains_key(&store.sha1_of(id).await.unwrap()));
     }
 
@@ -1515,13 +1663,24 @@ mod tests {
         let mut ids = Vec::new();
         let mut wants = Vec::new();
         for v in 0..6 {
-            let c: Vec<u8> = (0..400).flat_map(|i| format!("l{i} v{v}\n").into_bytes()).collect();
-            ids.push(store.write_git_object(3, Bytes::from(c.clone())).await.unwrap());
+            let c: Vec<u8> = (0..400)
+                .flat_map(|i| format!("l{i} v{v}\n").into_bytes())
+                .collect();
+            ids.push(
+                store
+                    .write_git_object(3, Bytes::from(c.clone()))
+                    .await
+                    .unwrap(),
+            );
             wants.push(c);
         }
         crate::repack::repack(&store).await.unwrap();
-        let pack_exists = || std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok())
-            .any(|e| e.path().extension().is_some_and(|x| x == "pack"));
+        let pack_exists = || {
+            std::fs::read_dir(store.pack_dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|x| x == "pack"))
+        };
         assert!(pack_exists(), "a .pack exists after repack");
 
         // TIER: pack body -> S3, local .pack removed
@@ -1530,21 +1689,35 @@ mod tests {
         assert!(!pack_exists(), "local .pack removed after tiering");
 
         // READ restores the .pack from S3 and is byte-exact
-        assert_eq!(ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(), wants[3].as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(),
+            wants[3].as_slice()
+        );
         assert!(pack_exists(), ".pack restored locally on read");
 
         // DURABILITY: wipe the restored .pack + reload packs -> still reads from S3
-        for e in std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok()) {
-            if e.path().extension().is_some_and(|x| x == "pack") { std::fs::remove_file(e.path()).unwrap(); }
+        for e in std::fs::read_dir(store.pack_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            if e.path().extension().is_some_and(|x| x == "pack") {
+                std::fs::remove_file(e.path()).unwrap();
+            }
         }
         store.reload_packs();
-        assert_eq!(ObjectStore::read(&store, ids[0]).await.unwrap().as_ref(), wants[0].as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, ids[0]).await.unwrap().as_ref(),
+            wants[0].as_slice()
+        );
     }
 
     #[tokio::test]
     async fn tier_disabled_without_cold() {
         let (store, _d) = make_store();
-        assert!(store.tier_packs().await.is_err(), "tier without a cold tier is an error");
+        assert!(
+            store.tier_packs().await.is_err(),
+            "tier without a cold tier is an error"
+        );
     }
 
     // ── Task 1 (S3 full-node DR): tier indexes too + rebuild a wiped node ──────
@@ -1553,16 +1726,27 @@ mod tests {
     async fn recover_from_s3_after_full_wipe() {
         let (store, _d) = make_store();
         store.set_cold(std::sync::Arc::new(crate::s3::S3Tier::in_memory("ledge")));
-        let mut ids = Vec::new(); let mut wants = Vec::new();
+        let mut ids = Vec::new();
+        let mut wants = Vec::new();
         for v in 0..6 {
-            let c: Vec<u8> = (0..400).flat_map(|i| format!("l{i} v{v}\n").into_bytes()).collect();
-            ids.push(store.write_git_object(3, Bytes::from(c.clone())).await.unwrap());
+            let c: Vec<u8> = (0..400)
+                .flat_map(|i| format!("l{i} v{v}\n").into_bytes())
+                .collect();
+            ids.push(
+                store
+                    .write_git_object(3, Bytes::from(c.clone()))
+                    .await
+                    .unwrap(),
+            );
             wants.push(c);
         }
         crate::repack::repack(&store).await.unwrap();
         store.tier_packs().await.unwrap();
         // WIPE the entire local pack dir (simulate disk death): remove ALL files
-        for e in std::fs::read_dir(store.pack_dir()).unwrap().filter_map(|e| e.ok()) {
+        for e in std::fs::read_dir(store.pack_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
             std::fs::remove_file(e.path()).unwrap();
         }
         store.reload_packs();
@@ -1570,7 +1754,10 @@ mod tests {
         let n = store.recover_from_s3().await.unwrap();
         assert!(n >= 1, "recovered at least one pack from S3");
         // read works again (index recovered from S3, body restores on read) — byte-identical
-        assert_eq!(ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(), wants[3].as_slice());
+        assert_eq!(
+            ObjectStore::read(&store, ids[3]).await.unwrap().as_ref(),
+            wants[3].as_slice()
+        );
         // idempotent
         assert_eq!(store.recover_from_s3().await.unwrap(), 0);
     }
@@ -1585,12 +1772,18 @@ mod tests {
     async fn loose_shadows_pack() {
         let (store, _d) = make_store();
         let c = b"loose wins".to_vec();
-        let id = store.write_git_object(3, Bytes::from(c.clone())).await.unwrap();
+        let id = store
+            .write_git_object(3, Bytes::from(c.clone()))
+            .await
+            .unwrap();
         // pack a DIFFERENT byte image under the same id path won't happen (content-addressed);
         // just assert that with both loose present and a pack registered, read uses loose.
         let sha1 = store.sha1_of(id).await.unwrap();
         let pf = pack_objects(&store, &[(id, 3, c.clone(), sha1)]).await;
         store.swap_packs(vec![pf]);
-        assert_eq!(ObjectStore::read(&store, id).await.unwrap().as_ref(), c.as_slice()); // loose still there
+        assert_eq!(
+            ObjectStore::read(&store, id).await.unwrap().as_ref(),
+            c.as_slice()
+        ); // loose still there
     }
 }

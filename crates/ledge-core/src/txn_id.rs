@@ -14,7 +14,9 @@ static TXN_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// makes hex lexicographic order match numeric order. The same `TxnId` value
 /// is carried verbatim through Raft log entries on every shard, so it must be
 /// `Copy + Eq + Hash + serde` and stable across encode/decode.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 #[serde(into = "String", try_from = "String")]
 pub struct TxnId([u8; 16]);
 

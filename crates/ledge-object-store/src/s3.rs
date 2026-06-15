@@ -141,11 +141,14 @@ mod tests {
         t.put("packs/a.pack", b"p".to_vec()).await.unwrap();
         let mut keys = t.list("packs/").await.unwrap();
         keys.sort();
-        assert_eq!(keys, vec![
-            "packs/a.idx".to_string(),
-            "packs/a.lidx".to_string(),
-            "packs/a.pack".to_string(),
-        ]);
+        assert_eq!(
+            keys,
+            vec![
+                "packs/a.idx".to_string(),
+                "packs/a.lidx".to_string(),
+                "packs/a.pack".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

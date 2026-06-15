@@ -32,14 +32,24 @@ impl AuthCtx {
     pub fn disabled() -> Self {
         AuthCtx {
             enabled: false,
-            store: Arc::new(store::AuthStore::in_memory(Arc::new(ledge_core::HLC::new()))),
+            store: Arc::new(store::AuthStore::in_memory(
+                Arc::new(ledge_core::HLC::new()),
+            )),
             cluster_secret: None,
         }
     }
 
     /// The enabled context: a real opened store + optional node-to-node secret.
     /// Built by `main.rs` when `[auth] enabled=true`.
-    pub fn new(enabled: bool, store: Arc<store::AuthStore>, cluster_secret: Option<String>) -> Self {
-        AuthCtx { enabled, store, cluster_secret }
+    pub fn new(
+        enabled: bool,
+        store: Arc<store::AuthStore>,
+        cluster_secret: Option<String>,
+    ) -> Self {
+        AuthCtx {
+            enabled,
+            store,
+            cluster_secret,
+        }
     }
 }

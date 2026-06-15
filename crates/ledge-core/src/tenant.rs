@@ -79,7 +79,10 @@ mod tests {
     fn prefix_composes_as_a_git_segment() {
         // The segment is inserted after `refs/`: refs/<prefix>heads/main.
         let p = tenant_prefix("acme");
-        assert_eq!(format!("refs/{p}heads/main"), "refs/tenants/acme/heads/main");
+        assert_eq!(
+            format!("refs/{p}heads/main"),
+            "refs/tenants/acme/heads/main"
+        );
         // Root collapses to the legacy form.
         let r = tenant_prefix("root");
         assert_eq!(format!("refs/{r}heads/main"), "refs/heads/main");

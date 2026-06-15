@@ -48,12 +48,10 @@ impl HLC {
         loop {
             let last = self.0.load(Ordering::Acquire);
             let candidate = std::cmp::max(wall_ms() << 20, last.wrapping_add(1));
-            match self.0.compare_exchange_weak(
-                last,
-                candidate,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .0
+                .compare_exchange_weak(last, candidate, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return candidate,
                 Err(_) => std::hint::spin_loop(),
             }
@@ -110,7 +108,10 @@ mod tests {
         let ticks: Vec<u64> = (0..1024).map(|_| hlc.tick()).collect();
         for window in ticks.windows(2) {
             let (a, b) = (window[0], window[1]);
-            assert!(b > a, "tick sequence must be strictly increasing: {a} then {b}");
+            assert!(
+                b > a,
+                "tick sequence must be strictly increasing: {a} then {b}"
+            );
             if (a >> 20) == (b >> 20) {
                 assert_eq!(
                     b & 0xFFFFF,
@@ -126,7 +127,10 @@ mod tests {
         let hlc = HLC::new();
         let t = hlc.tick();
         let wall_ms = t >> 20;
-        assert!(wall_ms >= 1_704_067_200_000, "wall_ms={wall_ms} implausibly old");
+        assert!(
+            wall_ms >= 1_704_067_200_000,
+            "wall_ms={wall_ms} implausibly old"
+        );
     }
 
     proptest! {
@@ -166,8 +170,7 @@ mod tests {
         all.sort_unstable();
         for window in all.windows(2) {
             assert_ne!(
-                window[0],
-                window[1],
+                window[0], window[1],
                 "duplicate tick: {} appeared twice",
                 window[0]
             );

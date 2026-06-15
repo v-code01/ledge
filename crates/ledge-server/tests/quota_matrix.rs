@@ -73,7 +73,13 @@ async fn app_with_quota(dir: &TempDir, quota: QuotaCtx) -> (axum::Router, String
     (build_app(state), acme, globex)
 }
 
-async fn status(app: &axum::Router, method: &str, uri: &str, token: &str, body: &str) -> StatusCode {
+async fn status(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: &str,
+) -> StatusCode {
     app.clone()
         .oneshot(
             Request::builder()
@@ -107,8 +113,14 @@ async fn workspace_count_quota_507_and_independence() {
     let create = r#"{"source":[],"ttl_seconds":3600}"#;
 
     // acme: two forks OK, third 507.
-    assert_eq!(status(&app, "POST", "/workspaces", &acme, create).await, StatusCode::OK);
-    assert_eq!(status(&app, "POST", "/workspaces", &acme, create).await, StatusCode::OK);
+    assert_eq!(
+        status(&app, "POST", "/workspaces", &acme, create).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&app, "POST", "/workspaces", &acme, create).await,
+        StatusCode::OK
+    );
     assert_eq!(
         status(&app, "POST", "/workspaces", &acme, create).await,
         StatusCode::INSUFFICIENT_STORAGE,
@@ -116,8 +128,14 @@ async fn workspace_count_quota_507_and_independence() {
     );
 
     // globex is independent: its first two forks still succeed.
-    assert_eq!(status(&app, "POST", "/workspaces", &globex, create).await, StatusCode::OK);
-    assert_eq!(status(&app, "POST", "/workspaces", &globex, create).await, StatusCode::OK);
+    assert_eq!(
+        status(&app, "POST", "/workspaces", &globex, create).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&app, "POST", "/workspaces", &globex, create).await,
+        StatusCode::OK
+    );
 }
 
 /// §4.2 — rate quota: with a tiny burst, the (burst+1)-th request is 429; a
@@ -135,15 +153,24 @@ async fn rate_quota_429_per_tenant() {
     };
     let (app, acme, globex) = app_with_quota(&dir, quota).await;
     // acme: two requests pass (burst), the third 429.
-    assert_eq!(status(&app, "GET", "/workspaces", &acme, "").await, StatusCode::OK);
-    assert_eq!(status(&app, "GET", "/workspaces", &acme, "").await, StatusCode::OK);
+    assert_eq!(
+        status(&app, "GET", "/workspaces", &acme, "").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&app, "GET", "/workspaces", &acme, "").await,
+        StatusCode::OK
+    );
     assert_eq!(
         status(&app, "GET", "/workspaces", &acme, "").await,
         StatusCode::TOO_MANY_REQUESTS,
         "acme's 3rd request (burst exhausted) is 429",
     );
     // globex still has its full burst (independent bucket).
-    assert_eq!(status(&app, "GET", "/workspaces", &globex, "").await, StatusCode::OK);
+    assert_eq!(
+        status(&app, "GET", "/workspaces", &globex, "").await,
+        StatusCode::OK
+    );
 }
 
 /// §4.7 — quotas DISABLED (the default ctx) ⇒ no limit at all: many forks + a
@@ -155,9 +182,15 @@ async fn disabled_quota_no_limits() {
     let (app, acme, _globex) = app_with_quota(&dir, QuotaCtx::disabled()).await;
     let create = r#"{"source":[],"ttl_seconds":3600}"#;
     for _ in 0..5 {
-        assert_eq!(status(&app, "POST", "/workspaces", &acme, create).await, StatusCode::OK);
+        assert_eq!(
+            status(&app, "POST", "/workspaces", &acme, create).await,
+            StatusCode::OK
+        );
     }
     for _ in 0..30 {
-        assert_eq!(status(&app, "GET", "/workspaces", &acme, "").await, StatusCode::OK);
+        assert_eq!(
+            status(&app, "GET", "/workspaces", &acme, "").await,
+            StatusCode::OK
+        );
     }
 }

@@ -24,7 +24,9 @@ use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use ledge_core::{HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result, TxnId};
+use ledge_core::{
+    LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result, TxnId, HLC,
+};
 use tracing::{debug, instrument, warn};
 
 use crate::art::{art_delete, art_insert, art_lookup, art_prefix_iter, ArtNode};
@@ -103,7 +105,10 @@ impl RefStoreImpl {
                         ));
                     }
                 }
-                WalEntry::Update { name, entry: ref_entry } => {
+                WalEntry::Update {
+                    name,
+                    entry: ref_entry,
+                } => {
                     root = Some(art_insert(
                         root,
                         name.as_bytes(),
@@ -190,7 +195,10 @@ impl RefStoreImpl {
         // pairs, inserting each RefEntry VERBATIM (no version recompute / hlc tick).
         let mut root: Option<Arc<ArtNode>> = None;
         for (name, entry) in entries {
-            debug_assert!(entry.version >= 1, "restored version invariant: version >= 1");
+            debug_assert!(
+                entry.version >= 1,
+                "restored version invariant: version >= 1"
+            );
             root = Some(art_insert(
                 root,
                 name.as_str().as_bytes(),
@@ -320,7 +328,12 @@ impl RefStoreImpl {
     #[instrument(skip(self, op))]
     pub async fn apply_op(&self, op: &AppliedOp) -> AppliedOutcome {
         match op {
-            AppliedOp::Update { name, target, expected, hlc } => {
+            AppliedOp::Update {
+                name,
+                target,
+                expected,
+                hlc,
+            } => {
                 let key = name.as_str().as_bytes().to_vec();
                 loop {
                     let current_arc = self.root.load_full();
@@ -344,8 +357,7 @@ impl RefStoreImpl {
                         _ => {}
                     }
 
-                    let new_version =
-                        current_entry.as_ref().map(|e| e.version + 1).unwrap_or(1);
+                    let new_version = current_entry.as_ref().map(|e| e.version + 1).unwrap_or(1);
                     debug_assert!(new_version >= 1, "version invariant: version >= 1");
 
                     // CRITICAL: use the SUPPLIED hlc, never self.hlc.tick().
@@ -362,7 +374,9 @@ impl RefStoreImpl {
                         0,
                     );
                     let new_root_arc = Arc::new(Some(new_root));
-                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    let prev = self
+                        .root
+                        .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                     if Arc::ptr_eq(&prev, &current_arc) {
                         // WAL append; on I/O failure, log and still return the
                         // logical outcome — the replicated apply must be
@@ -383,7 +397,11 @@ impl RefStoreImpl {
                     // CAS lost — reload and retry.
                 }
             }
-            AppliedOp::Delete { name, expected, hlc } => {
+            AppliedOp::Delete {
+                name,
+                expected,
+                hlc,
+            } => {
                 let key = name.as_str().as_bytes().to_vec();
                 loop {
                     let current_arc = self.root.load_full();
@@ -404,7 +422,9 @@ impl RefStoreImpl {
                         Some(root) => art_delete(Arc::clone(root), &key, 0),
                     };
                     let new_root_arc = Arc::new(new_root_opt);
-                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    let prev = self
+                        .root
+                        .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                     if Arc::ptr_eq(&prev, &current_arc) {
                         if let Err(e) = self
                             .wal
@@ -421,7 +441,14 @@ impl RefStoreImpl {
                     // CAS lost — retry.
                 }
             }
-            AppliedOp::Prepare { txn_id, coord_shard, name, target, expected, hlc } => {
+            AppliedOp::Prepare {
+                txn_id,
+                coord_shard,
+                name,
+                target,
+                expected,
+                hlc,
+            } => {
                 let key = name.as_str().as_bytes().to_vec();
                 loop {
                     let current_arc = self.root.load_full();
@@ -445,10 +472,10 @@ impl RefStoreImpl {
                         .map(|s| s.committed.clone())
                         .filter(|c| c.version != 0);
                     let precondition_ok = match (&committed, expected) {
-                        (None, None) => true,                  // create absent ref
-                        (Some(_), None) => false,              // create but present
-                        (None, Some(_)) => false,              // update but absent
-                        (Some(c), Some(x)) => c.target == *x,  // update matches
+                        (None, None) => true,                 // create absent ref
+                        (Some(_), None) => false,             // create but present
+                        (None, Some(_)) => false,             // update but absent
+                        (Some(c), Some(x)) => c.target == *x, // update matches
                     };
                     if !precondition_ok {
                         return AppliedOutcome::VoteNo;
@@ -470,14 +497,20 @@ impl RefStoreImpl {
                             prepared: Some(intent),
                         },
                         None => RefSlot {
-                            committed: RefEntry { target: *target, hlc: 0, version: 0 },
+                            committed: RefEntry {
+                                target: *target,
+                                hlc: 0,
+                                version: 0,
+                            },
                             prepared: Some(intent),
                         },
                     };
 
                     let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
                     let new_root_arc = Arc::new(Some(new_root));
-                    let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                    let prev = self
+                        .root
+                        .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                     if Arc::ptr_eq(&prev, &current_arc) {
                         // Locks are NOT WAL-logged as committed state: they are
                         // volatile until CommitPrepared writes the durable entry.
@@ -516,12 +549,18 @@ impl RefStoreImpl {
                             let new_slot = RefSlot::committed(new_entry.clone());
                             let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
                             let new_root_arc = Arc::new(Some(new_root));
-                            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                            let prev = self
+                                .root
+                                .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                             if Arc::ptr_eq(&prev, &current_arc) {
-                                if let Err(e) = self.wal.append(&WalEntry::Update {
-                                    name: name.as_str().to_string(),
-                                    entry: new_entry.clone(),
-                                }).await {
+                                if let Err(e) = self
+                                    .wal
+                                    .append(&WalEntry::Update {
+                                        name: name.as_str().to_string(),
+                                        entry: new_entry.clone(),
+                                    })
+                                    .await
+                                {
                                     warn!("CommitPrepared WAL append failed: {e:?}");
                                 }
                                 return AppliedOutcome::CommitedPrepared(new_entry);
@@ -560,7 +599,9 @@ impl RefStoreImpl {
                                     Some(root) => art_delete(Arc::clone(root), &key, 0),
                                 };
                                 let new_root_arc = Arc::new(new_root_opt);
-                                let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                                let prev = self
+                                    .root
+                                    .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                                 if Arc::ptr_eq(&prev, &current_arc) {
                                     return AppliedOutcome::AbortedPrepared;
                                 }
@@ -568,7 +609,9 @@ impl RefStoreImpl {
                                 let new_slot = RefSlot::committed(slot.committed.clone());
                                 let new_root = art_insert(current_root.clone(), &key, new_slot, 0);
                                 let new_root_arc = Arc::new(Some(new_root));
-                                let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+                                let prev = self
+                                    .root
+                                    .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                                 if Arc::ptr_eq(&prev, &current_arc) {
                                     return AppliedOutcome::AbortedPrepared;
                                 }
@@ -644,7 +687,14 @@ impl RefStoreImpl {
                     }
                     (None, Some(exp)) => {
                         // update but absent → version-0 sentinel as the "current".
-                        conflicts.push((name.clone(), RefEntry { target: *exp, hlc: 0, version: 0 }));
+                        conflicts.push((
+                            name.clone(),
+                            RefEntry {
+                                target: *exp,
+                                hlc: 0,
+                                version: 0,
+                            },
+                        ));
                     }
                     (Some(existing), Some(exp)) if existing.target != *exp => {
                         conflicts.push((name.clone(), existing.clone())); // stale CAS
@@ -655,7 +705,11 @@ impl RefStoreImpl {
                         debug_assert!(new_version >= 1, "version invariant: >= 1");
                         planned.push((
                             name.clone(),
-                            RefEntry { target: *target, hlc: *hlc, version: new_version },
+                            RefEntry {
+                                target: *target,
+                                hlc: *hlc,
+                                version: new_version,
+                            },
                         ));
                     }
                 }
@@ -679,15 +733,21 @@ impl RefStoreImpl {
             let new_root_arc = Arc::new(new_root);
 
             // Single atomic publish.
-            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+            let prev = self
+                .root
+                .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
             if Arc::ptr_eq(&prev, &current_arc) {
                 // One WAL frame per applied ref (the batch is logically one txn;
                 // recovery replays them in order to the same committed state).
                 for (name, entry) in &planned {
-                    if let Err(e) = self.wal.append(&WalEntry::Update {
-                        name: name.as_str().to_string(),
-                        entry: entry.clone(),
-                    }).await {
+                    if let Err(e) = self
+                        .wal
+                        .append(&WalEntry::Update {
+                            name: name.as_str().to_string(),
+                            entry: entry.clone(),
+                        })
+                        .await
+                    {
                         warn!("commit_batch WAL append failed for {name:?}: {e:?}");
                     }
                 }
@@ -753,7 +813,12 @@ impl RefStore for RefStoreImpl {
     /// Version starts at 1 for new refs and increments by 1 on each update.
     /// `debug_assert!` guards the version ≥ 1 invariant on every write path.
     #[instrument(skip(self), fields(ref_name = %name))]
-    async fn update(&self, name: &RefName, new: ObjectId, expected: Option<ObjectId>) -> Result<RefEntry> {
+    async fn update(
+        &self,
+        name: &RefName,
+        new: ObjectId,
+        expected: Option<ObjectId>,
+    ) -> Result<RefEntry> {
         let key = name.as_str().as_bytes().to_vec();
 
         loop {
@@ -771,7 +836,9 @@ impl RefStore for RefStoreImpl {
             // resolved (commit/abort) before any single-ref write may proceed.
             if let Some(slot) = &current_slot {
                 if slot.prepared.is_some() {
-                    return Err(LedgeError::Conflict { current: slot.committed.clone() });
+                    return Err(LedgeError::Conflict {
+                        current: slot.committed.clone(),
+                    });
                 }
             }
 
@@ -785,7 +852,9 @@ impl RefStore for RefStoreImpl {
             match (&current_entry, &expected) {
                 // create (expected = None) but ref already exists → Conflict.
                 (Some(existing), None) => {
-                    return Err(LedgeError::Conflict { current: existing.clone() });
+                    return Err(LedgeError::Conflict {
+                        current: existing.clone(),
+                    });
                 }
                 // update (expected = Some) but ref does not exist → NotFound.
                 (None, Some(_)) => {
@@ -793,7 +862,9 @@ impl RefStore for RefStoreImpl {
                 }
                 // update but wrong target → Conflict.
                 (Some(existing), Some(exp_oid)) if existing.target != *exp_oid => {
-                    return Err(LedgeError::Conflict { current: existing.clone() });
+                    return Err(LedgeError::Conflict {
+                        current: existing.clone(),
+                    });
                 }
                 // All other cases are valid (create with None, update with matching id).
                 _ => {}
@@ -802,7 +873,10 @@ impl RefStore for RefStoreImpl {
             // Compute the new version (1-based; new ref starts at 1).
             let new_version = current_entry.as_ref().map(|e| e.version + 1).unwrap_or(1);
             // Per spec: version must always be >= 1 on the write path.
-            debug_assert!(new_version >= 1, "version invariant violated: version must be >= 1");
+            debug_assert!(
+                new_version >= 1,
+                "version invariant violated: version must be >= 1"
+            );
 
             let new_entry = RefEntry {
                 target: new,
@@ -820,13 +894,17 @@ impl RefStore for RefStoreImpl {
             let new_root_arc = Arc::new(Some(new_root));
 
             // Attempt the atomic swap.
-            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+            let prev = self
+                .root
+                .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
             if Arc::ptr_eq(&prev, &current_arc) {
                 // CAS succeeded — commit to WAL then return.
-                self.wal.append(&WalEntry::Update {
-                    name: name.as_str().to_string(),
-                    entry: new_entry.clone(),
-                }).await?;
+                self.wal
+                    .append(&WalEntry::Update {
+                        name: name.as_str().to_string(),
+                        entry: new_entry.clone(),
+                    })
+                    .await?;
                 debug!(version = new_entry.version, "ref committed");
                 return Ok(new_entry);
             }
@@ -858,7 +936,9 @@ impl RefStore for RefStoreImpl {
 
             // A prepared lock makes the ref busy: it must be resolved first.
             if current_slot.prepared.is_some() {
-                return Err(LedgeError::Conflict { current: current_slot.committed.clone() });
+                return Err(LedgeError::Conflict {
+                    current: current_slot.committed.clone(),
+                });
             }
 
             // A version-0 sentinel committed means the ref is logically absent.
@@ -868,7 +948,9 @@ impl RefStore for RefStoreImpl {
             let current_entry = current_slot.committed.clone();
 
             if current_entry.target != expected {
-                return Err(LedgeError::Conflict { current: current_entry });
+                return Err(LedgeError::Conflict {
+                    current: current_entry,
+                });
             }
 
             // Produce the new root without the deleted key.
@@ -878,12 +960,16 @@ impl RefStore for RefStoreImpl {
             };
             let new_root_arc = Arc::new(new_root_opt);
 
-            let prev = self.root.compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
+            let prev = self
+                .root
+                .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
             if Arc::ptr_eq(&prev, &current_arc) {
-                self.wal.append(&WalEntry::Delete {
-                    name: name.as_str().to_string(),
-                    hlc: self.hlc.tick(),
-                }).await?;
+                self.wal
+                    .append(&WalEntry::Delete {
+                        name: name.as_str().to_string(),
+                        hlc: self.hlc.tick(),
+                    })
+                    .await?;
                 return Ok(());
             }
             // CAS lost — retry.
@@ -934,9 +1020,9 @@ impl RefStore for RefStoreImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledge_core::{ObjectId, RefName, TxnId, HLC};
     use std::sync::Arc;
     use tempfile::tempdir;
-    use ledge_core::{HLC, ObjectId, RefName, TxnId};
 
     fn make_store() -> RefStoreImpl {
         let dir = tempdir().unwrap();
@@ -995,7 +1081,10 @@ mod tests {
         store.update(&n, t, None).await.unwrap();
         // Second create with expected = None must fail.
         let res = store.update(&n, oid(2), None).await;
-        assert!(matches!(res, Err(LedgeError::Conflict { .. })), "expected Conflict, got {res:?}");
+        assert!(
+            matches!(res, Err(LedgeError::Conflict { .. })),
+            "expected Conflict, got {res:?}"
+        );
     }
 
     // ── 4. update with wrong expected → Conflict ────────────────────────────
@@ -1031,7 +1120,10 @@ mod tests {
         store.update(&n, t, None).await.unwrap();
         let res = store.delete(&n, oid(0xbb)).await;
         assert!(matches!(res, Err(LedgeError::Conflict { .. })));
-        assert!(store.get(&n).await.unwrap().is_some(), "ref must survive a failed delete");
+        assert!(
+            store.get(&n).await.unwrap().is_some(),
+            "ref must survive a failed delete"
+        );
     }
 
     // ── 7. list by prefix ───────────────────────────────────────────────────
@@ -1063,7 +1155,11 @@ mod tests {
         // Mutate the live store.
         store.update(&n, t2, Some(t1)).await.unwrap();
         // Snapshot must still reflect t1.
-        assert_eq!(snap.get(&n).unwrap().target, t1, "snapshot must be isolated from writes");
+        assert_eq!(
+            snap.get(&n).unwrap().target,
+            t1,
+            "snapshot must be isolated from writes"
+        );
         // Live store reflects t2.
         assert_eq!(store.get(&n).await.unwrap().unwrap().target, t2);
     }
@@ -1087,7 +1183,10 @@ mod tests {
             AppliedOutcome::Updated(entry) => {
                 assert_eq!(entry.target, t);
                 assert_eq!(entry.version, 1, "first write is version 1");
-                assert_eq!(entry.hlc, 777, "apply_op must use the SUPPLIED hlc, not tick()");
+                assert_eq!(
+                    entry.hlc, 777,
+                    "apply_op must use the SUPPLIED hlc, not tick()"
+                );
             }
             other => panic!("expected Updated, got {other:?}"),
         }
@@ -1103,10 +1202,20 @@ mod tests {
         let n = name("refs/heads/appliedv");
         let (t1, t2) = (oid(1), oid(2));
         let _ = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: t1, expected: None, hlc: 10 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: t1,
+                expected: None,
+                hlc: 10,
+            })
             .await;
         let outcome = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: t2, expected: Some(t1), hlc: 20 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: t2,
+                expected: Some(t1),
+                hlc: 20,
+            })
             .await;
         match outcome {
             AppliedOutcome::Updated(e) => {
@@ -1123,14 +1232,28 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/appliedcas");
         let _ = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(1), expected: None, hlc: 1 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: oid(1),
+                expected: None,
+                hlc: 1,
+            })
             .await;
         let outcome = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(2), expected: Some(oid(99)), hlc: 2 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(99)),
+                hlc: 2,
+            })
             .await;
         match outcome {
             AppliedOutcome::Conflict(current) => {
-                assert_eq!(current.target, oid(1), "conflict surfaces the current entry");
+                assert_eq!(
+                    current.target,
+                    oid(1),
+                    "conflict surfaces the current entry"
+                );
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
@@ -1141,10 +1264,20 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/applieddup");
         let _ = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(1), expected: None, hlc: 1 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: oid(1),
+                expected: None,
+                hlc: 1,
+            })
             .await;
         let outcome = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(2), expected: None, hlc: 2 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: oid(2),
+                expected: None,
+                hlc: 2,
+            })
             .await;
         assert!(matches!(outcome, AppliedOutcome::Conflict(_)));
     }
@@ -1155,17 +1288,30 @@ mod tests {
         let n = name("refs/heads/applieddel");
         let t = oid(0xdd);
         let _ = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: t, expected: None, hlc: 1 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: t,
+                expected: None,
+                hlc: 1,
+            })
             .await;
         let outcome = store
-            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: t, hlc: 2 })
+            .apply_op(&AppliedOp::Delete {
+                name: n.clone(),
+                expected: t,
+                hlc: 2,
+            })
             .await;
         assert!(matches!(outcome, AppliedOutcome::Deleted));
         assert!(store.get(&n).await.unwrap().is_none());
 
         // Deleting a now-missing ref → NotFound.
         let outcome = store
-            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: t, hlc: 3 })
+            .apply_op(&AppliedOp::Delete {
+                name: n.clone(),
+                expected: t,
+                hlc: 3,
+            })
             .await;
         assert!(matches!(outcome, AppliedOutcome::NotFound));
     }
@@ -1175,13 +1321,25 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/applieddelcas");
         let _ = store
-            .apply_op(&AppliedOp::Update { name: n.clone(), target: oid(0xaa), expected: None, hlc: 1 })
+            .apply_op(&AppliedOp::Update {
+                name: n.clone(),
+                target: oid(0xaa),
+                expected: None,
+                hlc: 1,
+            })
             .await;
         let outcome = store
-            .apply_op(&AppliedOp::Delete { name: n.clone(), expected: oid(0xbb), hlc: 2 })
+            .apply_op(&AppliedOp::Delete {
+                name: n.clone(),
+                expected: oid(0xbb),
+                hlc: 2,
+            })
             .await;
         assert!(matches!(outcome, AppliedOutcome::Conflict(_)));
-        assert!(store.get(&n).await.unwrap().is_some(), "ref survives a failed delete");
+        assert!(
+            store.get(&n).await.unwrap().is_some(),
+            "ref survives a failed delete"
+        );
     }
 
     // ── restore_from: snapshot install preserves exact RefEntry ─────────────────
@@ -1191,7 +1349,11 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/restored");
         // A source entry that has been updated several times: version=5, hlc=999.
-        let entry = RefEntry { target: oid(7), hlc: 999, version: 5 };
+        let entry = RefEntry {
+            target: oid(7),
+            hlc: 999,
+            version: 5,
+        };
         store
             .restore_from(vec![(n.clone(), entry.clone())])
             .await
@@ -1219,18 +1381,32 @@ mod tests {
             store
                 .restore_from(vec![(
                     fresh.clone(),
-                    RefEntry { target: oid(2), hlc: 555, version: 3 },
+                    RefEntry {
+                        target: oid(2),
+                        hlc: 555,
+                        version: 3,
+                    },
                 )])
                 .await
                 .unwrap();
-            assert!(store.get(&stale).await.unwrap().is_none(), "restore replaces the set");
+            assert!(
+                store.get(&stale).await.unwrap().is_none(),
+                "restore replaces the set"
+            );
             assert_eq!(store.get(&fresh).await.unwrap().unwrap().version, 3);
         }
 
         // Reopen: the WAL checkpoint must reproduce the restored state exactly.
         let store2 = RefStoreImpl::open(data_dir, Arc::new(HLC::new())).unwrap();
-        assert!(store2.get(&stale).await.unwrap().is_none(), "stale ref gone after reopen");
-        let got = store2.get(&fresh).await.unwrap().expect("fresh ref durable");
+        assert!(
+            store2.get(&stale).await.unwrap().is_none(),
+            "stale ref gone after reopen"
+        );
+        let got = store2
+            .get(&fresh)
+            .await
+            .unwrap()
+            .expect("fresh ref durable");
         assert_eq!(got.version, 3, "version durable across reopen");
         assert_eq!(got.hlc, 555);
         assert_eq!(got.target, oid(2));
@@ -1253,7 +1429,11 @@ mod tests {
 
         // Open a fresh instance from the same directory and verify state is restored.
         let store2 = RefStoreImpl::open(data_dir, Arc::new(HLC::new())).unwrap();
-        let entry = store2.get(&n).await.unwrap().expect("ref must survive a store reopen");
+        let entry = store2
+            .get(&n)
+            .await
+            .unwrap()
+            .expect("ref must survive a store reopen");
         assert_eq!(entry.target, t);
         assert_eq!(entry.version, 1);
     }
@@ -1266,8 +1446,12 @@ mod tests {
         store.update(&n, oid(1), None).await.unwrap();
         let outcome = store
             .apply_op(&AppliedOp::Prepare {
-                txn_id: txn(1), coord_shard: 0, name: n.clone(),
-                target: oid(2), expected: Some(oid(1)), hlc: 50,
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 50,
             })
             .await;
         assert_eq!(outcome, AppliedOutcome::VoteYes);
@@ -1281,15 +1465,27 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/prep2");
         store.update(&n, oid(1), None).await.unwrap();
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(1)), hlc: 50,
-        }).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 50,
+            })
+            .await;
         // A different txn cannot prepare the same ref (no-wait): votes NO.
-        let outcome = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(2), coord_shard: 0, name: n.clone(),
-            target: oid(3), expected: Some(oid(1)), hlc: 60,
-        }).await;
+        let outcome = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(2),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(3),
+                expected: Some(oid(1)),
+                hlc: 60,
+            })
+            .await;
         assert_eq!(outcome, AppliedOutcome::VoteNo);
     }
 
@@ -1300,10 +1496,16 @@ mod tests {
         let n = name("refs/heads/prep3");
         store.update(&n, oid(1), None).await.unwrap();
         // expected oid(9) != committed oid(1).
-        let outcome = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(9)), hlc: 50,
-        }).await;
+        let outcome = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(9)),
+                hlc: 50,
+            })
+            .await;
         assert_eq!(outcome, AppliedOutcome::VoteNo);
         // No lock taken → a normal update still works.
         store.update(&n, oid(2), Some(oid(1))).await.unwrap();
@@ -1315,13 +1517,22 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/cp");
         store.update(&n, oid(1), None).await.unwrap(); // version 1
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(1)), hlc: 777,
-        }).await;
-        let outcome = store.apply_op(&AppliedOp::CommitPrepared {
-            txn_id: txn(1), name: n.clone(),
-        }).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 777,
+            })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::CommitPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
         match outcome {
             AppliedOutcome::CommitedPrepared(e) => {
                 assert_eq!(e.target, oid(2));
@@ -1341,13 +1552,29 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/cpidem");
         store.update(&n, oid(1), None).await.unwrap();
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(1)), hlc: 777,
-        }).await;
-        let _ = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 777,
+            })
+            .await;
+        let _ = store
+            .apply_op(&AppliedOp::CommitPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
         // Re-applying CommitPrepared returns the CURRENT committed (idempotent, no double-bump).
-        let again = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        let again = store
+            .apply_op(&AppliedOp::CommitPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
         match again {
             AppliedOutcome::CommitedPrepared(e) => {
                 assert_eq!(e.version, 2, "no second version bump on replay");
@@ -1363,11 +1590,22 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/ap");
         store.update(&n, oid(1), None).await.unwrap();
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(1)), hlc: 777,
-        }).await;
-        let outcome = store.apply_op(&AppliedOp::AbortPrepared { txn_id: txn(1), name: n.clone() }).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 777,
+            })
+            .await;
+        let outcome = store
+            .apply_op(&AppliedOp::AbortPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
         assert_eq!(outcome, AppliedOutcome::AbortedPrepared);
         // Committed is still oid(1) version 1; lock gone so update works.
         let got = store.get(&n).await.unwrap().unwrap();
@@ -1382,8 +1620,17 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/apidem");
         store.update(&n, oid(1), None).await.unwrap();
-        let outcome = store.apply_op(&AppliedOp::AbortPrepared { txn_id: txn(1), name: n.clone() }).await;
-        assert_eq!(outcome, AppliedOutcome::AbortedPrepared, "abort of an unheld lock is a no-op");
+        let outcome = store
+            .apply_op(&AppliedOp::AbortPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            AppliedOutcome::AbortedPrepared,
+            "abort of an unheld lock is a no-op"
+        );
     }
 
     // ── Prepare to CREATE an absent ref (expected=None) ───────────────────────
@@ -1391,14 +1638,25 @@ mod tests {
     async fn prepare_create_absent_ref_votes_yes() {
         let store = make_store();
         let n = name("refs/heads/prepnew");
-        let outcome = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: None, hlc: 50,
-        }).await;
+        let outcome = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: None,
+                hlc: 50,
+            })
+            .await;
         assert_eq!(outcome, AppliedOutcome::VoteYes);
         // Still absent (staged-not-committed) until CommitPrepared.
         assert!(store.get(&n).await.unwrap().is_none());
-        let cp = store.apply_op(&AppliedOp::CommitPrepared { txn_id: txn(1), name: n.clone() }).await;
+        let cp = store
+            .apply_op(&AppliedOp::CommitPrepared {
+                txn_id: txn(1),
+                name: n.clone(),
+            })
+            .await;
         match cp {
             AppliedOutcome::CommitedPrepared(e) => {
                 assert_eq!(e.target, oid(2));
@@ -1414,10 +1672,16 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/prepdup");
         store.update(&n, oid(1), None).await.unwrap();
-        let outcome = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: None, hlc: 50,
-        }).await;
+        let outcome = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: None,
+                hlc: 50,
+            })
+            .await;
         assert_eq!(outcome, AppliedOutcome::VoteNo);
     }
 
@@ -1427,14 +1691,26 @@ mod tests {
         let store = make_store();
         let n = name("refs/heads/lockedw");
         store.update(&n, oid(1), None).await.unwrap();
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: n.clone(),
-            target: oid(2), expected: Some(oid(1)), hlc: 50,
-        }).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: n.clone(),
+                target: oid(2),
+                expected: Some(oid(1)),
+                hlc: 50,
+            })
+            .await;
         let res = store.update(&n, oid(9), Some(oid(1))).await;
-        assert!(matches!(res, Err(LedgeError::Conflict { .. })), "a locked ref is busy");
+        assert!(
+            matches!(res, Err(LedgeError::Conflict { .. })),
+            "a locked ref is busy"
+        );
         let res2 = store.delete(&n, oid(1)).await;
-        assert!(matches!(res2, Err(LedgeError::Conflict { .. })), "delete on a locked ref conflicts too");
+        assert!(
+            matches!(res2, Err(LedgeError::Conflict { .. })),
+            "delete on a locked ref conflicts too"
+        );
     }
 
     // ── commit_batch: all preconditions hold → all applied atomically ─────────
@@ -1445,10 +1721,12 @@ mod tests {
         let b = name("refs/heads/b");
         store.update(&a, oid(1), None).await.unwrap(); // v1
         store.update(&b, oid(1), None).await.unwrap(); // v1
-        let res = store.commit_batch(vec![
-            (a.clone(), oid(2), Some(oid(1)), 100),
-            (b.clone(), oid(3), Some(oid(1)), 100),
-        ]).await;
+        let res = store
+            .commit_batch(vec![
+                (a.clone(), oid(2), Some(oid(1)), 100),
+                (b.clone(), oid(3), Some(oid(1)), 100),
+            ])
+            .await;
         let applied = res.expect("all preconditions hold");
         assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].target, oid(2));
@@ -1466,10 +1744,12 @@ mod tests {
         let store = make_store();
         let a = name("refs/heads/newa");
         let b = name("refs/heads/newb");
-        let res = store.commit_batch(vec![
-            (a.clone(), oid(2), None, 100),
-            (b.clone(), oid(3), None, 100),
-        ]).await;
+        let res = store
+            .commit_batch(vec![
+                (a.clone(), oid(2), None, 100),
+                (b.clone(), oid(3), None, 100),
+            ])
+            .await;
         let applied = res.expect("creates succeed");
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[1].version, 1);
@@ -1485,16 +1765,30 @@ mod tests {
         store.update(&a, oid(1), None).await.unwrap();
         store.update(&b, oid(1), None).await.unwrap();
         // Second op has a stale expected → whole batch must be a no-op.
-        let res = store.commit_batch(vec![
-            (a.clone(), oid(2), Some(oid(1)), 100),  // would succeed
-            (b.clone(), oid(3), Some(oid(9)), 100),  // stale → conflict
-        ]).await;
+        let res = store
+            .commit_batch(vec![
+                (a.clone(), oid(2), Some(oid(1)), 100), // would succeed
+                (b.clone(), oid(3), Some(oid(9)), 100), // stale → conflict
+            ])
+            .await;
         let conflicts = res.expect_err("one stale precondition aborts the batch");
-        assert!(conflicts.iter().any(|(n, cur)| n == &b && cur.target == oid(1)),
-            "conflict reports b's current committed target");
+        assert!(
+            conflicts
+                .iter()
+                .any(|(n, cur)| n == &b && cur.target == oid(1)),
+            "conflict reports b's current committed target"
+        );
         // ATOMICITY: neither ref advanced.
-        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(1), "a untouched");
-        assert_eq!(store.get(&b).await.unwrap().unwrap().target, oid(1), "b untouched");
+        assert_eq!(
+            store.get(&a).await.unwrap().unwrap().target,
+            oid(1),
+            "a untouched"
+        );
+        assert_eq!(
+            store.get(&b).await.unwrap().unwrap().target,
+            oid(1),
+            "b untouched"
+        );
         assert_eq!(store.get(&a).await.unwrap().unwrap().version, 1);
     }
 
@@ -1506,15 +1800,27 @@ mod tests {
         let b = name("refs/heads/lb");
         store.update(&a, oid(1), None).await.unwrap();
         store.update(&b, oid(1), None).await.unwrap();
-        let _ = store.apply_op(&AppliedOp::Prepare {
-            txn_id: txn(1), coord_shard: 0, name: b.clone(),
-            target: oid(7), expected: Some(oid(1)), hlc: 50,
-        }).await;
-        let res = store.commit_batch(vec![
-            (a.clone(), oid(2), Some(oid(1)), 100),
-            (b.clone(), oid(3), Some(oid(1)), 100), // b is locked → conflict
-        ]).await;
+        let _ = store
+            .apply_op(&AppliedOp::Prepare {
+                txn_id: txn(1),
+                coord_shard: 0,
+                name: b.clone(),
+                target: oid(7),
+                expected: Some(oid(1)),
+                hlc: 50,
+            })
+            .await;
+        let res = store
+            .commit_batch(vec![
+                (a.clone(), oid(2), Some(oid(1)), 100),
+                (b.clone(), oid(3), Some(oid(1)), 100), // b is locked → conflict
+            ])
+            .await;
         assert!(res.is_err(), "a batch touching a locked ref aborts");
-        assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(1), "a not advanced");
+        assert_eq!(
+            store.get(&a).await.unwrap().unwrap().target,
+            oid(1),
+            "a not advanced"
+        );
     }
 }

@@ -46,7 +46,10 @@ impl LfsStore {
 
     /// A valid LFS oid is 64 lowercase hex chars (a SHA-256).
     fn valid_oid(oid: &str) -> bool {
-        oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        oid.len() == 64
+            && oid
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     }
 
     pub fn has(&self, oid: &str) -> bool {
@@ -171,23 +174,53 @@ pub async fn lfs_batch(
             let href = format!("{base}/{}", o.oid);
             if download {
                 if store.has(&o.oid) {
-                    ObjectResp { oid: o.oid.clone(), size: o.size, authenticated: Some(true), actions: Some(Actions { download: Some(Act { href }), upload: None }), error: None }
+                    ObjectResp {
+                        oid: o.oid.clone(),
+                        size: o.size,
+                        authenticated: Some(true),
+                        actions: Some(Actions {
+                            download: Some(Act { href }),
+                            upload: None,
+                        }),
+                        error: None,
+                    }
                 } else {
-                    ObjectResp { oid: o.oid.clone(), size: o.size, authenticated: None, actions: None, error: Some(ObjError { code: 404, message: "object not found".into() }) }
+                    ObjectResp {
+                        oid: o.oid.clone(),
+                        size: o.size,
+                        authenticated: None,
+                        actions: None,
+                        error: Some(ObjError {
+                            code: 404,
+                            message: "object not found".into(),
+                        }),
+                    }
                 }
             } else {
                 // upload: omit the action for objects we already hold (client skips them).
                 let actions = if store.has(&o.oid) {
                     None
                 } else {
-                    Some(Actions { download: None, upload: Some(Act { href }) })
+                    Some(Actions {
+                        download: None,
+                        upload: Some(Act { href }),
+                    })
                 };
-                ObjectResp { oid: o.oid.clone(), size: o.size, authenticated: Some(true), actions, error: None }
+                ObjectResp {
+                    oid: o.oid.clone(),
+                    size: o.size,
+                    authenticated: Some(true),
+                    actions,
+                    error: None,
+                }
             }
         })
         .collect();
 
-    let body = BatchResponse { transfer: "basic", objects };
+    let body = BatchResponse {
+        transfer: "basic",
+        objects,
+    };
     (
         StatusCode::OK,
         [("content-type", "application/vnd.git-lfs+json")],

@@ -79,7 +79,10 @@ async fn two_tenant(
 /// Write a real git blob so wire discovery can resolve its SHA-1; return the
 /// BLAKE3 [`ObjectId`] to point a ref at. (Synthetic ids would 500 the advertise
 /// when the wire layer fails to resolve a non-existent object's SHA-1.)
-async fn seed_blob(objects: &ledge_object_store::DiskObjectStore, content: &'static [u8]) -> ObjectId {
+async fn seed_blob(
+    objects: &ledge_object_store::DiskObjectStore,
+    content: &'static [u8],
+) -> ObjectId {
     objects
         .write_git_object(3, axum::body::Bytes::from_static(content))
         .await
@@ -186,10 +189,22 @@ async fn foreign_workspace_is_404_everywhere() {
 
     let cases = [
         ("GET", format!("/workspaces/{id}"), ""),
-        ("POST", format!("/workspaces/{id}/renew"), r#"{"ttl_seconds":60}"#),
-        ("POST", format!("/workspaces/{id}/commit"), r#"{"mappings":{}}"#),
+        (
+            "POST",
+            format!("/workspaces/{id}/renew"),
+            r#"{"ttl_seconds":60}"#,
+        ),
+        (
+            "POST",
+            format!("/workspaces/{id}/commit"),
+            r#"{"mappings":{}}"#,
+        ),
         ("DELETE", format!("/workspaces/{id}"), ""),
-        ("GET", format!("/ws/{id}/info/refs?service=git-upload-pack"), ""),
+        (
+            "GET",
+            format!("/ws/{id}/info/refs?service=git-upload-pack"),
+            "",
+        ),
     ];
     for (method, uri, body) in cases {
         let r = app
@@ -364,7 +379,11 @@ async fn over_quota_commit_is_507_through_rest() {
         )
         .await
         .unwrap();
-    assert!(fork.status().is_success(), "fork must succeed: {}", fork.status());
+    assert!(
+        fork.status().is_success(),
+        "fork must succeed: {}",
+        fork.status()
+    );
     let body = to_bytes(fork.into_body(), 1 << 20).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let id = v["id"].as_str().unwrap().to_string();
@@ -373,7 +392,10 @@ async fn over_quota_commit_is_507_through_rest() {
     let mut m = std::collections::HashMap::new();
     m.insert(
         "acme".to_string(),
-        ledge_workspace::TenantUsage { bytes: 1000, objects: 1 },
+        ledge_workspace::TenantUsage {
+            bytes: 1000,
+            objects: 1,
+        },
     );
     usage.store(Arc::new(m));
 

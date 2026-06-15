@@ -129,7 +129,11 @@ mod tests {
     async fn dispatch_empty_store_is_noop() {
         let d = WebhookDispatcher::new(Arc::new(WebhookStore::in_memory()));
         // No webhooks registered ⇒ no delivery spawned, no panic.
-        d.dispatch("acme", EventKind::RefCommitted, serde_json::json!({"event":"ref.committed"}));
+        d.dispatch(
+            "acme",
+            EventKind::RefCommitted,
+            serde_json::json!({"event":"ref.committed"}),
+        );
         assert_eq!(d.store().count(), 0);
     }
 }

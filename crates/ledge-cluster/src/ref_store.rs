@@ -33,9 +33,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use ledge_core::{
-    HLC, LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result,
-};
+use ledge_core::{LedgeError, ObjectId, RefEntry, RefName, RefSnapshot, RefStore, Result, HLC};
 use ledge_raft::{LedgeOp, LedgeResp, ReadHandle, TypeConfig};
 use ledge_workspace::{id::WorkspaceId, lease::Lease};
 use openraft::Raft;
@@ -375,7 +373,12 @@ impl RefStore for ClusterRefStore {
         if !self.hosts_locally(shard) {
             return match self
                 .forwarder
-                .forward(shard, ClusterOp::Get { name: name.as_str().to_string() })
+                .forward(
+                    shard,
+                    ClusterOp::Get {
+                        name: name.as_str().to_string(),
+                    },
+                )
                 .await?
             {
                 RefOpResponse::Entry(e) => Ok(e),
@@ -423,7 +426,9 @@ impl RefStore for ClusterRefStore {
                 RefOpResponse::Updated(e) => Ok(e),
                 RefOpResponse::Conflict(c) => Err(LedgeError::Conflict { current: c }),
                 RefOpResponse::NotFound => Err(LedgeError::NotFound(new)),
-                other => Err(infra(format!("unexpected forward resp for update: {other:?}"))),
+                other => Err(infra(format!(
+                    "unexpected forward resp for update: {other:?}"
+                ))),
             };
         }
         // Local shard: existing Phase-3 fast path (HLC ticked on the leader at
@@ -457,7 +462,9 @@ impl RefStore for ClusterRefStore {
                 RefOpResponse::Deleted => Ok(()),
                 RefOpResponse::Conflict(c) => Err(LedgeError::Conflict { current: c }),
                 RefOpResponse::NotFound => Err(LedgeError::NotFound(expected)),
-                other => Err(infra(format!("unexpected forward resp for delete: {other:?}"))),
+                other => Err(infra(format!(
+                    "unexpected forward resp for delete: {other:?}"
+                ))),
             };
         }
         let leader = self.leader_of(shard).await?;
@@ -661,9 +668,7 @@ impl ClusterRefStore {
         ops: Vec<(String, [u8; 32], Option<[u8; 32]>)>,
     ) -> Result<Vec<ledge_raft::BatchOutcome>> {
         if !self.hosts_locally(shard) {
-            return Err(infra(
-                "remote single-shard batch forwarding not yet wired",
-            ));
+            return Err(infra("remote single-shard batch forwarding not yet wired"));
         }
         let leader = self.leader_of(shard).await?;
         // Build the wire batch, stamping a monotonically increasing HLC per op.
@@ -801,9 +806,9 @@ impl ClusterRefStore {
                     // retries are safe (idempotent re-resolve). Callers that want
                     // the rolled-forward entry already got it on the first apply.
                     LedgeResp::AbortedPrepared => Ok(RefOpResponse::AbortedPrepared),
-                    other => {
-                        Err(infra(format!("unexpected resp for commit-prepared: {other:?}")))
-                    }
+                    other => Err(infra(format!(
+                        "unexpected resp for commit-prepared: {other:?}"
+                    ))),
                 }
             }
             ClusterOp::AbortPrepared { txn_id, name } => {
@@ -814,7 +819,9 @@ impl ClusterRefStore {
                     // apply always returns `AbortedPrepared`, whether it released a
                     // lock or found none). This makes presumed-abort retries safe.
                     LedgeResp::AbortedPrepared => Ok(RefOpResponse::AbortedPrepared),
-                    other => Err(infra(format!("unexpected resp for abort-prepared: {other:?}"))),
+                    other => Err(infra(format!(
+                        "unexpected resp for abort-prepared: {other:?}"
+                    ))),
                 }
             }
             ClusterOp::TxnStatus {
@@ -1022,7 +1029,10 @@ mod tests {
         assert_eq!(store.map().num_shards(), 0);
         let m = ShardMap::from_entries(vec![(
             ShardId(0),
-            vec![Replica { node_id: 1, addr: "http://a:3000".into() }],
+            vec![Replica {
+                node_id: 1,
+                addr: "http://a:3000".into(),
+            }],
         )])
         .unwrap();
         store.swap_placement(m);

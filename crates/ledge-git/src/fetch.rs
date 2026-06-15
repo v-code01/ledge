@@ -275,12 +275,15 @@ pub async fn handle_upload_pack_discovery(
             .find(|(n, _)| n == "refs/heads/main")
             .or_else(|| presented.iter().find(|(n, _)| n == "refs/heads/master"))
             .unwrap_or(&presented[0]);
-        let head_sha1 = sha1_store.sha1_of(default_ref.1.target).await.ok_or_else(|| {
-            LedgeError::Corruption(format!(
-                "no SHA-1 for HEAD target object {}",
-                default_ref.1.target.to_hex()
-            ))
-        })?;
+        let head_sha1 = sha1_store
+            .sha1_of(default_ref.1.target)
+            .await
+            .ok_or_else(|| {
+                LedgeError::Corruption(format!(
+                    "no SHA-1 for HEAD target object {}",
+                    default_ref.1.target.to_hex()
+                ))
+            })?;
         let head_sha1_hex = hex::encode(head_sha1);
         let default_name = default_ref.0.clone();
 
@@ -304,9 +307,9 @@ pub async fn handle_upload_pack_discovery(
                     ref_name
                 ))
             })?;
-            out.extend_from_slice(
-                &encode(format!("{} {}\n", hex::encode(sha1), ref_name).as_bytes()),
-            );
+            out.extend_from_slice(&encode(
+                format!("{} {}\n", hex::encode(sha1), ref_name).as_bytes(),
+            ));
         }
     }
     out.extend_from_slice(&encode_flush());
@@ -398,7 +401,9 @@ async fn collect_pack_objects(
             match filter {
                 BlobFilter::NoBlobs => continue,
                 BlobFilter::BlobLimit(n) => {
-                    let Ok(content) = objects.read(obj_id).await else { continue };
+                    let Ok(content) = objects.read(obj_id).await else {
+                        continue;
+                    };
                     if content.len() <= n {
                         pack_objects.push((3, content));
                     }
@@ -529,8 +534,12 @@ async fn collect_shallow(
         if !seen.insert(*sha) {
             continue;
         }
-        let Some(oid) = idx.get(sha).copied() else { continue };
-        let Ok(content) = objects.read(oid).await else { continue };
+        let Some(oid) = idx.get(sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
         let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
         match ty {
             1 => {
@@ -551,8 +560,12 @@ async fn collect_shallow(
         if !seen.insert(sha) {
             continue;
         }
-        let Some(oid) = idx.get(&sha).copied() else { continue };
-        let Ok(content) = objects.read(oid).await else { continue };
+        let Some(oid) = idx.get(&sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
         let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
         if ty == 2 {
             for c in tree_child_sha1s(&content) {
@@ -702,8 +715,8 @@ pub async fn handle_upload_pack(
             resp.extend_from_slice(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()));
         }
         resp.extend_from_slice(&encode_flush()); // end of shallow-info
-        // The no-`done` probe round gets ONLY the shallow-info; the `done` round
-        // additionally gets NAK + the depth-bounded pack.
+                                                 // The no-`done` probe round gets ONLY the shallow-info; the `done` round
+                                                 // additionally gets NAK + the depth-bounded pack.
         if done {
             resp.extend_from_slice(&encode(b"NAK\n"));
             resp.extend_from_slice(&encode_pack(&pack_objects));
@@ -1001,7 +1014,9 @@ pub(crate) async fn read_pkt<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> std:
     let len = std::str::from_utf8(&hdr)
         .ok()
         .and_then(|h| usize::from_str_radix(h, 16).ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pkt-line length"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pkt-line length")
+        })?;
     match len {
         0 => Ok(PktIn::Flush),
         1 => Ok(PktIn::Delim),
@@ -1061,7 +1076,8 @@ where
     use tokio::io::AsyncWriteExt;
 
     // 1. Advertise refs (the bare, no-"# service" form).
-    let http = handle_upload_pack_discovery(objects.clone(), refs.clone(), sha1_store, segment).await?;
+    let http =
+        handle_upload_pack_discovery(objects.clone(), refs.clone(), sha1_store, segment).await?;
     let advert = ssh_advert_from_http(&http);
     stream.write_all(&advert).await.map_err(LedgeError::Io)?;
     stream.flush().await.map_err(LedgeError::Io)?;
@@ -1107,7 +1123,10 @@ where
                 .await
                 .map_err(LedgeError::Io)?;
         }
-        stream.write_all(&encode_flush()).await.map_err(LedgeError::Io)?;
+        stream
+            .write_all(&encode_flush())
+            .await
+            .map_err(LedgeError::Io)?;
         stream.flush().await.map_err(LedgeError::Io)?;
         // Drain the client's remaining negotiation (haves/done) until done/EOF.
         loop {
@@ -1124,7 +1143,10 @@ where
         }
         let pack = encode_pack(&pack_objects);
         record_upload_pack("shallow", "ssh", pack_objects.len());
-        stream.write_all(&encode(b"NAK\n")).await.map_err(LedgeError::Io)?;
+        stream
+            .write_all(&encode(b"NAK\n"))
+            .await
+            .map_err(LedgeError::Io)?;
         stream.write_all(&pack).await.map_err(LedgeError::Io)?;
         stream.flush().await.map_err(LedgeError::Io)?;
         return Ok(());
@@ -1138,7 +1160,10 @@ where
             PktIn::Eof => break,
             PktIn::Delim => {}
             PktIn::Flush => {
-                stream.write_all(&encode(b"NAK\n")).await.map_err(LedgeError::Io)?;
+                stream
+                    .write_all(&encode(b"NAK\n"))
+                    .await
+                    .map_err(LedgeError::Io)?;
                 stream.flush().await.map_err(LedgeError::Io)?;
             }
             PktIn::Data(d) => {
@@ -1161,7 +1186,11 @@ where
 
     // 4. Build the (incremental) pack and stream it after the ack line.
     let idx = sha1_store.sha1_index().await;
-    let commons: Vec<[u8; 20]> = haves.iter().copied().filter(|h| idx.contains_key(h)).collect();
+    let commons: Vec<[u8; 20]> = haves
+        .iter()
+        .copied()
+        .filter(|h| idx.contains_key(h))
+        .collect();
     let exclude = if commons.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -1464,14 +1493,29 @@ mod tests {
             cursor = rem;
             if let crate::pkt_line::PktLine::Data(d) = line {
                 let s = String::from_utf8_lossy(&d);
-                if s.contains(&sha1_hex) && s.contains("refs/heads/main") { saw_presented = true; }
-                if s.contains("refs/workspaces/abc/") { saw_stored = true; }
-                if s.contains("symref=HEAD:refs/heads/main") { saw_head_symref = true; }
+                if s.contains(&sha1_hex) && s.contains("refs/heads/main") {
+                    saw_presented = true;
+                }
+                if s.contains("refs/workspaces/abc/") {
+                    saw_stored = true;
+                }
+                if s.contains("symref=HEAD:refs/heads/main") {
+                    saw_head_symref = true;
+                }
             }
         }
-        assert!(saw_presented, "must advertise the stripped client name refs/heads/main");
-        assert!(!saw_stored, "must NOT leak the stored workspace-prefixed name");
-        assert!(saw_head_symref, "HEAD symref must point at the stripped name");
+        assert!(
+            saw_presented,
+            "must advertise the stripped client name refs/heads/main"
+        );
+        assert!(
+            !saw_stored,
+            "must NOT leak the stored workspace-prefixed name"
+        );
+        assert!(
+            saw_head_symref,
+            "HEAD symref must point at the stripped name"
+        );
     }
 
     #[tokio::test]
@@ -1698,7 +1742,10 @@ mod tests {
     fn present_ref_passes_through_non_matching_segment() {
         // A stored ref that does not begin with the segment is returned unchanged
         // (defensive: a list() prefix guarantees a match, but never panic).
-        assert_eq!(present_ref("refs/heads/main", "workspaces/abc/"), "refs/heads/main");
+        assert_eq!(
+            present_ref("refs/heads/main", "workspaces/abc/"),
+            "refs/heads/main"
+        );
     }
 
     #[test]
@@ -1797,7 +1844,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(cache.misses(), before_misses, "first clone must not miss after warm");
+        assert_eq!(
+            cache.misses(),
+            before_misses,
+            "first clone must not miss after warm"
+        );
         assert!(cache.hits() >= 1);
 
         // Bytes identical to a cold build.
@@ -1822,12 +1873,24 @@ mod tests {
         let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
         let refs_arc = refs.clone() as Arc<dyn ledge_core::RefStore>;
 
-        let a = warm_upload_pack(store.clone(), refs_arc.clone(), objects.as_ref(), "", &cache)
-            .await
-            .unwrap();
-        let b = warm_upload_pack(store.clone(), refs_arc.clone(), objects.as_ref(), "", &cache)
-            .await
-            .unwrap();
+        let a = warm_upload_pack(
+            store.clone(),
+            refs_arc.clone(),
+            objects.as_ref(),
+            "",
+            &cache,
+        )
+        .await
+        .unwrap();
+        let b = warm_upload_pack(
+            store.clone(),
+            refs_arc.clone(),
+            objects.as_ref(),
+            "",
+            &cache,
+        )
+        .await
+        .unwrap();
         assert_eq!(a, b, "idempotent warm returns the same count");
 
         // A segment with no refs warms nothing.
@@ -1847,7 +1910,10 @@ mod tests {
     fn segment_of_ref_derives_all_forms() {
         assert_eq!(segment_of_ref("refs/heads/main"), "");
         assert_eq!(segment_of_ref("refs/tags/v1"), "");
-        assert_eq!(segment_of_ref("refs/workspaces/abc/heads/main"), "workspaces/abc/");
+        assert_eq!(
+            segment_of_ref("refs/workspaces/abc/heads/main"),
+            "workspaces/abc/"
+        );
         assert_eq!(segment_of_ref("refs/tenants/acme/tags/v1"), "tenants/acme/");
         // Roundtrip against store_ref for every segment form.
         for seg in ["", "workspaces/abc/", "tenants/acme/"] {
@@ -1891,7 +1957,10 @@ mod tests {
     }
     /// Object count from a (possibly ACK-prefixed) upload-pack response.
     fn pack_count(resp: &[u8]) -> u32 {
-        let p = resp.windows(4).position(|w| w == b"PACK").expect("pack present");
+        let p = resp
+            .windows(4)
+            .position(|w| w == b"PACK")
+            .expect("pack present");
         u32::from_be_bytes([resp[p + 8], resp[p + 9], resp[p + 10], resp[p + 11]])
     }
 
@@ -1941,26 +2010,55 @@ mod tests {
         // (2 commits + 2 trees + 2 blobs).
         let full = handle_upload_pack(
             fetch_body(&[child], &[], true),
-            store.clone(), refs.clone(), objects.as_ref(), "", None,
-        ).await.unwrap();
+            store.clone(),
+            refs.clone(),
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
         assert!(full.starts_with(b"0008NAK\n"), "clone is NAK-framed");
         assert_eq!(pack_count(&full), 6, "clone sends the full closure");
 
         // Incremental fetch (have base): only child commit + child tree + new blob = 3.
         let incr = handle_upload_pack(
             fetch_body(&[child], &[base], true),
-            store.clone(), refs.clone(), objects.as_ref(), "", None,
-        ).await.unwrap();
+            store.clone(),
+            refs.clone(),
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
         let ack = format!("ACK {}\n", hex::encode(base));
-        assert!(incr.starts_with(&encode(ack.as_bytes())), "fetch ACKs the common base");
-        assert_eq!(pack_count(&incr), 3, "fetch sends ONLY the new objects, not the closure");
+        assert!(
+            incr.starts_with(&encode(ack.as_bytes())),
+            "fetch ACKs the common base"
+        );
+        assert_eq!(
+            pack_count(&incr),
+            3,
+            "fetch sends ONLY the new objects, not the closure"
+        );
 
         // Up-to-date fetch (have child): nothing new.
         let none = handle_upload_pack(
             fetch_body(&[child], &[child], true),
-            store.clone(), refs.clone(), objects.as_ref(), "", None,
-        ).await.unwrap();
-        assert_eq!(pack_count(&none), 0, "an up-to-date fetch transfers zero objects");
+            store.clone(),
+            refs.clone(),
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pack_count(&none),
+            0,
+            "an up-to-date fetch transfers zero objects"
+        );
     }
 
     #[tokio::test]
@@ -1992,7 +2090,11 @@ mod tests {
         req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
         req.extend_from_slice(&encode_flush());
         req.extend_from_slice(&encode(b"done\n"));
-        assert_eq!(pack_count(&run(objects.clone(), req).await), 6, "stream clone = full closure");
+        assert_eq!(
+            pack_count(&run(objects.clone(), req).await),
+            6,
+            "stream clone = full closure"
+        );
 
         // Fetch: want child, flush, have base, done → only the 3 new objects.
         let mut req = Vec::new();
@@ -2000,15 +2102,28 @@ mod tests {
         req.extend_from_slice(&encode_flush());
         req.extend_from_slice(&encode(format!("have {}\n", hex::encode(base)).as_bytes()));
         req.extend_from_slice(&encode(b"done\n"));
-        assert_eq!(pack_count(&run(objects.clone(), req).await), 3, "stream fetch = incremental");
+        assert_eq!(
+            pack_count(&run(objects.clone(), req).await),
+            3,
+            "stream fetch = incremental"
+        );
     }
 
     #[test]
     fn blob_filter_parse() {
         assert_eq!(BlobFilter::parse("blob:none"), BlobFilter::NoBlobs);
-        assert_eq!(BlobFilter::parse("blob:limit=1024"), BlobFilter::BlobLimit(1024));
-        assert_eq!(BlobFilter::parse("blob:limit=1k"), BlobFilter::BlobLimit(1024));
-        assert_eq!(BlobFilter::parse("blob:limit=2m"), BlobFilter::BlobLimit(2 * 1024 * 1024));
+        assert_eq!(
+            BlobFilter::parse("blob:limit=1024"),
+            BlobFilter::BlobLimit(1024)
+        );
+        assert_eq!(
+            BlobFilter::parse("blob:limit=1k"),
+            BlobFilter::BlobLimit(1024)
+        );
+        assert_eq!(
+            BlobFilter::parse("blob:limit=2m"),
+            BlobFilter::BlobLimit(2 * 1024 * 1024)
+        );
         assert_eq!(BlobFilter::parse("tree:0"), BlobFilter::All); // unsupported ⇒ full
         assert_eq!(BlobFilter::parse("garbage"), BlobFilter::All);
     }
@@ -2019,14 +2134,29 @@ mod tests {
         let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
         let empty = std::collections::HashSet::new();
         // Full: 2 commits + 2 trees + 2 blobs = 6.
-        let full = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::All).await;
+        let full =
+            collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::All).await;
         assert_eq!(full.len(), 6);
         // blob:none → no blobs (4 objects), and none are type 3.
-        let none = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::NoBlobs).await;
+        let none = collect_pack_objects(
+            &store,
+            objects.as_ref(),
+            &[child],
+            &empty,
+            BlobFilter::NoBlobs,
+        )
+        .await;
         assert_eq!(none.len(), 4, "blob:none omits both blobs");
         assert!(none.iter().all(|(t, _)| *t != 3), "no blobs packed");
         // blob:limit=12 keeps the 10-byte blob, drops the 15-byte one → 5.
-        let lim = collect_pack_objects(&store, objects.as_ref(), &[child], &empty, BlobFilter::BlobLimit(12)).await;
+        let lim = collect_pack_objects(
+            &store,
+            objects.as_ref(),
+            &[child],
+            &empty,
+            BlobFilter::BlobLimit(12),
+        )
+        .await;
         assert_eq!(lim.len(), 5, "blob:limit keeps small, drops large");
     }
 
@@ -2040,12 +2170,19 @@ mod tests {
         // and `child` is the shallow boundary (its parent is cut).
         let (objs, shallow) = collect_shallow(&store, objects.as_ref(), &[child], &empty, 1).await;
         assert_eq!(shallow, vec![child], "depth-1 boundary is the tip");
-        assert_eq!(objs.len(), 4, "depth-1 packs only the tip snapshot, not history");
+        assert_eq!(
+            objs.len(),
+            4,
+            "depth-1 packs only the tip snapshot, not history"
+        );
 
         // depth 2 covers the whole 2-commit history → no boundary, full closure (6).
         let (objs2, shallow2) =
             collect_shallow(&store, objects.as_ref(), &[child], &empty, 2).await;
-        assert!(shallow2.is_empty(), "depth covering all history has no boundary");
+        assert!(
+            shallow2.is_empty(),
+            "depth covering all history has no boundary"
+        );
         assert_eq!(objs2.len(), 6, "depth-2 packs both commits' closure");
     }
 
@@ -2060,15 +2197,19 @@ mod tests {
         req.extend_from_slice(&encode(b"deepen 1\n"));
         req.extend_from_slice(&encode_flush());
         req.extend_from_slice(&encode(b"done\n"));
-        let resp = handle_upload_pack(
-            Bytes::from(req), store, refs, objects.as_ref(), "", None,
-        ).await.unwrap();
+        let resp = handle_upload_pack(Bytes::from(req), store, refs, objects.as_ref(), "", None)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&resp);
         assert!(
             text.contains(&format!("shallow {}", hex::encode(child))),
             "response must advertise the shallow boundary"
         );
-        assert_eq!(pack_count(&resp), 4, "shallow depth-1 pack holds only the tip snapshot");
+        assert_eq!(
+            pack_count(&resp),
+            4,
+            "shallow depth-1 pack holds only the tip snapshot"
+        );
     }
 
     #[tokio::test]
@@ -2080,10 +2221,19 @@ mod tests {
         // would mean "pack follows" — we must NAK and send no pack until `done`.
         let resp = handle_upload_pack(
             fetch_body(&[child], &[base], false),
-            store, refs, objects.as_ref(), "", None,
-        ).await.unwrap();
+            store,
+            refs,
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(resp, encode(b"NAK\n"));
-        assert!(!resp.windows(4).any(|w| w == b"PACK"), "no pack in a negotiation round");
+        assert!(
+            !resp.windows(4).any(|w| w == b"PACK"),
+            "no pack in a negotiation round"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-use ledge_core::LedgeError;
 use ledge_cluster::{Replica, ShardId, ShardMap, ShardMapError};
+use ledge_core::LedgeError;
+use std::path::PathBuf;
 
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct LedgeConfig {
@@ -191,21 +191,28 @@ pub struct TlsConfig {
     /// When false (default), no TLS: the server binds plaintext (back-compat).
     pub enabled: bool,
     /// Server leaf+chain PEM (required when `enabled`).
-    #[serde(default)] pub cert_path: Option<String>,
+    #[serde(default)]
+    pub cert_path: Option<String>,
     /// Server private key PEM (required when `enabled`).
-    #[serde(default)] pub key_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
     /// CA bundle PEM: verifies peer server certs (outbound) and client certs
     /// (mTLS inbound). Required when `mtls`.
-    #[serde(default)] pub ca_path: Option<String>,
+    #[serde(default)]
+    pub ca_path: Option<String>,
     /// When true, require + verify a CA-signed client cert on the peer listener
     /// (mutual TLS). Requires `enabled` + `cluster.enabled` + ca/peer/client paths.
-    #[serde(default)] pub mtls: bool,
+    #[serde(default)]
+    pub mtls: bool,
     /// Bind address for the mTLS peer listener (required when `mtls`).
-    #[serde(default)] pub peer_addr: Option<String>,
+    #[serde(default)]
+    pub peer_addr: Option<String>,
     /// THIS node's client identity cert PEM for outbound mTLS (required when `mtls`).
-    #[serde(default)] pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
     /// THIS node's client identity key PEM for outbound mTLS (required when `mtls`).
-    #[serde(default)] pub client_key_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
 }
 
 /// Webhooks / event surface configuration. Disabled by default (byte-identical
@@ -299,7 +306,10 @@ impl ClusterConfig {
                 ShardId(s.id),
                 s.members
                     .iter()
-                    .map(|m| Replica { node_id: m.id, addr: m.addr.clone() })
+                    .map(|m| Replica {
+                        node_id: m.id,
+                        addr: m.addr.clone(),
+                    })
                     .collect::<Vec<_>>(),
             )
         }))
@@ -310,28 +320,50 @@ impl LedgeConfig {
     pub fn load(config_path: Option<&PathBuf>) -> ledge_core::Result<Self> {
         use config::{Config, Environment, File};
         let mut builder = Config::builder()
-            .set_default("server.addr",                       "0.0.0.0:3000").map_err(map_cfg)?
-            .set_default("server.data_dir",                   "/var/lib/ledge").map_err(map_cfg)?
-            .set_default("object_store.fanout_depth",          2i64).map_err(map_cfg)?
-            .set_default("ref_store.wal_compact_threshold_mb", 64i64).map_err(map_cfg)?
-            .set_default("metrics.enabled",                    true).map_err(map_cfg)?
-            .set_default("metrics.addr",                       "0.0.0.0:9090").map_err(map_cfg)?
-            .set_default("workspace.expiry_interval_secs",     30i64).map_err(map_cfg)?
-            .set_default("workspace.gc_interval_secs",         300i64).map_err(map_cfg)?
-            .set_default("workspace.default_ttl_secs",         3600i64).map_err(map_cfg)?
-            .set_default("cluster.enabled",                    false).map_err(map_cfg)?
-            .set_default("cluster.node_id",                    1i64).map_err(map_cfg)?
-            .set_default("cluster.num_shards",                 1i64).map_err(map_cfg)?
-            .set_default("cluster.raft_bind",                  "0.0.0.0:4001").map_err(map_cfg)?
-            .set_default("auth.enabled",                       false).map_err(map_cfg)?
-            .set_default("quotas.enabled",                     false).map_err(map_cfg)?
-            .set_default("tls.enabled", false).map_err(map_cfg)?
-            .set_default("tls.mtls",    false).map_err(map_cfg)?
-            .set_default("webhooks.enabled", false).map_err(map_cfg)?
-            .set_default("sync.enabled", false).map_err(map_cfg)?
-            .set_default("s3.enabled", false).map_err(map_cfg)?
-            .set_default("ssh.enabled", false).map_err(map_cfg)?
-            .set_default("ssh.addr", "0.0.0.0:2222").map_err(map_cfg)?;
+            .set_default("server.addr", "0.0.0.0:3000")
+            .map_err(map_cfg)?
+            .set_default("server.data_dir", "/var/lib/ledge")
+            .map_err(map_cfg)?
+            .set_default("object_store.fanout_depth", 2i64)
+            .map_err(map_cfg)?
+            .set_default("ref_store.wal_compact_threshold_mb", 64i64)
+            .map_err(map_cfg)?
+            .set_default("metrics.enabled", true)
+            .map_err(map_cfg)?
+            .set_default("metrics.addr", "0.0.0.0:9090")
+            .map_err(map_cfg)?
+            .set_default("workspace.expiry_interval_secs", 30i64)
+            .map_err(map_cfg)?
+            .set_default("workspace.gc_interval_secs", 300i64)
+            .map_err(map_cfg)?
+            .set_default("workspace.default_ttl_secs", 3600i64)
+            .map_err(map_cfg)?
+            .set_default("cluster.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("cluster.node_id", 1i64)
+            .map_err(map_cfg)?
+            .set_default("cluster.num_shards", 1i64)
+            .map_err(map_cfg)?
+            .set_default("cluster.raft_bind", "0.0.0.0:4001")
+            .map_err(map_cfg)?
+            .set_default("auth.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("quotas.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("tls.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("tls.mtls", false)
+            .map_err(map_cfg)?
+            .set_default("webhooks.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("sync.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("s3.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("ssh.enabled", false)
+            .map_err(map_cfg)?
+            .set_default("ssh.addr", "0.0.0.0:2222")
+            .map_err(map_cfg)?;
         if let Some(path) = config_path {
             builder = builder.add_source(
                 File::from(path.as_ref())
@@ -340,7 +372,9 @@ impl LedgeConfig {
             );
         }
         builder = builder.add_source(
-            Environment::with_prefix("LEDGE").separator("__").try_parsing(true),
+            Environment::with_prefix("LEDGE")
+                .separator("__")
+                .try_parsing(true),
         );
         let cfg: LedgeConfig = builder
             .build()
@@ -355,9 +389,7 @@ impl LedgeConfig {
     /// the server refuses to boot half-configured rather than failing at the first
     /// handshake.
     fn validate(&self) -> ledge_core::Result<()> {
-        if self.tls.enabled
-            && (self.tls.cert_path.is_none() || self.tls.key_path.is_none())
-        {
+        if self.tls.enabled && (self.tls.cert_path.is_none() || self.tls.key_path.is_none()) {
             return Err(invalid_config(
                 "tls.enabled requires tls.cert_path and tls.key_path",
             ));
@@ -380,11 +412,17 @@ impl LedgeConfig {
 }
 
 fn map_cfg(e: config::ConfigError) -> LedgeError {
-    LedgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    LedgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        e.to_string(),
+    ))
 }
 
 fn invalid_config(msg: &str) -> LedgeError {
-    LedgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string()))
+    LedgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        msg.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -500,7 +538,10 @@ mod tests {
             vec![ledge_cluster::ShardId(0), ledge_cluster::ShardId(1)]
         );
         assert_eq!(map.shards_hosted_by(1), vec![ledge_cluster::ShardId(0)]);
-        assert_eq!(map.replica_addr(ledge_cluster::ShardId(1), 4), Some("http://n4:8404"));
+        assert_eq!(
+            map.replica_addr(ledge_cluster::ShardId(1), 4),
+            Some("http://n4:8404")
+        );
     }
 
     #[test]
@@ -542,7 +583,10 @@ mod tests {
     fn quota_config_defaults() {
         let _guard = ENV_LOCK.lock().unwrap();
         let cfg = LedgeConfig::load(None).expect("default config must load");
-        assert!(!cfg.quotas.enabled, "quotas disabled by default (back-compat)");
+        assert!(
+            !cfg.quotas.enabled,
+            "quotas disabled by default (back-compat)"
+        );
         assert!(cfg.quotas.max_workspaces.is_none());
         assert!(cfg.quotas.max_durable_bytes.is_none());
         assert!(cfg.quotas.max_object_count.is_none());
@@ -644,10 +688,17 @@ mod tests {
     fn sync_toml_override() {
         let _g = ENV_LOCK.lock().unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "[sync]\nenabled=true\nallowed_upstream_hosts=[\"github.com\"]").unwrap();
+        writeln!(
+            f,
+            "[sync]\nenabled=true\nallowed_upstream_hosts=[\"github.com\"]"
+        )
+        .unwrap();
         let cfg = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
         assert!(cfg.sync.enabled);
-        assert_eq!(cfg.sync.allowed_upstream_hosts, vec!["github.com".to_string()]);
+        assert_eq!(
+            cfg.sync.allowed_upstream_hosts,
+            vec!["github.com".to_string()]
+        );
     }
 
     #[test]
@@ -663,7 +714,11 @@ mod tests {
     fn s3_toml_override() {
         let _g = ENV_LOCK.lock().unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "[s3]\nenabled=true\nbucket=\"b\"\nendpoint=\"http://localhost:9000\"").unwrap();
+        writeln!(
+            f,
+            "[s3]\nenabled=true\nbucket=\"b\"\nendpoint=\"http://localhost:9000\""
+        )
+        .unwrap();
         let c = LedgeConfig::load(Some(&f.path().to_path_buf())).unwrap();
         assert!(c.s3.enabled);
         assert_eq!(c.s3.bucket, "b");

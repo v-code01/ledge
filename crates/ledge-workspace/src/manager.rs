@@ -647,10 +647,16 @@ mod tests {
         let (mgr, _dir) = setup();
         let main = r("refs/heads/main");
         mgr.refs.update(&main, oid(1), None).await.unwrap();
-        let view = mgr.fork(&[main], Duration::from_secs(1), "root").await.unwrap();
+        let view = mgr
+            .fork(&[main], Duration::from_secs(1), "root")
+            .await
+            .unwrap();
         let before = view.lease.clone();
 
-        let renewed = mgr.renew(view.id, Duration::from_secs(3600), "root").await.unwrap();
+        let renewed = mgr
+            .renew(view.id, Duration::from_secs(3600), "root")
+            .await
+            .unwrap();
 
         assert_eq!(renewed.id, before.id);
         assert_eq!(renewed.generation, before.generation + 1);
@@ -774,9 +780,8 @@ mod tests {
         let d2 = r("refs/heads/dst2");
         refs.update(&d1, oid(5), None).await.unwrap();
 
-        let inner: Arc<dyn AtomicCommit> = Arc::new(ledge_ref_store::LocalAtomicCommit::new(
-            refs.clone(),
-        ));
+        let inner: Arc<dyn AtomicCommit> =
+            Arc::new(ledge_ref_store::LocalAtomicCommit::new(refs.clone()));
         let coordinator: Arc<dyn AtomicCommit> = Arc::new(RacingCommit {
             inner,
             store: refs.clone(),
@@ -809,9 +814,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            outcomes
-                .iter()
-                .any(|o| matches!(o, CommitOutcome::Conflict { target, .. } if target == d1.as_str())),
+            outcomes.iter().any(
+                |o| matches!(o, CommitOutcome::Conflict { target, .. } if target == d1.as_str())
+            ),
             "d1 must be reported as the conflict, got {outcomes:?}"
         );
         // Atomicity: d1 stays at the raced value oid(9) (never advanced to oid(1));
@@ -915,8 +920,14 @@ mod tests {
             .unwrap_err();
         match err {
             LedgeError::Corruption(msg) => {
-                assert!(msg.contains(b_ws_ref.as_str()), "msg names the foreign ref: {msg}");
-                assert!(msg.contains(&view_a.id.to_hex()), "msg names the target ws: {msg}");
+                assert!(
+                    msg.contains(b_ws_ref.as_str()),
+                    "msg names the foreign ref: {msg}"
+                );
+                assert!(
+                    msg.contains(&view_a.id.to_hex()),
+                    "msg names the target ws: {msg}"
+                );
             }
             other => panic!("expected Corruption rejecting the foreign ref, got {other:?}"),
         }
@@ -933,7 +944,11 @@ mod tests {
         mgr.refs.update(&main, oid(1), None).await.unwrap();
         mgr.refs.update(&tag, oid(2), None).await.unwrap();
         let view = mgr
-            .fork(&[main.clone(), tag.clone()], Duration::from_secs(60), "root")
+            .fork(
+                &[main.clone(), tag.clone()],
+                Duration::from_secs(60),
+                "root",
+            )
             .await
             .unwrap();
 
@@ -957,7 +972,10 @@ mod tests {
         let (mgr, _dir) = setup();
         let main = r("refs/heads/main");
         mgr.refs.update(&main, oid(1), None).await.unwrap();
-        let view = mgr.fork(&[main], Duration::from_secs(60), "root").await.unwrap();
+        let view = mgr
+            .fork(&[main], Duration::from_secs(60), "root")
+            .await
+            .unwrap();
 
         mgr.release(view.id, "root").await.unwrap();
         // Second release on an already-released workspace must still be Ok.
@@ -1000,19 +1018,31 @@ mod tests {
 
         // Live workspace (long TTL).
         let live = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "root")
+            .fork(
+                std::slice::from_ref(&main),
+                Duration::from_secs(3600),
+                "root",
+            )
             .await
             .unwrap();
         // Released workspace (tombstoned -> not live).
         let released = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "root")
+            .fork(
+                std::slice::from_ref(&main),
+                Duration::from_secs(3600),
+                "root",
+            )
             .await
             .unwrap();
         mgr.release(released.id, "root").await.unwrap();
         // Expired workspace (TTL already elapsed). expires_at_ms == created_at_ms;
         // `live` uses `expires_at_ms > now_ms`, so a 0ms TTL is not live.
         let expired = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_millis(0), "root")
+            .fork(
+                std::slice::from_ref(&main),
+                Duration::from_millis(0),
+                "root",
+            )
             .await
             .unwrap();
 
@@ -1076,7 +1106,11 @@ mod tests {
             .await
             .unwrap();
         let acme = mgr
-            .fork(std::slice::from_ref(&main), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&main),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let globex = mgr
@@ -1122,10 +1156,17 @@ mod tests {
         // acme forks from the CLIENT name refs/heads/main (resolves to its phys ref).
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(60), "acme")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(60),
+                "acme",
+            )
             .await
             .unwrap();
-        assert_eq!(view.refs[0].0, "refs/heads/main", "view shows client-facing name");
+        assert_eq!(
+            view.refs[0].0, "refs/heads/main",
+            "view shows client-facing name"
+        );
         assert_eq!(view.refs[0].1.target, oid(1));
 
         // Advance the workspace ref, then commit back to the CLIENT durable name.
@@ -1167,17 +1208,29 @@ mod tests {
 
         // First two forks succeed (live count 0, then 1 — both < 2).
         let w1 = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let _w2 = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
 
         // Third fork: live count is 2 ⇒ 2 >= 2 ⇒ QuotaExceeded (→507).
         let err = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap_err();
         match err {
@@ -1191,7 +1244,11 @@ mod tests {
         // Release one ⇒ a slot frees ⇒ the next fork succeeds (count back to 1).
         mgr.release(w1.id, "acme").await.unwrap();
         let _w4 = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
     }
@@ -1205,7 +1262,10 @@ mod tests {
         };
         let (mgr, _dir) = setup_quota(limits);
         // Seed root + two tenants' durable refs.
-        mgr.refs.update(&r("refs/heads/main"), oid(1), None).await.unwrap();
+        mgr.refs
+            .update(&r("refs/heads/main"), oid(1), None)
+            .await
+            .unwrap();
         mgr.refs
             .update(&r("refs/tenants/acme/heads/main"), oid(1), None)
             .await
@@ -1218,26 +1278,42 @@ mod tests {
 
         // root is EXEMPT: many forks despite max_workspaces=1.
         for _ in 0..3 {
-            mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "root")
-                .await
-                .unwrap();
+            mgr.fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "root",
+            )
+            .await
+            .unwrap();
         }
 
         // acme: first ok, second rejected (limit 1).
-        mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
-            .await
-            .unwrap();
+        mgr.fork(
+            std::slice::from_ref(&src),
+            Duration::from_secs(3600),
+            "acme",
+        )
+        .await
+        .unwrap();
         let acme_err = mgr
-            .fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap_err();
         assert!(matches!(acme_err, LedgeError::QuotaExceeded(_)));
 
         // globex is INDEPENDENT: its first fork still succeeds (acme's count does
         // not count against globex — per-tenant limits).
-        mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "globex")
-            .await
-            .unwrap();
+        mgr.fork(
+            std::slice::from_ref(&src),
+            Duration::from_secs(3600),
+            "globex",
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1255,9 +1331,13 @@ mod tests {
             .unwrap();
         let src = r("refs/heads/main");
         for _ in 0..5 {
-            mgr.fork(std::slice::from_ref(&src), Duration::from_secs(3600), "acme")
-                .await
-                .unwrap();
+            mgr.fork(
+                std::slice::from_ref(&src),
+                Duration::from_secs(3600),
+                "acme",
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -1306,7 +1386,11 @@ mod tests {
             .unwrap();
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &client).unwrap();
@@ -1314,7 +1398,14 @@ mod tests {
 
         // Last-measured usage is UNDER the limit (999 < 1000) ⇒ this commit (which
         // pushes over) SUCCEEDS — the pre-gate saw under (soft semantics, §2/§6).
-        set_usage(&usage, "acme", TenantUsage { bytes: 999, objects: 1 });
+        set_usage(
+            &usage,
+            "acme",
+            TenantUsage {
+                bytes: 999,
+                objects: 1,
+            },
+        );
         let out = mgr
             .commit(view.id, &[(ws.clone(), client.clone())], "acme")
             .await
@@ -1326,7 +1417,14 @@ mod tests {
 
         // Simulate the NEXT GC re-measuring acme AT/OVER the limit. The next commit
         // is now REJECTED (507) — the documented one-burst overshoot bound.
-        set_usage(&usage, "acme", TenantUsage { bytes: 1000, objects: 2 });
+        set_usage(
+            &usage,
+            "acme",
+            TenantUsage {
+                bytes: 1000,
+                objects: 2,
+            },
+        );
         // Advance the ws ref again so there is something to promote.
         mgr.refs.update(&ws, oid(3), Some(oid(2))).await.unwrap();
         let err = mgr
@@ -1366,15 +1464,29 @@ mod tests {
             .unwrap();
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &client).unwrap();
         mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
 
         // acme measured AT the object-count limit (5 >= 5) ⇒ reject.
-        set_usage(&usage, "acme", TenantUsage { bytes: 0, objects: 5 });
-        let err = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap_err();
+        set_usage(
+            &usage,
+            "acme",
+            TenantUsage {
+                bytes: 0,
+                objects: 5,
+            },
+        );
+        let err = mgr
+            .commit(view.id, &[(ws, client)], "acme")
+            .await
+            .unwrap_err();
         match err {
             LedgeError::QuotaExceeded(m) => assert!(m.starts_with("object_count:"), "msg: {m}"),
             other => panic!("expected QuotaExceeded(object_count), got {other:?}"),
@@ -1397,16 +1509,30 @@ mod tests {
             .unwrap();
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &client).unwrap();
         mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
 
         // Strictly under both limits ⇒ commit succeeds.
-        set_usage(&usage, "acme", TenantUsage { bytes: 500, objects: 3 });
+        set_usage(
+            &usage,
+            "acme",
+            TenantUsage {
+                bytes: 500,
+                objects: 3,
+            },
+        );
         let out = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap();
-        assert!(matches!(out[0], CommitOutcome::Ok { .. }), "under limit succeeds");
+        assert!(
+            matches!(out[0], CommitOutcome::Ok { .. }),
+            "under limit succeeds"
+        );
     }
 
     #[tokio::test]
@@ -1420,15 +1546,29 @@ mod tests {
             ..Default::default()
         };
         let (mgr, usage, _dir) = setup_quota_usage(limits);
-        mgr.refs.update(&r("refs/heads/main"), oid(1), None).await.unwrap();
+        mgr.refs
+            .update(&r("refs/heads/main"), oid(1), None)
+            .await
+            .unwrap();
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "root")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(3600),
+                "root",
+            )
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &client).unwrap();
         mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
-        set_usage(&usage, "root", TenantUsage { bytes: 10_000, objects: 10_000 });
+        set_usage(
+            &usage,
+            "root",
+            TenantUsage {
+                bytes: 10_000,
+                objects: 10_000,
+            },
+        );
         // root is exempt ⇒ commit succeeds despite being far over.
         let out = mgr.commit(view.id, &[(ws, client)], "root").await.unwrap();
         assert!(matches!(out[0], CommitOutcome::Ok { .. }), "root exempt");
@@ -1445,13 +1585,27 @@ mod tests {
             .unwrap();
         let client = r("refs/heads/main");
         let view = mgr
-            .fork(std::slice::from_ref(&client), Duration::from_secs(3600), "acme")
+            .fork(
+                std::slice::from_ref(&client),
+                Duration::from_secs(3600),
+                "acme",
+            )
             .await
             .unwrap();
         let ws = workspace_ref(&view.id, &client).unwrap();
         mgr.refs.update(&ws, oid(2), Some(oid(1))).await.unwrap();
-        set_usage(&usage, "acme", TenantUsage { bytes: 10_000, objects: 10_000 });
+        set_usage(
+            &usage,
+            "acme",
+            TenantUsage {
+                bytes: 10_000,
+                objects: 10_000,
+            },
+        );
         let out = mgr.commit(view.id, &[(ws, client)], "acme").await.unwrap();
-        assert!(matches!(out[0], CommitOutcome::Ok { .. }), "disabled ⇒ no gate");
+        assert!(
+            matches!(out[0], CommitOutcome::Ok { .. }),
+            "disabled ⇒ no gate"
+        );
     }
 }

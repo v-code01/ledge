@@ -325,8 +325,7 @@ impl HttpRaftNetwork {
             .bytes()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let wire: WireResult =
-            dec(&bytes).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let wire: WireResult = dec(&bytes).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         match wire {
             WireResult::Ok(ok) => {
                 dec::<Resp>(&ok).map_err(|e| RPCError::Network(NetworkError::new(&e)))
@@ -334,7 +333,10 @@ impl HttpRaftNetwork {
             WireResult::Err(err) => {
                 let raft_err: RaftError<NodeId, E> =
                     dec(&err).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-                Err(RPCError::RemoteError(RemoteError::new(self.target, raft_err)))
+                Err(RPCError::RemoteError(RemoteError::new(
+                    self.target,
+                    raft_err,
+                )))
             }
         }
     }
@@ -418,7 +420,11 @@ impl HttpObjectPeer {
     }
 
     /// Build a peer client reusing an existing pooled `reqwest::Client`.
-    pub fn with_client(base_url: impl Into<String>, shard: ShardId, client: reqwest::Client) -> Self {
+    pub fn with_client(
+        base_url: impl Into<String>,
+        shard: ShardId,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             shard,
@@ -438,7 +444,12 @@ impl HttpObjectPeer {
 
     /// Common put body: POST raw `content` with `?type=git_type`, expect the
     /// 200 body to be the ObjectId hex, and verify it equals `id`.
-    async fn put_typed(&self, id: &ObjectId, git_type: u8, content: &[u8]) -> ledge_core::Result<()> {
+    async fn put_typed(
+        &self,
+        id: &ObjectId,
+        git_type: u8,
+        content: &[u8],
+    ) -> ledge_core::Result<()> {
         let url = format!("{}?type={}", self.replicate_url(), git_type);
         let resp = self
             .client
@@ -447,7 +458,9 @@ impl HttpObjectPeer {
             .body(content.to_vec())
             .send()
             .await
-            .map_err(|e| LedgeError::Unavailable(format!("replicate {} to peer failed: {e}", id.to_hex())))?;
+            .map_err(|e| {
+                LedgeError::Unavailable(format!("replicate {} to peer failed: {e}", id.to_hex()))
+            })?;
         if !resp.status().is_success() {
             return Err(LedgeError::Unavailable(format!(
                 "replicate {} to peer returned {}",
@@ -491,7 +504,9 @@ impl crate::object_store::ObjectPeer for HttpObjectPeer {
             .get(self.object_url(id))
             .send()
             .await
-            .map_err(|e| LedgeError::Unavailable(format!("fetch {} from peer failed: {e}", id.to_hex())))?;
+            .map_err(|e| {
+                LedgeError::Unavailable(format!("fetch {} from peer failed: {e}", id.to_hex()))
+            })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -515,7 +530,9 @@ impl crate::object_store::ObjectPeer for HttpObjectPeer {
             .get(self.object_url(id))
             .send()
             .await
-            .map_err(|e| LedgeError::Unavailable(format!("probe {} on peer failed: {e}", id.to_hex())))?;
+            .map_err(|e| {
+                LedgeError::Unavailable(format!("probe {} on peer failed: {e}", id.to_hex()))
+            })?;
         match resp.status() {
             s if s.is_success() => Ok(true),
             reqwest::StatusCode::NOT_FOUND => Ok(false),
@@ -544,7 +561,6 @@ mod tests {
     use openraft::{Config, LogId, SnapshotMeta, StoredMembership, Vote};
     use std::sync::Arc;
 
-
     fn raft_config() -> Arc<Config> {
         Arc::new(
             Config {
@@ -563,7 +579,8 @@ mod tests {
     async fn one_node_raft(id: NodeId) -> openraft::Raft<TypeConfig> {
         let log = LogStore::default();
         let sm = StateMachineStore::new_temp().await;
-        let net = crate::net_mem::MemNetworkFactory::new(ShardId(0), crate::net_mem::Registry::new());
+        let net =
+            crate::net_mem::MemNetworkFactory::new(ShardId(0), crate::net_mem::Registry::new());
         openraft::Raft::new(id, raft_config(), net, log, sm)
             .await
             .expect("Raft::new")
@@ -594,10 +611,10 @@ mod tests {
         assert_eq!(back.vote, append.vote);
         assert_eq!(back.entries.len(), 0);
 
-        let vote = VoteRequest::<NodeId>::new(Vote::new(2, 1), Some(LogId::new(
-            openraft::CommittedLeaderId::new(2, 1),
-            7,
-        )));
+        let vote = VoteRequest::<NodeId>::new(
+            Vote::new(2, 1),
+            Some(LogId::new(openraft::CommittedLeaderId::new(2, 1), 7)),
+        );
         let back: VoteRequest<NodeId> = dec(&enc(&vote).unwrap()).unwrap();
         assert_eq!(back, vote);
 
@@ -650,7 +667,10 @@ mod tests {
             WireResult::Err(_) => panic!("expected Ok vote response"),
         };
         let resp: VoteResponse<NodeId> = dec(&resp_bytes).unwrap();
-        assert!(resp.vote_granted, "fresh node should grant a higher-term vote");
+        assert!(
+            resp.vote_granted,
+            "fresh node should grant a higher-term vote"
+        );
 
         // The served Raft observed the vote: its persisted vote is now term 5.
         let metrics = raft.metrics().borrow().clone();
@@ -729,13 +749,21 @@ mod tests {
         let mut peers = HashMap::new();
         peers.insert(1u64, format!("http://{addr}"));
         let mut factory = HttpRaftNetworkFactory::new(ShardId(0), peers);
-        let mut conn = factory.new_client(1, &Node::new(format!("http://{addr}"))).await;
+        let mut conn = factory
+            .new_client(1, &Node::new(format!("http://{addr}")))
+            .await;
 
         let resp = conn
-            .vote(VoteRequest::new(Vote::new(9, 1), None), RPCOption::new(std::time::Duration::from_secs(2)))
+            .vote(
+                VoteRequest::new(Vote::new(9, 1), None),
+                RPCOption::new(std::time::Duration::from_secs(2)),
+            )
             .await
             .expect("vote RPC over HTTP");
-        assert!(resp.vote_granted, "fresh node should grant a higher-term vote over HTTP");
+        assert!(
+            resp.vote_granted,
+            "fresh node should grant a higher-term vote over HTTP"
+        );
 
         // The served Raft observed it.
         let metrics = raft.metrics().borrow().clone();
@@ -1043,8 +1071,14 @@ mod tests {
         // its content address + git header match.
         let content = Bytes::from_static(b"100644 file\0\x01\x02\x03");
         let id = ObjectId::from(blake3::hash(&content));
-        peer.put_git(&id, 2, &content).await.expect("put_git over HTTP");
-        assert_eq!(store.git_type_of(id).await.unwrap(), 2, "type byte preserved");
+        peer.put_git(&id, 2, &content)
+            .await
+            .expect("put_git over HTTP");
+        assert_eq!(
+            store.git_type_of(id).await.unwrap(),
+            2,
+            "type byte preserved"
+        );
 
         server.abort();
     }
@@ -1124,7 +1158,10 @@ mod tests {
         assert_eq!(store.quorum(), 2);
 
         let content = Bytes::from_static(b"survives one down peer");
-        let id = store.write(content).await.expect("quorum still reached with one peer down");
+        let id = store
+            .write(content)
+            .await
+            .expect("quorum still reached with one peer down");
         assert!(local.exists(id).await.unwrap());
 
         for _ in 0..100 {
@@ -1185,7 +1222,9 @@ mod tests {
         peers.insert(1u64, format!("http://{addr}"));
         let mut factory =
             HttpRaftNetworkFactory::with_secret(ShardId(0), peers, Some("svc-secret".to_string()));
-        let mut conn = factory.new_client(1, &Node::new(format!("http://{addr}"))).await;
+        let mut conn = factory
+            .new_client(1, &Node::new(format!("http://{addr}")))
+            .await;
         let _ = conn
             .vote(
                 VoteRequest::new(Vote::new(9, 1), None),

@@ -70,11 +70,7 @@ pub fn parse_authorized_keys(text: &str) -> Vec<(ssh_key::PublicKey, String)> {
 }
 
 /// Run the SSH listener until the process exits. `host_key` is the server identity.
-pub async fn serve(
-    ctx: SshCtx,
-    addr: &str,
-    host_key: ssh_key::PrivateKey,
-) -> std::io::Result<()> {
+pub async fn serve(ctx: SshCtx, addr: &str, host_key: ssh_key::PrivateKey) -> std::io::Result<()> {
     let config = Arc::new(Config {
         keys: vec![host_key],
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),

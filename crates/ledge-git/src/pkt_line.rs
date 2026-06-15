@@ -11,36 +11,55 @@ pub enum PktLine {
 /// Panics if payload > 65531 bytes.
 pub fn encode(payload: &[u8]) -> Vec<u8> {
     let total = payload.len() + 4;
-    assert!(total <= 0xFFFF, "pkt-line payload too large: {} bytes", payload.len());
+    assert!(
+        total <= 0xFFFF,
+        "pkt-line payload too large: {} bytes",
+        payload.len()
+    );
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(format!("{:04x}", total).as_bytes());
     out.extend_from_slice(payload);
     out
 }
 
-pub fn encode_flush() -> Vec<u8> { b"0000".to_vec() }
-pub fn encode_delimiter() -> Vec<u8> { b"0001".to_vec() }
+pub fn encode_flush() -> Vec<u8> {
+    b"0000".to_vec()
+}
+pub fn encode_delimiter() -> Vec<u8> {
+    b"0001".to_vec()
+}
 
 /// Decode one pkt-line from the front of input. Returns (PktLine, remaining).
 pub fn decode_line(input: &[u8]) -> Result<(PktLine, &[u8]), LedgeError> {
     if input.len() < 4 {
-        return Err(LedgeError::Corruption(format!("pkt-line: need 4 bytes, got {}", input.len())));
+        return Err(LedgeError::Corruption(format!(
+            "pkt-line: need 4 bytes, got {}",
+            input.len()
+        )));
     }
     let prefix = std::str::from_utf8(&input[..4])
         .map_err(|_| LedgeError::Corruption("pkt-line: non-UTF-8 prefix".into()))?;
     let total = u16::from_str_radix(prefix, 16)
-        .map_err(|_| LedgeError::Corruption(format!("pkt-line: invalid hex {:?}", prefix)))? as usize;
+        .map_err(|_| LedgeError::Corruption(format!("pkt-line: invalid hex {:?}", prefix)))?
+        as usize;
 
     match total {
         0 => return Ok((PktLine::Flush, &input[4..])),
         1 => return Ok((PktLine::Delimiter, &input[4..])),
-        2 | 3 => return Err(LedgeError::Corruption(format!("pkt-line: illegal length {}", total))),
+        2 | 3 => {
+            return Err(LedgeError::Corruption(format!(
+                "pkt-line: illegal length {}",
+                total
+            )))
+        }
         _ => {}
     }
 
     if input.len() < total {
         return Err(LedgeError::Corruption(format!(
-            "pkt-line: declared {} bytes but only {} available", total, input.len()
+            "pkt-line: declared {} bytes but only {} available",
+            total,
+            input.len()
         )));
     }
     Ok((PktLine::Data(input[4..total].to_vec()), &input[total..]))
@@ -59,10 +78,14 @@ mod tests {
     }
 
     #[test]
-    fn encode_flush_packet() { assert_eq!(encode_flush(), b"0000"); }
+    fn encode_flush_packet() {
+        assert_eq!(encode_flush(), b"0000");
+    }
 
     #[test]
-    fn encode_delimiter_packet() { assert_eq!(encode_delimiter(), b"0001"); }
+    fn encode_delimiter_packet() {
+        assert_eq!(encode_delimiter(), b"0001");
+    }
 
     #[test]
     fn encode_empty_payload() {
@@ -103,10 +126,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_too_short() { assert!(decode_line(b"00").is_err()); }
+    fn decode_too_short() {
+        assert!(decode_line(b"00").is_err());
+    }
 
     #[test]
-    fn decode_truncated_payload() { assert!(decode_line(b"000ahell").is_err()); }
+    fn decode_truncated_payload() {
+        assert!(decode_line(b"000ahell").is_err());
+    }
 
     #[test]
     fn roundtrip_various_lengths() {

@@ -52,13 +52,31 @@ pub fn method_name(request_bytes: &[u8]) -> &'static str {
 
 /// An owned, plain-Rust decoding of a capnp `Request` (no capnp types retained).
 enum DecodedRequest {
-    WriteObject { git_type: u8, content: Bytes },
-    ReadObject { id: ObjectId },
-    Fork { sources: Vec<String>, ttl_seconds: u64 },
-    Commit { workspace_id: String, mappings: Vec<(String, String)> },
-    Renew { workspace_id: String, ttl_seconds: u64 },
-    Release { workspace_id: String },
-    GetWorkspace { workspace_id: String },
+    WriteObject {
+        git_type: u8,
+        content: Bytes,
+    },
+    ReadObject {
+        id: ObjectId,
+    },
+    Fork {
+        sources: Vec<String>,
+        ttl_seconds: u64,
+    },
+    Commit {
+        workspace_id: String,
+        mappings: Vec<(String, String)>,
+    },
+    Renew {
+        workspace_id: String,
+        ttl_seconds: u64,
+    },
+    Release {
+        workspace_id: String,
+    },
+    GetWorkspace {
+        workspace_id: String,
+    },
     ListWorkspaces,
     RunGc,
 }
@@ -110,9 +128,17 @@ fn decode_request(request_bytes: &[u8]) -> Result<DecodedRequest> {
             let sources_reader = r.get_sources().map_err(malformed)?;
             let mut sources = Vec::with_capacity(sources_reader.len() as usize);
             for s in sources_reader.iter() {
-                sources.push(s.map_err(malformed)?.to_str().map_err(bad_utf8)?.to_string());
+                sources.push(
+                    s.map_err(malformed)?
+                        .to_str()
+                        .map_err(bad_utf8)?
+                        .to_string(),
+                );
             }
-            Ok(DecodedRequest::Fork { sources, ttl_seconds })
+            Ok(DecodedRequest::Fork {
+                sources,
+                ttl_seconds,
+            })
         }
         request::Which::Commit(r) => {
             let workspace_id = r
@@ -138,7 +164,10 @@ fn decode_request(request_bytes: &[u8]) -> Result<DecodedRequest> {
                     .to_string();
                 mappings.push((wref, dref));
             }
-            Ok(DecodedRequest::Commit { workspace_id, mappings })
+            Ok(DecodedRequest::Commit {
+                workspace_id,
+                mappings,
+            })
         }
         request::Which::Renew(r) => Ok(DecodedRequest::Renew {
             workspace_id: r
@@ -184,17 +213,27 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
             Ok(content) => DispatchResult::ObjectContent(content),
             Err(e) => DispatchResult::Error(e.to_string()),
         },
-        DecodedRequest::Fork { sources, ttl_seconds } => {
+        DecodedRequest::Fork {
+            sources,
+            ttl_seconds,
+        } => {
             let names = match parse_ref_names(&sources) {
                 Ok(n) => n,
                 Err(e) => return DispatchResult::Error(e),
             };
-            match ctx.workspaces.fork(&names, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id).await {
+            match ctx
+                .workspaces
+                .fork(&names, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id)
+                .await
+            {
                 Ok(view) => DispatchResult::Workspace(view),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
         }
-        DecodedRequest::Commit { workspace_id, mappings } => {
+        DecodedRequest::Commit {
+            workspace_id,
+            mappings,
+        } => {
             let id = match WorkspaceId::from_hex(&workspace_id) {
                 Ok(id) => id,
                 Err(e) => return DispatchResult::Error(e.to_string()),
@@ -216,12 +255,19 @@ async fn execute(req: DecodedRequest, ctx: &RpcCtx) -> DispatchResult {
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
         }
-        DecodedRequest::Renew { workspace_id, ttl_seconds } => {
+        DecodedRequest::Renew {
+            workspace_id,
+            ttl_seconds,
+        } => {
             let id = match WorkspaceId::from_hex(&workspace_id) {
                 Ok(id) => id,
                 Err(e) => return DispatchResult::Error(e.to_string()),
             };
-            match ctx.workspaces.renew(id, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id).await {
+            match ctx
+                .workspaces
+                .renew(id, ctx.resolve_ttl(ttl_seconds), &ctx.tenant_id)
+                .await
+            {
                 Ok(lease) => DispatchResult::Lease(lease),
                 Err(e) => DispatchResult::Error(e.to_string()),
             }
@@ -340,9 +386,9 @@ fn bad_utf8(e: std::str::Utf8Error) -> LedgeError {
 fn read_object_id(reader: crate::ledge_capnp::object_id::Reader<'_>) -> Result<ObjectId> {
     let bytes = reader.get_bytes().map_err(malformed)?;
     let len = bytes.len();
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        LedgeError::Corruption(format!("ObjectId must be 32 bytes, got {len}"))
-    })?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| LedgeError::Corruption(format!("ObjectId must be 32 bytes, got {len}")))?;
     Ok(ObjectId::from_bytes(arr))
 }
 
@@ -363,7 +409,9 @@ fn write_workspace_info(
 
 /// Encode a [`RefEntry`] into a capnp `RefEntry` builder.
 fn write_ref_entry(mut re: crate::ledge_capnp::ref_entry::Builder<'_>, entry: &RefEntry) {
-    re.reborrow().init_target().set_bytes(entry.target.as_bytes());
+    re.reborrow()
+        .init_target()
+        .set_bytes(entry.target.as_bytes());
     re.set_hlc(entry.hlc);
     re.set_version(entry.version);
 }

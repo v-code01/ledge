@@ -312,7 +312,10 @@ mod tests {
         assert_eq!(f.target_addr(ShardId(0)), None, "empty map has no target");
         let m = ShardMap::from_entries([(
             ShardId(0),
-            vec![Replica { node_id: 1, addr: "http://new-host:3000".into() }],
+            vec![Replica {
+                node_id: 1,
+                addr: "http://new-host:3000".into(),
+            }],
         )])
         .unwrap();
         f.set_map(m);
@@ -348,8 +351,20 @@ mod tests {
 
         // Placement: shard 0 → node 1, shard 1 → node 2 (distinct subsets).
         let map = ShardMap::from_entries([
-            (ShardId(0), vec![Replica { node_id: 1, addr: "mem://1".into() }]),
-            (ShardId(1), vec![Replica { node_id: 2, addr: "mem://2".into() }]),
+            (
+                ShardId(0),
+                vec![Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                }],
+            ),
+            (
+                ShardId(1),
+                vec![Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                }],
+            ),
         ])
         .unwrap();
 
@@ -382,8 +397,14 @@ mod tests {
         assert_eq!(e.version, 1);
 
         // Readable from the hosting node (node 2) AND from the forwarding node.
-        assert_eq!(store2.get(&name_s1).await.unwrap().unwrap().target, oid(0xaa));
-        assert_eq!(store1.get(&name_s1).await.unwrap().unwrap().target, oid(0xaa));
+        assert_eq!(
+            store2.get(&name_s1).await.unwrap().unwrap().target,
+            oid(0xaa)
+        );
+        assert_eq!(
+            store1.get(&name_s1).await.unwrap().unwrap().target,
+            oid(0xaa)
+        );
 
         // CAS through the forwarder: correct expected succeeds, wrong conflicts.
         let e2 = store1
@@ -422,9 +443,18 @@ mod tests {
                 target_bytes: [0xaa; 32],
                 expected_bytes: Some([0xbb; 32]),
             },
-            ClusterOp::CommitPrepared { txn_id: txn, name: "refs/heads/main".into() },
-            ClusterOp::AbortPrepared { txn_id: txn, name: "refs/heads/main".into() },
-            ClusterOp::TxnStatus { txn_id: txn, coord_shard: 0 },
+            ClusterOp::CommitPrepared {
+                txn_id: txn,
+                name: "refs/heads/main".into(),
+            },
+            ClusterOp::AbortPrepared {
+                txn_id: txn,
+                name: "refs/heads/main".into(),
+            },
+            ClusterOp::TxnStatus {
+                txn_id: txn,
+                coord_shard: 0,
+            },
         ];
         for op in ops {
             let bytes = bincode::serde::encode_to_vec(&op, cfg).unwrap();
@@ -434,7 +464,11 @@ mod tests {
         }
 
         // RefOpResponse 2PC variants round-trip too.
-        let entry = RefEntry { target: ObjectId::from_bytes([1; 32]), version: 3, hlc: 9 };
+        let entry = RefEntry {
+            target: ObjectId::from_bytes([1; 32]),
+            version: 3,
+            hlc: 9,
+        };
         let resps = vec![
             RefOpResponse::Vote(true),
             RefOpResponse::Vote(false),
@@ -457,8 +491,20 @@ mod tests {
     async fn apply_local_op_applies_directly_and_rejects_misdirected() {
         let cluster = MultiShardCluster::start(2, &[1, 2]).await;
         let map = ShardMap::from_entries([
-            (ShardId(0), vec![Replica { node_id: 1, addr: "mem://1".into() }]),
-            (ShardId(1), vec![Replica { node_id: 2, addr: "mem://2".into() }]),
+            (
+                ShardId(0),
+                vec![Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                }],
+            ),
+            (
+                ShardId(1),
+                vec![Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                }],
+            ),
         ])
         .unwrap();
         let fwd = Arc::new(InMemoryForwarder::new());
@@ -507,8 +553,20 @@ mod tests {
         use ledge_raft::TxnId;
         let cluster = MultiShardCluster::start(2, &[1, 2]).await;
         let map = ShardMap::from_entries([
-            (ShardId(0), vec![Replica { node_id: 1, addr: "mem://1".into() }]),
-            (ShardId(1), vec![Replica { node_id: 2, addr: "mem://2".into() }]),
+            (
+                ShardId(0),
+                vec![Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                }],
+            ),
+            (
+                ShardId(1),
+                vec![Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                }],
+            ),
         ])
         .unwrap();
         let fwd = Arc::new(InMemoryForwarder::new());
@@ -518,7 +576,11 @@ mod tests {
         // A name on shard 0 (local to node 1).
         let (a, b) = cluster.two_names_on_distinct_shards();
         let router = cluster.router();
-        let name_s0 = if router.shard_for(a.as_str()) == ShardId(0) { a } else { b };
+        let name_s0 = if router.shard_for(a.as_str()) == ShardId(0) {
+            a
+        } else {
+            b
+        };
 
         let txn = TxnId::from_bytes([1u8; 16]);
         // Prepare create-only (expected = None) → VOTE-YES, lock taken.
@@ -535,20 +597,34 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(vote, RefOpResponse::Vote(true)), "expected YES, got {vote:?}");
+        assert!(
+            matches!(vote, RefOpResponse::Vote(true)),
+            "expected YES, got {vote:?}"
+        );
 
         // Read sees COMMITTED (still absent — staged is invisible, spec §3.3).
         let got = store1
-            .apply_local_op(ShardId(0), ClusterOp::Get { name: name_s0.as_str().to_string() })
+            .apply_local_op(
+                ShardId(0),
+                ClusterOp::Get {
+                    name: name_s0.as_str().to_string(),
+                },
+            )
             .await
             .unwrap();
-        assert!(matches!(got, RefOpResponse::Entry(None)), "read must NOT see staged: {got:?}");
+        assert!(
+            matches!(got, RefOpResponse::Entry(None)),
+            "read must NOT see staged: {got:?}"
+        );
 
         // CommitPrepared rolls the staged value forward and releases the lock.
         let committed = store1
             .apply_local_op(
                 ShardId(0),
-                ClusterOp::CommitPrepared { txn_id: txn, name: name_s0.as_str().to_string() },
+                ClusterOp::CommitPrepared {
+                    txn_id: txn,
+                    name: name_s0.as_str().to_string(),
+                },
             )
             .await
             .unwrap();
@@ -558,7 +634,12 @@ mod tests {
         }
         // Now the committed value is visible.
         let got2 = store1
-            .apply_local_op(ShardId(0), ClusterOp::Get { name: name_s0.as_str().to_string() })
+            .apply_local_op(
+                ShardId(0),
+                ClusterOp::Get {
+                    name: name_s0.as_str().to_string(),
+                },
+            )
             .await
             .unwrap();
         match got2 {
@@ -585,7 +666,10 @@ mod tests {
         let base = format!("http://{addr}");
         let map = ShardMap::from_entries([(
             ShardId(0),
-            vec![Replica { node_id: 1, addr: base.clone() }],
+            vec![Replica {
+                node_id: 1,
+                addr: base.clone(),
+            }],
         )])
         .unwrap();
 
@@ -593,8 +677,7 @@ mod tests {
         // initializes + awaits the leader; node 1 leads its single-member shard.
         // It never forwards (it hosts the shard), so its forwarder is inert.
         let cluster = MultiShardCluster::start_placed(&map).await;
-        let served =
-            cluster.cluster_ref_store_hosting(1, &map, Arc::new(InMemoryForwarder::new()));
+        let served = cluster.cluster_ref_store_hosting(1, &map, Arc::new(InMemoryForwarder::new()));
         let served_map = map.clone();
 
         // Minimal /cluster/ref-op server: the real handler logic inlined (decode

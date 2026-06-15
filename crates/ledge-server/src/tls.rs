@@ -18,7 +18,8 @@ fn io_err(path: &str, what: &str) -> LedgeError {
 /// missing/unreadable or contains zero certificates.
 fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let pem = fs::read(path).map_err(|e| io_err(path, &format!("read cert ({e})")))?;
-    let chain: std::result::Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem.as_slice()).collect();
+    let chain: std::result::Result<Vec<_>, _> =
+        rustls_pemfile::certs(&mut pem.as_slice()).collect();
     let chain = chain.map_err(|e| io_err(path, &format!("parse cert ({e})")))?;
     if chain.is_empty() {
         return Err(io_err(path, "no certificates in PEM"));
@@ -39,7 +40,9 @@ pub(crate) fn load_ca_roots(path: &str) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut n = 0usize;
     for c in load_cert_chain(path)? {
-        roots.add(c).map_err(|e| io_err(path, &format!("add CA cert ({e})")))?;
+        roots
+            .add(c)
+            .map_err(|e| io_err(path, &format!("add CA cert ({e})")))?;
         n += 1;
     }
     if n == 0 {
@@ -87,7 +90,11 @@ pub fn client_config(ca: &str, client_id: Option<(&str, &str)>) -> Result<Client
     // Load all PEM material before the builder (see `server_config_tls_only`).
     let roots = load_ca_roots(ca)?;
     let identity = match client_id {
-        Some((cert, key)) => Some((load_cert_chain(cert)?, load_private_key(key)?, cert.to_owned())),
+        Some((cert, key)) => Some((
+            load_cert_chain(cert)?,
+            load_private_key(key)?,
+            cert.to_owned(),
+        )),
         None => None,
     };
     let builder = ClientConfig::builder().with_root_certificates(roots);
@@ -122,10 +129,14 @@ pub(crate) mod tests_support {
         let server_key = KeyPair::generate().unwrap();
         let server_params =
             CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
         let client_key = KeyPair::generate().unwrap();
         let client_params = CertificateParams::new(vec!["ledge-node".to_string()]).unwrap();
-        let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
         (
             ca_cert.pem(),
             server_cert.pem(),
@@ -182,7 +193,10 @@ mod tests {
     #[test]
     fn missing_file_is_err_naming_path() {
         let e = server_config_tls_only("/no/such/cert.pem", "/no/such/key.pem").unwrap_err();
-        assert!(e.to_string().contains("/no/such/cert.pem"), "err names the path: {e}");
+        assert!(
+            e.to_string().contains("/no/such/cert.pem"),
+            "err names the path: {e}"
+        );
     }
     #[test]
     fn garbage_pem_is_err() {

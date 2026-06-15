@@ -72,7 +72,11 @@ pub async fn rpc(
             // Only a malformed/undecodable message reaches here; business errors
             // are encoded into a 200 Response above.
             warn!(method, error = %e, "rpc malformed request");
-            (StatusCode::BAD_REQUEST, format!("malformed rpc request: {e}")).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                format!("malformed rpc request: {e}"),
+            )
+                .into_response()
         }
     }
 }
@@ -95,8 +99,15 @@ mod tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc,
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         AppState {
             objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -173,19 +184,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let reader = serialize::read_message(&mut &out[..], ReaderOptions::new()).unwrap();
-        let id_bytes: [u8; 32] =
-            match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
-                response::Which::ObjectId(oid) => {
-                    oid.unwrap().get_bytes().unwrap().try_into().unwrap()
-                }
-                _ => panic!("expected objectId"),
-            };
+        let id_bytes: [u8; 32] = match reader
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
+            response::Which::ObjectId(oid) => oid.unwrap().get_bytes().unwrap().try_into().unwrap(),
+            _ => panic!("expected objectId"),
+        };
 
-        let (status2, out2) =
-            post_rpc(crate::build_app(state), read_object_req(&id_bytes)).await;
+        let (status2, out2) = post_rpc(crate::build_app(state), read_object_req(&id_bytes)).await;
         assert_eq!(status2, StatusCode::OK);
         let reader2 = serialize::read_message(&mut &out2[..], ReaderOptions::new()).unwrap();
-        match reader2.get_root::<response::Reader>().unwrap().which().unwrap() {
+        match reader2
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
             response::Which::ObjectContent(c) => assert_eq!(c.unwrap(), &content[..]),
             _ => panic!("expected objectContent"),
         }
@@ -216,16 +233,15 @@ mod tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(
-                    p.clone(),
-                    objects.clone(),
-                    refs.clone(),
-                    hlc.clone(),
-                    ledge_workspace::QuotaLimits::default(),
-                    std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-                )
-                .unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
         let acme = store
             .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
@@ -235,7 +251,11 @@ mod tests {
             .mint("globex", PrincipalKind::User, Scopes::ALL, None, 0)
             .await
             .unwrap();
-        let auth = AuthCtx { enabled: true, store, cluster_secret: None };
+        let auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
         let state = AppState {
             objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -286,7 +306,12 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let out = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         let reader = serialize::read_message(&mut &out[..], ReaderOptions::new()).unwrap();
-        let id = match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+        let id = match reader
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
             response::Which::Workspace(w) => {
                 w.unwrap().get_id().unwrap().to_str().unwrap().to_string()
             }
@@ -320,7 +345,12 @@ mod tests {
         assert_eq!(r2.status(), StatusCode::OK); // business error rides in the body
         let out2 = to_bytes(r2.into_body(), usize::MAX).await.unwrap();
         let reader2 = serialize::read_message(&mut &out2[..], ReaderOptions::new()).unwrap();
-        match reader2.get_root::<response::Reader>().unwrap().which().unwrap() {
+        match reader2
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
             response::Which::Error(e) => {
                 assert!(
                     e.unwrap().to_str().unwrap().contains("unknown workspace"),

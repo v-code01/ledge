@@ -56,8 +56,15 @@ fn state_with_shards(dir: &TempDir, raft_shards: Option<Arc<ClusterHandles>>) ->
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) =
-        build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+    let (workspaces, leases, gc) = build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),
@@ -303,8 +310,15 @@ fn cluster_state(
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs_disk = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) =
-        build_workspace_stack(p.clone(), objects.clone(), refs_disk.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+    let (workspaces, leases, gc) = build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs_disk.clone(),
+        hlc,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
     // The node's clustered ref store (hosts only its mapped shards); the handler
     // never forwards, so an inert in-memory forwarder is fine.
     let cluster_refs: Arc<ClusterRefStore> = cluster.cluster_ref_store_hosting(
@@ -553,10 +567,13 @@ async fn cluster_gc_coordinator_reports_downed_peers_as_error_entries() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let agg: ledge_server::cluster_routes::ClusterGcStats =
-        serde_json::from_slice(&out).unwrap();
+    let agg: ledge_server::cluster_routes::ClusterGcStats = serde_json::from_slice(&out).unwrap();
     // Node 1's own pass is an Ok entry; nodes 2 and 3 are unreachable Error entries.
-    let mine = agg.per_node.iter().find(|(n, _)| *n == 1).expect("self entry present");
+    let mine = agg
+        .per_node
+        .iter()
+        .find(|(n, _)| *n == 1)
+        .expect("self entry present");
     assert!(
         matches!(mine.1, ledge_server::cluster_routes::NodeGcOutcome::Ok(_)),
         "this node's own pass succeeds"
@@ -568,7 +585,10 @@ async fn cluster_gc_coordinator_reports_downed_peers_as_error_entries() {
             *n != 1 && matches!(o, ledge_server::cluster_routes::NodeGcOutcome::Error(_))
         })
         .count();
-    assert_eq!(downed, 2, "both unreachable peers are Error entries, not a failure");
+    assert_eq!(
+        downed, 2,
+        "both unreachable peers are Error entries, not a failure"
+    );
 }
 
 #[tokio::test]

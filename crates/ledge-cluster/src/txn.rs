@@ -65,8 +65,7 @@ impl TxnCoordinator {
         mappings: &[Mapping],
     ) -> BTreeMap<ShardId, Vec<(RefName, ObjectId, Option<ObjectId>)>> {
         let router = self.store.router();
-        let mut by: BTreeMap<ShardId, Vec<(RefName, ObjectId, Option<ObjectId>)>> =
-            BTreeMap::new();
+        let mut by: BTreeMap<ShardId, Vec<(RefName, ObjectId, Option<ObjectId>)>> = BTreeMap::new();
         for (name, target, expected) in mappings {
             let shard = router.shard_for(name.as_str());
             by.entry(shard)

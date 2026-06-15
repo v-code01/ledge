@@ -237,7 +237,11 @@ pub async fn create_workspace(
     let ttl_secs = req.ttl_seconds.unwrap_or(state.default_ttl_secs);
     match state
         .workspaces
-        .fork(&sources, Duration::from_secs(ttl_secs), &principal.tenant_id)
+        .fork(
+            &sources,
+            Duration::from_secs(ttl_secs),
+            &principal.tenant_id,
+        )
         .await
     {
         Ok(view) => {
@@ -345,7 +349,11 @@ pub async fn renew_workspace(
     };
     match state
         .workspaces
-        .renew(wid, Duration::from_secs(req.ttl_seconds), &principal.tenant_id)
+        .renew(
+            wid,
+            Duration::from_secs(req.ttl_seconds),
+            &principal.tenant_id,
+        )
         .await
     {
         Ok(lease) => (
@@ -384,13 +392,20 @@ pub async fn commit_workspace(
         let d_ref = match RefName::new(durable) {
             Ok(r) => r,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("bad durable ref {durable}: {e}"))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad durable ref {durable}: {e}"),
+                )
                     .into_response();
             }
         };
         mappings.push((ws_ref, d_ref));
     }
-    match state.workspaces.commit(wid, &mappings, &principal.tenant_id).await {
+    match state
+        .workspaces
+        .commit(wid, &mappings, &principal.tenant_id)
+        .await
+    {
         Ok(outcomes) => {
             metrics::record_workspace_commit(outcomes.len() as u64);
             let out: Vec<CommitOutcomeDto> = outcomes
@@ -467,7 +482,10 @@ pub async fn delete_workspace(
 /// Cluster mode (`AppState.cluster_gc` is `Some`): run the node-local
 /// `ClusterGc::run` (cross-shard roots + grace fence). Single-node (`None`): the
 /// existing single-node `Gc::run` (byte-identical behavior).
-pub async fn admin_gc(State(state): State<AppState>, _principal: crate::auth::Principal) -> Response {
+pub async fn admin_gc(
+    State(state): State<AppState>,
+    _principal: crate::auth::Principal,
+) -> Response {
     let start = std::time::Instant::now();
     if let Some(cgc) = &state.cluster_gc {
         let now = std::time::SystemTime::now()
@@ -593,8 +611,10 @@ mod tests {
         use ledge_core::LedgeError;
         // requests: → 429 Too Many Requests (rate limit).
         assert_eq!(
-            map_lookup_err(LedgeError::QuotaExceeded("requests: rate limit exceeded".into()))
-                .status(),
+            map_lookup_err(LedgeError::QuotaExceeded(
+                "requests: rate limit exceeded".into()
+            ))
+            .status(),
             StatusCode::TOO_MANY_REQUESTS,
         );
         // every other quota resource → 507 Insufficient Storage.
@@ -622,8 +642,15 @@ pub(crate) fn test_state_for_auth(dir: &tempfile::TempDir) -> AppState {
     let hlc = Arc::new(ledge_core::HLC::new());
     let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) =
-        crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+    let (workspaces, leases, gc) = crate::build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
     AppState {
         objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
         objects_disk: objects.clone(),
@@ -660,8 +687,15 @@ mod route_tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc,
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         AppState {
             objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -752,7 +786,10 @@ mod route_tests {
         let id = j["id"].as_str().unwrap().to_string();
         let expires = j["expires_at_ms"].as_u64().unwrap();
         // Expiry must be in the future, and consistent with the default TTL.
-        assert!(expires > before_ms, "expiry {expires} not after {before_ms}");
+        assert!(
+            expires > before_ms,
+            "expiry {expires} not after {before_ms}"
+        );
         // Lower-bound: at least the default TTL out from when we started.
         assert!(
             expires >= before_ms + default_ttl_ms - 1000,
@@ -801,7 +838,10 @@ mod route_tests {
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         let expires = j["expires_at_ms"].as_u64().unwrap();
         // 60s TTL → expiry within [before, before + ~120s], far below the 3600s default.
-        assert!(expires > before_ms, "expiry {expires} not after {before_ms}");
+        assert!(
+            expires > before_ms,
+            "expiry {expires} not after {before_ms}"
+        );
         assert!(
             expires < before_ms + 120_000,
             "explicit 60s TTL not honored: expiry {expires} too far from base {before_ms}"
@@ -936,16 +976,15 @@ mod tenant_rest_tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(
-                    p.clone(),
-                    objects.clone(),
-                    refs.clone(),
-                    hlc.clone(),
-                    ledge_workspace::QuotaLimits::default(),
-                    std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-                )
-                .unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
         let acme = store
             .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
@@ -955,7 +994,11 @@ mod tenant_rest_tests {
             .mint("globex", PrincipalKind::User, Scopes::ALL, None, 0)
             .await
             .unwrap();
-        let auth = AuthCtx { enabled: true, store, cluster_secret: None };
+        let auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
         let state = AppState {
             objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -1028,7 +1071,9 @@ mod tenant_rest_tests {
         let id = create_ws(&app, &acme).await;
 
         assert_eq!(
-            req(&app, "GET", &format!("/workspaces/{id}"), &globex, "").await.0,
+            req(&app, "GET", &format!("/workspaces/{id}"), &globex, "")
+                .await
+                .0,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -1056,13 +1101,17 @@ mod tenant_rest_tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            req(&app, "DELETE", &format!("/workspaces/{id}"), &globex, "").await.0,
+            req(&app, "DELETE", &format!("/workspaces/{id}"), &globex, "")
+                .await
+                .0,
             StatusCode::NOT_FOUND
         );
 
         // acme still owns it: GET → 200.
         assert_eq!(
-            req(&app, "GET", &format!("/workspaces/{id}"), &acme, "").await.0,
+            req(&app, "GET", &format!("/workspaces/{id}"), &acme, "")
+                .await
+                .0,
             StatusCode::OK
         );
     }
@@ -1108,7 +1157,9 @@ mod tenant_rest_tests {
         let (app, acme, _globex) = two_tenant_app(&dir).await;
         let id = create_ws(&app, &acme).await;
         assert_eq!(
-            req(&app, "GET", &format!("/workspaces/{id}"), &acme, "").await.0,
+            req(&app, "GET", &format!("/workspaces/{id}"), &acme, "")
+                .await
+                .0,
             StatusCode::OK
         );
         assert_eq!(
@@ -1124,7 +1175,9 @@ mod tenant_rest_tests {
             StatusCode::OK
         );
         assert_eq!(
-            req(&app, "DELETE", &format!("/workspaces/{id}"), &acme, "").await.0,
+            req(&app, "DELETE", &format!("/workspaces/{id}"), &acme, "")
+                .await
+                .0,
             StatusCode::OK
         );
     }
@@ -1143,7 +1196,9 @@ mod tenant_rest_tests {
         let before = denied_count();
         // A foreign GET on a LIVE workspace is a cross-tenant probe → 404 + bump.
         assert_eq!(
-            req(&app, "GET", &format!("/workspaces/{id}"), &globex, "").await.0,
+            req(&app, "GET", &format!("/workspaces/{id}"), &globex, "")
+                .await
+                .0,
             StatusCode::NOT_FOUND
         );
         let after = denied_count();

@@ -17,8 +17,11 @@ use tokio::process::Command as TokioCommand;
 async fn start_server_with_store() -> (String, Arc<ledge_object_store::DiskObjectStore>, TempDir) {
     let data_dir = TempDir::new().unwrap();
     let hlc = Arc::new(ledge_core::HLC::new());
-    let objects = Arc::new(ledge_object_store::DiskObjectStore::new(data_dir.path().to_path_buf()).unwrap());
-    let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
+    let objects =
+        Arc::new(ledge_object_store::DiskObjectStore::new(data_dir.path().to_path_buf()).unwrap());
+    let refs = Arc::new(
+        ledge_ref_store::RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap(),
+    );
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
         data_dir.path().to_path_buf(),
         objects.clone(),
@@ -52,7 +55,11 @@ async fn start_server_with_store() -> (String, Arc<ledge_object_store::DiskObjec
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://127.0.0.1:{}", addr.port()), objects, data_dir)
+    (
+        format!("http://127.0.0.1:{}", addr.port()),
+        objects,
+        data_dir,
+    )
 }
 
 async fn git(args: &[&str], cwd: &Path) -> std::process::Output {
@@ -66,7 +73,11 @@ async fn git(args: &[&str], cwd: &Path) -> std::process::Output {
 }
 
 fn ok(out: &std::process::Output, ctx: &str) {
-    assert!(out.status.success(), "git {ctx}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {ctx}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Count loose object files under `objects/`, excluding the `pack/` and `tmp/` dirs.
@@ -100,35 +111,91 @@ async fn clone_from_purely_packed_store_succeeds() {
 
     // Source repo: a sizeable file across several commits, then forced deltas.
     let src = TempDir::new().unwrap();
-    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
-    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
-    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path()).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path()).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path()).await,
+        "name",
+    );
     let base: String = (0..500).map(|i| format!("line {i}\n")).collect();
     for v in 0..6 {
-        std::fs::write(src.path().join("f.txt"), base.replace("line 5\n", &format!("CHANGED v{v}\n"))).unwrap();
+        std::fs::write(
+            src.path().join("f.txt"),
+            base.replace("line 5\n", &format!("CHANGED v{v}\n")),
+        )
+        .unwrap();
         ok(&git(&["add", "."], src.path()).await, "add");
-        ok(&git(&["commit", "-m", &format!("c{v}")], src.path()).await, "commit");
+        ok(
+            &git(&["commit", "-m", &format!("c{v}")], src.path()).await,
+            "commit",
+        );
     }
-    ok(&git(&["repack", "-ad", "-f", "--window=50", "--depth=50"], src.path()).await, "repack");
-    let want = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout).unwrap().trim().to_string();
+    ok(
+        &git(
+            &["repack", "-ad", "-f", "--window=50", "--depth=50"],
+            src.path(),
+        )
+        .await,
+        "repack",
+    );
+    let want = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Push into Ledge (durable default-repo).
     let remote_url = format!("{base_url}/pack-clone-repo");
     let push = git(&["push", &remote_url, "main:refs/heads/main"], src.path()).await;
-    assert!(push.status.success(), "push: {}", String::from_utf8_lossy(&push.stderr));
+    assert!(
+        push.status.success(),
+        "push: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
 
     // REPACK the store: objects move loose → pack, loose pruned to 0.
     let loose_before = count_loose(data_dir.path());
     assert!(loose_before > 0, "objects should be loose after push");
     let stats = ledge_object_store::repack::repack(&store).await.unwrap();
     assert!(stats.objects_packed > 0);
-    assert_eq!(count_loose(data_dir.path()), 0, "store is now PURELY packed (loose pruned)");
+    assert_eq!(
+        count_loose(data_dir.path()),
+        0,
+        "store is now PURELY packed (loose pruned)"
+    );
 
     // Clone from the purely-packed store — this is the bug fix.
     let out = TempDir::new().unwrap();
-    let cl = git(&["clone", "--quiet", &remote_url, out.path().to_str().unwrap()], Path::new("/")).await;
-    assert!(cl.status.success(), "clone from packed store: {}", String::from_utf8_lossy(&cl.stderr));
-    let got = String::from_utf8(git(&["rev-parse", "main"], out.path()).await.stdout).unwrap().trim().to_string();
-    assert_eq!(got, want, "cloned-from-packed main SHA-1 matches the pushed sha");
-    assert_eq!(std::fs::read_to_string(out.path().join("f.txt")).unwrap(), base.replace("line 5\n", "CHANGED v5\n"));
+    let cl = git(
+        &[
+            "clone",
+            "--quiet",
+            &remote_url,
+            out.path().to_str().unwrap(),
+        ],
+        Path::new("/"),
+    )
+    .await;
+    assert!(
+        cl.status.success(),
+        "clone from packed store: {}",
+        String::from_utf8_lossy(&cl.stderr)
+    );
+    let got = String::from_utf8(git(&["rev-parse", "main"], out.path()).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        got, want,
+        "cloned-from-packed main SHA-1 matches the pushed sha"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("f.txt")).unwrap(),
+        base.replace("line 5\n", "CHANGED v5\n")
+    );
 }

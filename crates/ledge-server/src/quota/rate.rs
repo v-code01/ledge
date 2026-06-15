@@ -51,8 +51,8 @@ impl TenantRateLimiter {
         let rate = rate_per_sec.filter(|&r| r > 0).map(|r| r as f64);
         let burst = match (rate, burst) {
             (None, _) => 0.0,
-            (Some(r), None) => r,                     // burst defaults to the rate
-            (Some(_), Some(b)) => (b.max(1)) as f64,  // at least 1 so a single req can pass
+            (Some(r), None) => r, // burst defaults to the rate
+            (Some(_), Some(b)) => (b.max(1)) as f64, // at least 1 so a single req can pass
         };
         Self {
             rate,
@@ -92,7 +92,9 @@ impl TenantRateLimiter {
         });
         // Refill: add elapsed * rate, cap at burst. saturating_duration_since
         // makes a non-monotone `now` (should not happen with Instant) yield 0.
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * rate).min(self.burst);
         bucket.last_refill = now;
         if bucket.tokens >= 1.0 {

@@ -47,7 +47,9 @@ async fn start() -> (String, TempDir) {
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
     tokio::task::yield_now().await;
     (format!("http://127.0.0.1:{}", addr.port()), data_dir)
 }
@@ -68,13 +70,23 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> std::process::Output {
 }
 
 fn ok(o: &std::process::Output, ctx: &str) {
-    assert!(o.status.success(), "{ctx} failed: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "{ctx} failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }
 
 #[tokio::test]
 async fn lfs_push_and_clone_roundtrips_large_file() {
     // Skip cleanly if git-lfs isn't available (e.g. a minimal CI image).
-    if TokioCommand::new("git").args(["lfs", "version"]).output().await.map(|o| !o.status.success()).unwrap_or(true) {
+    if TokioCommand::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .await
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
         eprintln!("skipping: git-lfs not installed");
         return;
     }
@@ -83,29 +95,78 @@ async fn lfs_push_and_clone_roundtrips_large_file() {
 
     // A repo that tracks *.bin via LFS, with a 1 MiB deterministic file.
     let src = TempDir::new().unwrap();
-    ok(&run("git", &["init", "--initial-branch=main", "."], src.path()).await, "init");
-    ok(&run("git", &["config", "user.email", "t@l"], src.path()).await, "email");
-    ok(&run("git", &["config", "user.name", "t"], src.path()).await, "name");
-    ok(&run("git", &["lfs", "install", "--local"], src.path()).await, "lfs install");
-    ok(&run("git", &["lfs", "track", "*.bin"], src.path()).await, "lfs track");
-    let big: Vec<u8> = (0..1024u32 * 1024).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    ok(
+        &run("git", &["init", "--initial-branch=main", "."], src.path()).await,
+        "init",
+    );
+    ok(
+        &run("git", &["config", "user.email", "t@l"], src.path()).await,
+        "email",
+    );
+    ok(
+        &run("git", &["config", "user.name", "t"], src.path()).await,
+        "name",
+    );
+    ok(
+        &run("git", &["lfs", "install", "--local"], src.path()).await,
+        "lfs install",
+    );
+    ok(
+        &run("git", &["lfs", "track", "*.bin"], src.path()).await,
+        "lfs track",
+    );
+    let big: Vec<u8> = (0..1024u32 * 1024)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
     std::fs::write(src.path().join("big.bin"), &big).unwrap();
-    ok(&run("git", &["add", ".gitattributes", "big.bin"], src.path()).await, "add");
-    ok(&run("git", &["commit", "-m", "add lfs file"], src.path()).await, "commit");
+    ok(
+        &run("git", &["add", ".gitattributes", "big.bin"], src.path()).await,
+        "add",
+    );
+    ok(
+        &run("git", &["commit", "-m", "add lfs file"], src.path()).await,
+        "commit",
+    );
 
     // Push: the pointer commit over git, the bytes over the LFS Batch API.
-    ok(&run("git", &["push", &remote, "main:refs/heads/main"], src.path()).await, "push");
+    ok(
+        &run(
+            "git",
+            &["push", &remote, "main:refs/heads/main"],
+            src.path(),
+        )
+        .await,
+        "push",
+    );
     // The object is content-addressed on the server.
-    let lfs_objs = std::fs::read_dir(_dd.path().join("lfs")).map(|rd| {
-        rd.flatten().flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
-            .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten()).count()
-    }).unwrap_or(0);
-    assert!(lfs_objs >= 1, "the LFS object should be stored on the server");
+    let lfs_objs = std::fs::read_dir(_dd.path().join("lfs"))
+        .map(|rd| {
+            rd.flatten()
+                .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+                .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        lfs_objs >= 1,
+        "the LFS object should be stored on the server"
+    );
 
     // Clone: git pulls the pointer, then git-lfs fetches the bytes back.
     let clone = TempDir::new().unwrap();
     let clp = clone.path().join("c");
-    ok(&run("git", &["clone", &remote, clp.to_str().unwrap()], Path::new("/")).await, "clone");
+    ok(
+        &run(
+            "git",
+            &["clone", &remote, clp.to_str().unwrap()],
+            Path::new("/"),
+        )
+        .await,
+        "clone",
+    );
     let got = std::fs::read(clp.join("big.bin")).unwrap();
-    assert_eq!(got, big, "the LFS file round-trips byte-identical through Ledge");
+    assert_eq!(
+        got, big,
+        "the LFS file round-trips byte-identical through Ledge"
+    );
 }

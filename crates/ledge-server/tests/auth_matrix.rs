@@ -223,7 +223,14 @@ async fn matrix_6_revoked_key_401() {
     let (app, store, _admin, ro) = enabled_app(&dir).await;
     // The key works before revocation.
     assert_eq!(
-        status(app.clone(), "GET", "/workspaces", Some(("Bearer", ro.clone())), "").await,
+        status(
+            app.clone(),
+            "GET",
+            "/workspaces",
+            Some(("Bearer", ro.clone())),
+            ""
+        )
+        .await,
         StatusCode::OK
     );
     // Revoke it, then the SAME app (shared Arc<AuthStore>) must reject it.
@@ -273,7 +280,14 @@ async fn matrix_7_admin_gate_gc_and_snapshot() {
     .to_string();
     // Non-admin → 403 on BOTH admin routes.
     assert_eq!(
-        status(app.clone(), "POST", "/admin/gc", Some(("Bearer", ro.clone())), "").await,
+        status(
+            app.clone(),
+            "POST",
+            "/admin/gc",
+            Some(("Bearer", ro.clone())),
+            ""
+        )
+        .await,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -290,7 +304,14 @@ async fn matrix_7_admin_gate_gc_and_snapshot() {
     // Admin → cleared by the gate on BOTH; gc runs (200) and snapshot CoW-clones
     // the data dir to a fresh dest (200). Neither may be a 401/403.
     assert_eq!(
-        status(app.clone(), "POST", "/admin/gc", Some(("Bearer", admin.clone())), "").await,
+        status(
+            app.clone(),
+            "POST",
+            "/admin/gc",
+            Some(("Bearer", admin.clone())),
+            ""
+        )
+        .await,
         StatusCode::OK
     );
     let snap = status(
@@ -301,7 +322,11 @@ async fn matrix_7_admin_gate_gc_and_snapshot() {
         &snap_body,
     )
     .await;
-    assert_ne!(snap, StatusCode::UNAUTHORIZED, "admin clears auth on snapshot");
+    assert_ne!(
+        snap,
+        StatusCode::UNAUTHORIZED,
+        "admin clears auth on snapshot"
+    );
     assert_ne!(snap, StatusCode::FORBIDDEN, "admin clears the admin gate");
 }
 
@@ -329,7 +354,14 @@ async fn matrix_8_9_internal_route_secret_only() {
     );
     // A CLIENT admin key (not the service secret) → 401 (item 9).
     assert_eq!(
-        status(app.clone(), "POST", "/cluster/gc", Some(("Bearer", admin)), "").await,
+        status(
+            app.clone(),
+            "POST",
+            "/cluster/gc",
+            Some(("Bearer", admin)),
+            ""
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
     // Correct secret → clears the middleware (handler then 503s single-node,
@@ -343,7 +375,11 @@ async fn matrix_8_9_internal_route_secret_only() {
         "",
     )
     .await;
-    assert_ne!(s, StatusCode::UNAUTHORIZED, "correct secret must clear auth");
+    assert_ne!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "correct secret must clear auth"
+    );
     assert_ne!(s, StatusCode::FORBIDDEN);
 }
 
@@ -416,7 +452,14 @@ async fn auth_metrics_counter_advances_per_result() {
 
     // 1 `ok`: a valid read-only Bearer on a CLIENT route.
     assert_eq!(
-        status(app.clone(), "GET", "/workspaces", Some(("Bearer", ro.clone())), "").await,
+        status(
+            app.clone(),
+            "GET",
+            "/workspaces",
+            Some(("Bearer", ro.clone())),
+            ""
+        )
+        .await,
         StatusCode::OK
     );
     // 1 `unauthenticated`: no credential on a CLIENT route → 401.

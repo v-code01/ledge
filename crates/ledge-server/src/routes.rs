@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use crate::metrics;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -6,8 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
+use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
-use crate::metrics;
 
 /// Per-shard Raft handles for the cluster control plane. `None` in single-node
 /// mode (the `/raft/*` and `/cluster/*` handlers see `None` → 503), `Some` only
@@ -120,7 +120,10 @@ pub async fn healthz() -> impl IntoResponse {
 
 pub async fn metrics_handler() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         metrics::render(),
     )
 }
@@ -439,16 +442,15 @@ mod tenant_git_tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(
-                    p.clone(),
-                    objects.clone(),
-                    refs.clone(),
-                    hlc.clone(),
-                    ledge_workspace::QuotaLimits::default(),
-                    std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-                )
-                .unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
         let acme = store
             .mint("acme", PrincipalKind::User, Scopes::ALL, None, 0)
@@ -458,7 +460,11 @@ mod tenant_git_tests {
             .mint("globex", PrincipalKind::User, Scopes::ALL, None, 0)
             .await
             .unwrap();
-        let auth = AuthCtx { enabled: true, store, cluster_secret: None };
+        let auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
         let state = AppState {
             objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -521,9 +527,13 @@ mod tenant_git_tests {
         // git object so the wire discovery can resolve its SHA-1.
         let acme_oid = seed_blob(&objects, b"acme blob").await;
         let globex_oid = seed_blob(&objects, b"globex blob").await;
-        refs.update(&RefName::new("refs/tenants/acme/heads/main").unwrap(), acme_oid, None)
-            .await
-            .unwrap();
+        refs.update(
+            &RefName::new("refs/tenants/acme/heads/main").unwrap(),
+            acme_oid,
+            None,
+        )
+        .await
+        .unwrap();
         refs.update(
             &RefName::new("refs/tenants/globex/heads/feature").unwrap(),
             globex_oid,
@@ -534,13 +544,25 @@ mod tenant_git_tests {
 
         let acme_adv = discovery(&app, &acme).await;
         // acme sees its own branch, presented client-facing (prefix stripped).
-        assert!(acme_adv.contains("refs/heads/main"), "acme must see its main: {acme_adv}");
-        assert!(!acme_adv.contains("refs/heads/feature"), "acme must NOT see globex's feature");
-        assert!(!acme_adv.contains("tenants/"), "client never sees the physical prefix");
+        assert!(
+            acme_adv.contains("refs/heads/main"),
+            "acme must see its main: {acme_adv}"
+        );
+        assert!(
+            !acme_adv.contains("refs/heads/feature"),
+            "acme must NOT see globex's feature"
+        );
+        assert!(
+            !acme_adv.contains("tenants/"),
+            "client never sees the physical prefix"
+        );
 
         let globex_adv = discovery(&app, &globex).await;
         assert!(globex_adv.contains("refs/heads/feature"));
-        assert!(!globex_adv.contains("refs/heads/main"), "globex must NOT see acme's main");
+        assert!(
+            !globex_adv.contains("refs/heads/main"),
+            "globex must NOT see acme's main"
+        );
     }
 
     /// §6.4 — globex GET /ws/<acme-id>/info/refs → 404; acme on its own → 200.
@@ -586,7 +608,15 @@ mod tenant_git_tests {
                 .status()
             }
         };
-        assert_eq!(ws_get(&globex).await, StatusCode::NOT_FOUND, "globex denied acme's ws git");
-        assert_eq!(ws_get(&acme).await, StatusCode::OK, "acme serves its own ws git");
+        assert_eq!(
+            ws_get(&globex).await,
+            StatusCode::NOT_FOUND,
+            "globex denied acme's ws git"
+        );
+        assert_eq!(
+            ws_get(&acme).await,
+            StatusCode::OK,
+            "acme serves its own ws git"
+        );
     }
 }

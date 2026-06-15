@@ -21,9 +21,8 @@ impl ObjectId {
     }
 
     pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s).map_err(|e| {
-            LedgeError::Corruption(format!("invalid ObjectId hex '{s}': {e}"))
-        })?;
+        let bytes = hex::decode(s)
+            .map_err(|e| LedgeError::Corruption(format!("invalid ObjectId hex '{s}': {e}")))?;
         let arr: [u8; 32] = bytes.try_into().map_err(|_| {
             LedgeError::Corruption(format!(
                 "invalid ObjectId hex length: expected 64 chars, got {}",

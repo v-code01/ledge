@@ -294,17 +294,35 @@ mod tests {
             (
                 ShardId(0),
                 vec![
-                    Replica { node_id: 1, addr: "mem://1".into() },
-                    Replica { node_id: 2, addr: "mem://2".into() },
-                    Replica { node_id: 3, addr: "mem://3".into() },
+                    Replica {
+                        node_id: 1,
+                        addr: "mem://1".into(),
+                    },
+                    Replica {
+                        node_id: 2,
+                        addr: "mem://2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "mem://3".into(),
+                    },
                 ],
             ),
             (
                 ShardId(1),
                 vec![
-                    Replica { node_id: 1, addr: "mem://1".into() },
-                    Replica { node_id: 2, addr: "mem://2".into() },
-                    Replica { node_id: 3, addr: "mem://3".into() },
+                    Replica {
+                        node_id: 1,
+                        addr: "mem://1".into(),
+                    },
+                    Replica {
+                        node_id: 2,
+                        addr: "mem://2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "mem://3".into(),
+                    },
                 ],
             ),
         ])
@@ -348,7 +366,10 @@ mod tests {
         assert_eq!(stats.reclaimed, 1, "the lone orphan is reclaimed");
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.skipped_grace, 0);
-        assert!(!objects.exists(orphan).await.unwrap(), "orphan gone after sweep");
+        assert!(
+            !objects.exists(orphan).await.unwrap(),
+            "orphan gone after sweep"
+        );
     }
 
     #[tokio::test]

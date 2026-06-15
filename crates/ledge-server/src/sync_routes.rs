@@ -40,7 +40,11 @@ pub async fn import(
     };
     let u = &req.upstream_url;
     if !(u.starts_with("https://") || u.starts_with("http://") || u.starts_with("file://")) {
-        return (StatusCode::BAD_REQUEST, "upstream_url must be http(s) or file").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "upstream_url must be http(s) or file",
+        )
+            .into_response();
     }
     let ttl = req.ttl_seconds.unwrap_or(state.default_ttl_secs);
     match engine
@@ -112,7 +116,11 @@ pub async fn push(
     };
     let u = &req.upstream_url;
     if !(u.starts_with("https://") || u.starts_with("http://") || u.starts_with("file://")) {
-        return (StatusCode::BAD_REQUEST, "upstream_url must be http(s) or file").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "upstream_url must be http(s) or file",
+        )
+            .into_response();
     }
     match engine
         .export(

@@ -30,17 +30,35 @@ async fn two_shard_cluster() -> (
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
     ])
@@ -568,7 +586,14 @@ async fn workspace_commit_cross_shard_is_atomic() {
     let leases = Arc::new(LeaseStore::open(dir.path().join("leases"), hlc.clone()).unwrap());
     let coordinator: Arc<dyn AtomicCommit> = Arc::new(TxnCoordinator::new(store1.clone()));
     let refs_dyn: Arc<dyn RefStore> = store1.clone();
-    let mgr = WorkspaceManager::new(refs_dyn, leases, hlc, coordinator, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()));
+    let mgr = WorkspaceManager::new(
+        refs_dyn,
+        leases,
+        hlc,
+        coordinator,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    );
 
     // Fork both sources; the manager re-roots each under refs/workspaces/<id>/.
     let view = mgr
@@ -580,12 +605,7 @@ async fn workspace_commit_cross_shard_is_atomic() {
     // refs/X → refs/workspaces/<id>/X. Derive them so we can advance each forward.
     let ws_name = |src: &RefName| -> RefName {
         let suffix = src.as_str().strip_prefix("refs/").unwrap();
-        RefName::new(&format!(
-            "refs/workspaces/{}/{}",
-            view.id.to_hex(),
-            suffix
-        ))
-        .unwrap()
+        RefName::new(&format!("refs/workspaces/{}/{}", view.id.to_hex(), suffix)).unwrap()
     };
     let ws1 = ws_name(&s1);
     let ws2 = ws_name(&s2);

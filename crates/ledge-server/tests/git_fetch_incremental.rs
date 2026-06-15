@@ -51,7 +51,9 @@ async fn start_server() -> (String, TempDir) {
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
     tokio::task::yield_now().await;
     (format!("http://127.0.0.1:{}", addr.port()), data_dir)
 }
@@ -101,33 +103,77 @@ async fn partial_clone_blob_none_lazily_fetches() {
     let remote = format!("{base_url}/partial-repo");
 
     let src = TempDir::new().unwrap();
-    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
-    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
-    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path()).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path()).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path()).await,
+        "name",
+    );
     for i in 0..3 {
-        std::fs::write(src.path().join(format!("f{i}.txt")), format!("blob body number {i}\n")).unwrap();
+        std::fs::write(
+            src.path().join(format!("f{i}.txt")),
+            format!("blob body number {i}\n"),
+        )
+        .unwrap();
         ok(&git(&["add", "."], src.path()).await, "add");
-        ok(&git(&["commit", "-m", &format!("c{i}")], src.path()).await, "commit");
+        ok(
+            &git(&["commit", "-m", &format!("c{i}")], src.path()).await,
+            "commit",
+        );
     }
-    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push");
+    ok(
+        &git(&["push", &remote, "main:refs/heads/main"], src.path()).await,
+        "push",
+    );
 
     // --filter=blob:none: the initial pack omits blobs; the default checkout must
     // lazily fetch each blob by SHA (exercising allow-reachable-sha1-in-want and
     // the explicit-want-bypasses-filter rule).
     let cl = TempDir::new().unwrap();
     let clp = cl.path().join("c");
-    let out = git(&["clone", "--filter=blob:none", "--quiet", &remote, clp.to_str().unwrap()], Path::new("/")).await;
+    let out = git(
+        &[
+            "clone",
+            "--filter=blob:none",
+            "--quiet",
+            &remote,
+            clp.to_str().unwrap(),
+        ],
+        Path::new("/"),
+    )
+    .await;
     ok(&out, "partial clone");
     assert_eq!(
-        String::from_utf8(git(&["config", "remote.origin.promisor"], &clp).await.stdout).unwrap().trim(),
+        String::from_utf8(
+            git(&["config", "remote.origin.promisor"], &clp)
+                .await
+                .stdout
+        )
+        .unwrap()
+        .trim(),
         "true",
         "clone is a promisor (partial) repo"
     );
     // Checkout lazy-fetched the blobs → working tree is correct, nothing missing.
-    assert_eq!(std::fs::read_to_string(clp.join("f2.txt")).unwrap(), "blob body number 2\n");
+    assert_eq!(
+        std::fs::read_to_string(clp.join("f2.txt")).unwrap(),
+        "blob body number 2\n"
+    );
     let missing = String::from_utf8(
-        git(&["rev-list", "--objects", "--all", "--missing=print"], &clp).await.stdout,
-    ).unwrap().lines().filter(|l| l.starts_with('?')).count();
+        git(&["rev-list", "--objects", "--all", "--missing=print"], &clp)
+            .await
+            .stdout,
+    )
+    .unwrap()
+    .lines()
+    .filter(|l| l.starts_with('?'))
+    .count();
     assert_eq!(missing, 0, "all blobs lazily fetched after checkout");
 }
 
@@ -138,36 +184,94 @@ async fn shallow_clone_bounds_history() {
 
     // 8-commit repo.
     let src = TempDir::new().unwrap();
-    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
-    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
-    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path()).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path()).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path()).await,
+        "name",
+    );
     for i in 0..8 {
         std::fs::write(src.path().join("f.txt"), format!("v{i}\n")).unwrap();
         ok(&git(&["add", "."], src.path()).await, "add");
-        ok(&git(&["commit", "-m", &format!("c{i}")], src.path()).await, "commit");
+        ok(
+            &git(&["commit", "-m", &format!("c{i}")], src.path()).await,
+            "commit",
+        );
     }
-    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push");
-    let tip = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout).unwrap().trim().to_string();
+    ok(
+        &git(&["push", &remote, "main:refs/heads/main"], src.path()).await,
+        "push",
+    );
+    let tip = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // --depth 1: exactly one commit, marked shallow, working tree intact.
     let c1 = TempDir::new().unwrap();
     let c1p = c1.path().join("c");
-    ok(&git(&["clone", "--depth", "1", "--quiet", &remote, c1p.to_str().unwrap()], Path::new("/")).await, "depth-1 clone");
-    let n1 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c1p).await.stdout).unwrap().trim().to_string();
+    ok(
+        &git(
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--quiet",
+                &remote,
+                c1p.to_str().unwrap(),
+            ],
+            Path::new("/"),
+        )
+        .await,
+        "depth-1 clone",
+    );
+    let n1 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c1p).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert_eq!(n1, "1", "depth-1 clone has exactly one commit");
     assert!(c1p.join(".git/shallow").exists(), "clone is marked shallow");
     assert_eq!(
-        String::from_utf8(git(&["rev-parse", "HEAD"], &c1p).await.stdout).unwrap().trim(),
+        String::from_utf8(git(&["rev-parse", "HEAD"], &c1p).await.stdout)
+            .unwrap()
+            .trim(),
         tip,
         "shallow clone HEAD is the tip"
     );
-    assert_eq!(std::fs::read_to_string(c1p.join("f.txt")).unwrap(), "v7\n", "working tree is correct");
+    assert_eq!(
+        std::fs::read_to_string(c1p.join("f.txt")).unwrap(),
+        "v7\n",
+        "working tree is correct"
+    );
 
     // --depth 3: exactly three commits.
     let c3 = TempDir::new().unwrap();
     let c3p = c3.path().join("c");
-    ok(&git(&["clone", "--depth", "3", "--quiet", &remote, c3p.to_str().unwrap()], Path::new("/")).await, "depth-3 clone");
-    let n3 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c3p).await.stdout).unwrap().trim().to_string();
+    ok(
+        &git(
+            &[
+                "clone",
+                "--depth",
+                "3",
+                "--quiet",
+                &remote,
+                c3p.to_str().unwrap(),
+            ],
+            Path::new("/"),
+        )
+        .await,
+        "depth-3 clone",
+    );
+    let n3 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c3p).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert_eq!(n3, "3", "depth-3 clone has exactly three commits");
 }
 
@@ -178,19 +282,38 @@ async fn incremental_fetch_transfers_only_new_objects() {
 
     // Source repo: 25 commits, each a new line in f.txt (≈75 objects total).
     let src = TempDir::new().unwrap();
-    ok(&git(&["init", "--initial-branch=main", "."], src.path()).await, "init");
-    ok(&git(&["config", "user.email", "t@l"], src.path()).await, "email");
-    ok(&git(&["config", "user.name", "t"], src.path()).await, "name");
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path()).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path()).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path()).await,
+        "name",
+    );
     for i in 0..25 {
         std::fs::write(src.path().join("f.txt"), format!("line {i}\n")).unwrap();
         ok(&git(&["add", "."], src.path()).await, "add");
-        ok(&git(&["commit", "-m", &format!("c{i}")], src.path()).await, "commit");
+        ok(
+            &git(&["commit", "-m", &format!("c{i}")], src.path()).await,
+            "commit",
+        );
     }
-    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push initial");
+    ok(
+        &git(&["push", &remote, "main:refs/heads/main"], src.path()).await,
+        "push initial",
+    );
 
     // Clone it (full closure).
     let clone = TempDir::new().unwrap();
-    let cl = git(&["clone", "--quiet", &remote, clone.path().to_str().unwrap()], Path::new("/")).await;
+    let cl = git(
+        &["clone", "--quiet", &remote, clone.path().to_str().unwrap()],
+        Path::new("/"),
+    )
+    .await;
     ok(&cl, "clone");
     let total_after_clone = obj_total(clone.path()).await;
     assert!(
@@ -201,10 +324,18 @@ async fn incremental_fetch_transfers_only_new_objects() {
     // Upstream advances by ONE commit.
     std::fs::write(src.path().join("f.txt"), "the new line\n").unwrap();
     ok(&git(&["add", "."], src.path()).await, "add2");
-    ok(&git(&["commit", "-m", "c25-new"], src.path()).await, "commit2");
+    ok(
+        &git(&["commit", "-m", "c25-new"], src.path()).await,
+        "commit2",
+    );
     let new_tip = String::from_utf8(git(&["rev-parse", "main"], src.path()).await.stdout)
-        .unwrap().trim().to_string();
-    ok(&git(&["push", &remote, "main:refs/heads/main"], src.path()).await, "push update");
+        .unwrap()
+        .trim()
+        .to_string();
+    ok(
+        &git(&["push", &remote, "main:refs/heads/main"], src.path()).await,
+        "push update",
+    );
 
     // Incremental fetch from the clone.
     let before = obj_total(clone.path()).await;
@@ -213,9 +344,18 @@ async fn incremental_fetch_transfers_only_new_objects() {
     let after = obj_total(clone.path()).await;
 
     // (a) the negotiation framing is accepted by real git: origin/main advanced.
-    let got = String::from_utf8(git(&["rev-parse", "origin/main"], clone.path()).await.stdout)
-        .unwrap().trim().to_string();
-    assert_eq!(got, new_tip, "fetch must advance origin/main to the new tip");
+    let got = String::from_utf8(
+        git(&["rev-parse", "origin/main"], clone.path())
+            .await
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(
+        got, new_tip,
+        "fetch must advance origin/main to the new tip"
+    );
 
     // (b) it was INCREMENTAL: only the new commit+tree+blob (a few objects), not
     // the whole closure. Allow a small upper bound for git bookkeeping objects.
@@ -225,5 +365,8 @@ async fn incremental_fetch_transfers_only_new_objects() {
         "incremental fetch transferred {transferred} objects (expected ~3); have-line \
          negotiation is not excluding the shared history"
     );
-    assert!(transferred >= 1, "fetch should have transferred the new objects");
+    assert!(
+        transferred >= 1,
+        "fetch should have transferred the new objects"
+    );
 }

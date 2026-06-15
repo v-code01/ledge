@@ -168,7 +168,9 @@ mod tests {
         .expect("create-key prints a token");
         // Reopen the store and verify the printed token.
         let store = AuthStore::open(dd, Arc::new(HLC::new())).unwrap();
-        let p = store.verify(&token, now_ms()).expect("minted token verifies");
+        let p = store
+            .verify(&token, now_ms())
+            .expect("minted token verifies");
         assert_eq!(p.tenant_id, "acme");
         assert!(p.scopes.is_admin());
     }
@@ -227,7 +229,9 @@ mod tests {
             .await
             .unwrap()
             .expect("first boot records the bootstrap admin");
-        let p = store.verify(&token, 0).expect("bootstrapped admin verifies");
+        let p = store
+            .verify(&token, 0)
+            .expect("bootstrapped admin verifies");
         assert_eq!(p.tenant_id, "root");
         assert!(p.scopes.is_admin());
         assert_eq!(store.list().len(), 1, "exactly one key after bootstrap");

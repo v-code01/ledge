@@ -1,25 +1,50 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::process::Command as TokioCommand;
 use ledge_core::HLC;
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_server::{build_app, AppState};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::process::Command as TokioCommand;
 
 async fn start_server() -> (String, TempDir) {
     let data_dir = TempDir::new().unwrap();
-    let hlc     = Arc::new(HLC::new());
+    let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.path().to_path_buf()).unwrap());
-    let refs    = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
+    let refs = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
     let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
-        data_dir.path().to_path_buf(), objects.clone(), refs.clone(), hlc,
-        ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-    ).unwrap();
-    let app     = build_app(AppState { objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>, objects_disk: objects.clone(), refs: refs.clone() as Arc<dyn ledge_core::RefStore>, workspaces, leases, gc, default_ttl_secs: 3600, data_dir: data_dir.path().to_path_buf(), raft_shards: None, cluster_refs: None, cluster_objects: None, webhooks: None, sync: None, shard_map: None, cluster_gc: None, auth: ledge_server::auth::AuthCtx::disabled(), quota: ledge_server::quota::QuotaCtx::disabled() });
+        data_dir.path().to_path_buf(),
+        objects.clone(),
+        refs.clone(),
+        hlc,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
+    let app = build_app(AppState {
+        objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+        objects_disk: objects.clone(),
+        refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+        workspaces,
+        leases,
+        gc,
+        default_ttl_secs: 3600,
+        data_dir: data_dir.path().to_path_buf(),
+        raft_shards: None,
+        cluster_refs: None,
+        cluster_objects: None,
+        webhooks: None,
+        sync: None,
+        shard_map: None,
+        cluster_gc: None,
+        auth: ledge_server::auth::AuthCtx::disabled(),
+        quota: ledge_server::quota::QuotaCtx::disabled(),
+    });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
     tokio::task::yield_now().await;
     (format!("http://127.0.0.1:{}", addr.port()), data_dir)
 }
@@ -42,10 +67,12 @@ async fn git(args: &[&str], cwd: &Path) -> std::process::Output {
 
 fn assert_git_ok(output: &std::process::Output, ctx: &str) {
     if !output.status.success() {
-        panic!("{ctx} failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        panic!(
+            "{ctx} failed (exit {:?}):\nstdout: {}\nstderr: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -59,7 +86,9 @@ async fn healthz_endpoint_returns_200() {
     let resp = reqwest::Client::new()
         .get(format!("{base_url}/healthz"))
         .timeout(Duration::from_secs(5))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
@@ -71,10 +100,15 @@ async fn metrics_endpoint_returns_200() {
     let resp = reqwest::Client::new()
         .get(format!("{base_url}/metrics"))
         .timeout(Duration::from_secs(5))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     assert!(ct.starts_with("text/plain"), "content-type: {ct}");
 }
 
@@ -83,19 +117,36 @@ async fn metrics_endpoint_returns_200() {
 async fn upload_pack_discovery_response_format() {
     let (base_url, _data_dir) = start_server().await;
     let resp = reqwest::Client::new()
-        .get(format!("{base_url}/myrepo/info/refs?service=git-upload-pack"))
+        .get(format!(
+            "{base_url}/myrepo/info/refs?service=git-upload-pack"
+        ))
         .timeout(Duration::from_secs(5))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-    assert!(ct.contains("git-upload-pack-advertisement"), "wrong content-type: {ct}");
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("git-upload-pack-advertisement"),
+        "wrong content-type: {ct}"
+    );
     let body = resp.bytes().await.unwrap();
     // Service banner pkt-line: "# service=git-upload-pack\n" = 26 bytes + 4 prefix = 30 = 0x1e
-    assert!(body.starts_with(b"001e# service=git-upload-pack\n"),
-        "bad service banner: {:?}", &body[..body.len().min(40)]);
+    assert!(
+        body.starts_with(b"001e# service=git-upload-pack\n"),
+        "bad service banner: {:?}",
+        &body[..body.len().min(40)]
+    );
     // Followed by flush "0000"
-    assert_eq!(&body[30..34], b"0000", "expected flush after service banner");
+    assert_eq!(
+        &body[30..34],
+        b"0000",
+        "expected flush after service banner"
+    );
 }
 
 /// Verify the receive-pack discovery response via HTTP.
@@ -103,15 +154,26 @@ async fn upload_pack_discovery_response_format() {
 async fn receive_pack_discovery_response_format() {
     let (base_url, _data_dir) = start_server().await;
     let resp = reqwest::Client::new()
-        .get(format!("{base_url}/myrepo/info/refs?service=git-receive-pack"))
+        .get(format!(
+            "{base_url}/myrepo/info/refs?service=git-receive-pack"
+        ))
         .timeout(Duration::from_secs(5))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.bytes().await.unwrap();
     // "# service=git-receive-pack\n" = 27 bytes + 4 prefix = 31 = 0x1f
-    assert!(body.starts_with(b"001f# service=git-receive-pack\n"),
-        "bad service banner: {:?}", &body[..body.len().min(40)]);
-    assert_eq!(&body[31..35], b"0000", "expected flush after service banner");
+    assert!(
+        body.starts_with(b"001f# service=git-receive-pack\n"),
+        "bad service banner: {:?}",
+        &body[..body.len().min(40)]
+    );
+    assert_eq!(
+        &body[31..35],
+        b"0000",
+        "expected flush after service banner"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +184,11 @@ async fn receive_pack_discovery_response_format() {
 async fn git_clone_empty_repo() {
     let (base_url, _data_dir) = start_server().await;
     let clone_root = TempDir::new().unwrap();
-    let output = git(&["clone", &format!("{base_url}/myrepo"), "cloned"], clone_root.path()).await;
+    let output = git(
+        &["clone", &format!("{base_url}/myrepo"), "cloned"],
+        clone_root.path(),
+    )
+    .await;
     assert_git_ok(&output, "git clone empty repo");
     assert!(clone_root.path().join("cloned").is_dir());
 }
@@ -132,20 +198,44 @@ async fn git_push_and_reclone() {
     let (base_url, _data_dir) = start_server().await;
     let source = TempDir::new().unwrap();
     let sp = source.path();
-    assert_git_ok(&git(&["init", "--initial-branch=main", "."], sp).await, "git init");
-    assert_git_ok(&git(&["config", "user.email", "test@ledge.local"], sp).await, "config email");
-    assert_git_ok(&git(&["config", "user.name", "Ledge Test"], sp).await, "config name");
+    assert_git_ok(
+        &git(&["init", "--initial-branch=main", "."], sp).await,
+        "git init",
+    );
+    assert_git_ok(
+        &git(&["config", "user.email", "test@ledge.local"], sp).await,
+        "config email",
+    );
+    assert_git_ok(
+        &git(&["config", "user.name", "Ledge Test"], sp).await,
+        "config name",
+    );
     std::fs::write(sp.join("hello.txt"), b"ledge integration test payload\n").unwrap();
     assert_git_ok(&git(&["add", "hello.txt"], sp).await, "git add");
-    assert_git_ok(&git(&["commit", "-m", "feat: initial commit"], sp).await, "git commit");
+    assert_git_ok(
+        &git(&["commit", "-m", "feat: initial commit"], sp).await,
+        "git commit",
+    );
     let remote_url = format!("{base_url}/integration-test-repo");
-    assert_git_ok(&git(&["remote", "add", "ledge", &remote_url], sp).await, "git remote add");
-    assert_git_ok(&git(&["push", "ledge", "main:refs/heads/main"], sp).await, "git push");
+    assert_git_ok(
+        &git(&["remote", "add", "ledge", &remote_url], sp).await,
+        "git remote add",
+    );
+    assert_git_ok(
+        &git(&["push", "ledge", "main:refs/heads/main"], sp).await,
+        "git push",
+    );
     let clone_root = TempDir::new().unwrap();
-    assert_git_ok(&git(&["clone", &remote_url, "fresh-clone"], clone_root.path()).await, "git clone after push");
+    assert_git_ok(
+        &git(&["clone", &remote_url, "fresh-clone"], clone_root.path()).await,
+        "git clone after push",
+    );
     let cloned_file = clone_root.path().join("fresh-clone").join("hello.txt");
     assert!(cloned_file.exists(), "hello.txt must exist in fresh clone");
-    assert_eq!(std::fs::read(&cloned_file).unwrap(), b"ledge integration test payload\n");
+    assert_eq!(
+        std::fs::read(&cloned_file).unwrap(),
+        b"ledge integration test payload\n"
+    );
 }
 
 /// 7A seam proof: an `AppState` whose `refs` is an `Arc<dyn RefStore>` (backed
@@ -162,8 +252,15 @@ async fn appstate_holds_trait_objects() {
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(p.clone()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) =
-        ledge_server::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+        p.clone(),
+        objects.clone(),
+        refs.clone(),
+        hlc,
+        ledge_workspace::QuotaLimits::default(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    )
+    .unwrap();
 
     // Build AppState with the ref/object trait-object seams explicitly typed.
     let refs_dyn: Arc<dyn RefStore> = refs.clone();
@@ -200,11 +297,7 @@ async fn appstate_holds_trait_objects() {
         .unwrap();
     assert_eq!(view.refs.len(), 1);
 
-    let ws_ref = RefName::new(&format!(
-        "refs/workspaces/{}/heads/main",
-        view.id.to_hex()
-    ))
-    .unwrap();
+    let ws_ref = RefName::new(&format!("refs/workspaces/{}/heads/main", view.id.to_hex())).unwrap();
     let durable = RefName::new("refs/heads/promoted").unwrap();
     let outcomes = state
         .workspaces
@@ -214,6 +307,11 @@ async fn appstate_holds_trait_objects() {
     assert_eq!(outcomes.len(), 1);
 
     // The promotion landed, read back through the dyn RefStore seam.
-    let promoted = state.refs.get(&durable).await.unwrap().expect("promoted ref");
+    let promoted = state
+        .refs
+        .get(&durable)
+        .await
+        .unwrap()
+        .expect("promoted ref");
     assert_eq!(promoted.target, target);
 }

@@ -76,9 +76,8 @@ pub fn parse_ref_commands(data: &[u8]) -> ledge_core::Result<Vec<RefCommand>> {
                 // Strip trailing newline.
                 let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
                 // Expect exactly three space-delimited tokens.
-                let s = std::str::from_utf8(payload).map_err(|_| {
-                    LedgeError::Corruption("ref command: non-UTF-8 line".into())
-                })?;
+                let s = std::str::from_utf8(payload)
+                    .map_err(|_| LedgeError::Corruption("ref command: non-UTF-8 line".into()))?;
                 let mut parts = s.splitn(3, ' ');
                 let old_hex = parts.next().ok_or_else(|| {
                     LedgeError::Corruption(format!("ref command: missing old-sha1 in {:?}", s))
@@ -209,9 +208,8 @@ pub async fn handle_receive_pack(
                     None => &raw[..],
                 };
                 let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
-                let s = std::str::from_utf8(payload).map_err(|_| {
-                    LedgeError::Corruption("ref command: non-UTF-8 line".into())
-                })?;
+                let s = std::str::from_utf8(payload)
+                    .map_err(|_| LedgeError::Corruption("ref command: non-UTF-8 line".into()))?;
                 let mut parts = s.splitn(3, ' ');
                 let old_hex = parts.next().ok_or_else(|| {
                     LedgeError::Corruption(format!("ref command: missing old-sha1 in {:?}", s))
@@ -276,7 +274,10 @@ pub async fn handle_receive_pack(
         let ref_name = match RefName::new(&stored_name) {
             Ok(n) => n,
             Err(e) => {
-                ref_results.push((cmd.ref_name.clone(), Err(format!("invalid ref name: {}", e))));
+                ref_results.push((
+                    cmd.ref_name.clone(),
+                    Err(format!("invalid ref name: {}", e)),
+                ));
                 continue;
             }
         };
@@ -315,19 +316,14 @@ pub async fn handle_receive_pack(
             // token to RefStore::update.  This provides server-side optimistic
             // concurrency without needing a Sha1Provider in Phase 1.
             let result = match sha1_to_obj.get(&cmd.new_sha1) {
-                Some(&new_id) => {
-                    match refs.get(&ref_name).await? {
-                        Some(entry) => refs
-                            .update(&ref_name, new_id, Some(entry.target))
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| format!("{}", e)),
-                        None => Err(format!(
-                            "ref {} not found for CAS update",
-                            cmd.ref_name
-                        )),
-                    }
-                }
+                Some(&new_id) => match refs.get(&ref_name).await? {
+                    Some(entry) => refs
+                        .update(&ref_name, new_id, Some(entry.target))
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{}", e)),
+                    None => Err(format!("ref {} not found for CAS update", cmd.ref_name)),
+                },
                 None => Err(format!(
                     "object for {} not found in pack",
                     hex::encode(cmd.new_sha1)
@@ -749,7 +745,10 @@ mod tests {
         pack.extend_from_slice(&[0u8; 20]); // trailer (unverified by decode)
         let store = MemObjectStore::new();
         let r = decode_pack_objects(&pack, store.as_ref()).await;
-        assert!(r.is_err(), "a zlib bomb (size mismatch) must be rejected, not inflated");
+        assert!(
+            r.is_err(),
+            "a zlib bomb (size mismatch) must be rejected, not inflated"
+        );
     }
 
     #[test]
@@ -759,16 +758,28 @@ mod tests {
             (3u8, Bytes::from_static(b"hello")),
             (3u8, Bytes::from_static(b"world, a slightly longer blob")),
         ]);
-        assert_eq!(git_pack_len(&pack), Some(pack.len()), "full pack → its length");
+        assert_eq!(
+            git_pack_len(&pack),
+            Some(pack.len()),
+            "full pack → its length"
+        );
         // Truncated trailer / mid-object / header → None (need more bytes).
-        assert_eq!(git_pack_len(&pack[..pack.len() - 5]), None, "missing trailer bytes");
+        assert_eq!(
+            git_pack_len(&pack[..pack.len() - 5]),
+            None,
+            "missing trailer bytes"
+        );
         assert_eq!(git_pack_len(&pack[..14]), None, "mid first object");
         assert_eq!(git_pack_len(&pack[..8]), None, "shorter than header");
         assert_eq!(git_pack_len(b"NOTAPACK....."), None, "bad magic");
         // Trailing bytes after a complete pack don't extend the reported length.
         let mut extra = pack.clone();
         extra.extend_from_slice(b"trailing");
-        assert_eq!(git_pack_len(&extra), Some(pack.len()), "stops at the pack end");
+        assert_eq!(
+            git_pack_len(&extra),
+            Some(pack.len()),
+            "stops at the pack end"
+        );
     }
 
     // ── In-memory stores for testing ─────────────────────────────────────
@@ -1091,7 +1102,11 @@ mod tests {
         let refs = MemRefStore::new();
         let sha1_provider = MemObjectStore::new();
         let id = ObjectId::from_bytes([0x11u8; 32]);
-        sha1_provider.sha1s.lock().unwrap().insert(*id.as_bytes(), make_sha1(0x11));
+        sha1_provider
+            .sha1s
+            .lock()
+            .unwrap()
+            .insert(*id.as_bytes(), make_sha1(0x11));
         refs.insert("refs/workspaces/abc/heads/main", id);
 
         let response = handle_receive_pack_discovery(
@@ -1104,8 +1119,14 @@ mod tests {
 
         let s = String::from_utf8_lossy(&response);
         assert!(s.contains("refs/heads/main"), "must present stripped name");
-        assert!(!s.contains("refs/workspaces/abc/"), "must not leak stored name");
-        assert!(s.contains("report-status delete-refs"), "must keep capabilities");
+        assert!(
+            !s.contains("refs/workspaces/abc/"),
+            "must not leak stored name"
+        );
+        assert!(
+            s.contains("report-status delete-refs"),
+            "must keep capabilities"
+        );
     }
 
     // ── Test 5: push writes objects and updates ref ───────────────────────
@@ -1131,7 +1152,12 @@ mod tests {
         // Build receive-pack body: one ref create command + flush + pack.
         let null = null_sha1();
         let mut body: Vec<u8> = Vec::new();
-        body.extend_from_slice(&pkt_ref_cmd(&null, &blob_sha1, "refs/heads/main", Some(" caps")));
+        body.extend_from_slice(&pkt_ref_cmd(
+            &null,
+            &blob_sha1,
+            "refs/heads/main",
+            Some(" caps"),
+        ));
         body.extend_from_slice(&encode_flush());
         body.extend_from_slice(&pack);
 
@@ -1178,7 +1204,12 @@ mod tests {
         let null = null_sha1();
         let mut body: Vec<u8> = Vec::new();
         // Client pushes the normal name refs/heads/main.
-        body.extend_from_slice(&pkt_ref_cmd(&null, &blob_sha1, "refs/heads/main", Some(" caps")));
+        body.extend_from_slice(&pkt_ref_cmd(
+            &null,
+            &blob_sha1,
+            "refs/heads/main",
+            Some(" caps"),
+        ));
         body.extend_from_slice(&encode_flush());
         body.extend_from_slice(&pack);
 
@@ -1197,9 +1228,15 @@ mod tests {
         assert!(s.contains("ok refs/heads/main"), "{s}");
         // ...but the ref is stored under the workspace prefix.
         let stored = RefName::new("refs/workspaces/abc/heads/main").unwrap();
-        assert!(refs.get(&stored).await.unwrap().is_some(), "must store under ws prefix");
+        assert!(
+            refs.get(&stored).await.unwrap().is_some(),
+            "must store under ws prefix"
+        );
         let client = RefName::new("refs/heads/main").unwrap();
-        assert!(refs.get(&client).await.unwrap().is_none(), "must NOT store under client name");
+        assert!(
+            refs.get(&client).await.unwrap().is_none(),
+            "must NOT store under client name"
+        );
     }
 
     // ── Test 6: create-conflict reports ng ───────────────────────────────
@@ -1213,9 +1250,17 @@ mod tests {
     async fn decode_resolves_real_delta_pack() {
         let dir = tempfile::TempDir::new().unwrap();
         let g = |args: &[&str]| {
-            let o = std::process::Command::new("git").args(args).current_dir(dir.path())
-                .env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
-            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
             o
         };
         g(&["init", "--initial-branch=main", "."]);
@@ -1223,32 +1268,51 @@ mod tests {
         g(&["config", "user.name", "t"]);
         let big: String = (0..400).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.path().join("f.txt"), &big).unwrap();
-        g(&["add", "."]); g(&["commit", "-m", "c1"]);
-        std::fs::write(dir.path().join("f.txt"), big.replace("line 5\n", "LINE FIVE\n")).unwrap();
-        g(&["add", "."]); g(&["commit", "-m", "c2"]);
+        g(&["add", "."]);
+        g(&["commit", "-m", "c1"]);
+        std::fs::write(
+            dir.path().join("f.txt"),
+            big.replace("line 5\n", "LINE FIVE\n"),
+        )
+        .unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "c2"]);
         g(&["repack", "-ad", "-f", "--window=50", "--depth=50"]);
-        let rev = std::process::Command::new("git").args(["rev-list", "--objects", "--all"])
-            .current_dir(dir.path()).output().unwrap();
+        let rev = std::process::Command::new("git")
+            .args(["rev-list", "--objects", "--all"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         let pack = {
             use std::io::Write;
             let mut c = std::process::Command::new("git")
                 .args(["pack-objects", "--stdout", "--delta-base-offset"])
                 .current_dir(dir.path())
-                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-                .spawn().unwrap();
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
             c.stdin.take().unwrap().write_all(&rev.stdout).unwrap();
             c.wait_with_output().unwrap().stdout
         };
         // Guarantee the pack actually contains a delta (else the path isn't exercised).
         let pf = dir.path().join("p.pack");
         std::fs::write(&pf, &pack).unwrap();
-        let _ = std::process::Command::new("git").args(["index-pack", pf.to_str().unwrap()])
-            .current_dir(dir.path()).output().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["index-pack", pf.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         let idx = pf.with_extension("idx");
-        let vp = std::process::Command::new("git").args(["verify-pack", "-v", idx.to_str().unwrap()])
-            .current_dir(dir.path()).output().unwrap();
-        assert!(String::from_utf8_lossy(&vp.stdout).contains("delta"),
-            "test pack must contain a delta to exercise the path");
+        let vp = std::process::Command::new("git")
+            .args(["verify-pack", "-v", idx.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&vp.stdout).contains("delta"),
+            "test pack must contain a delta to exercise the path"
+        );
 
         let store = MemObjectStore::new();
         let decoded = decode_pack_objects(&pack, store.as_ref()).await.unwrap();
@@ -1266,8 +1330,11 @@ mod tests {
             // byte-match the reconstructed canonical content. That the computed
             // SHA-1 (over our reconstructed bytes) is one git knows already
             // proves the delta resolved correctly.
-            let cat = std::process::Command::new("git").args(["cat-file", name, &hex])
-                .current_dir(dir.path()).output().unwrap();
+            let cat = std::process::Command::new("git")
+                .args(["cat-file", name, &hex])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
             assert!(cat.status.success(), "git knows object {hex}");
             assert_eq!(cat.stdout, *content, "content matches for {hex}");
         }

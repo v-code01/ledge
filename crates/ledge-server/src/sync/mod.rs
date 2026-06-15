@@ -148,7 +148,10 @@ impl SyncEngine {
         let mut sha1_to_oid = std::collections::HashMap::with_capacity(objs.len());
         let mut n = 0u64;
         for (sha1, ty, content) in objs {
-            let oid = self.objects.write_git_object(ty, Bytes::from(content)).await?;
+            let oid = self
+                .objects
+                .write_git_object(ty, Bytes::from(content))
+                .await?;
             sha1_to_oid.insert(sha1, oid);
             n += 1;
         }
@@ -214,7 +217,11 @@ impl SyncEngine {
         });
         let mut tips: Vec<(String, ObjectId)> = Vec::new();
         for (name, entry) in all {
-            let branch = name.as_str().strip_prefix(&prefix).unwrap_or("").to_string();
+            let branch = name
+                .as_str()
+                .strip_prefix(&prefix)
+                .unwrap_or("")
+                .to_string();
             if branch.is_empty() {
                 continue;
             }
@@ -243,7 +250,8 @@ impl SyncEngine {
         }
         crate::metrics::record_sync_objects("export", n);
         let mut refspecs = Vec::new();
-        let mut tip_sha: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut tip_sha: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for (branch, oid) in &tips {
             let sha = hex20(&self.objects.sha1_of(*oid).await?);
             git_cli::update_ref(&repo, &format!("refs/heads/{branch}"), &sha).await?;
@@ -407,7 +415,10 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
-        assert_eq!(got, main_a, "round-trip A→Ledge→B preserves the commit SHA-1");
+        assert_eq!(
+            got, main_a,
+            "round-trip A→Ledge→B preserves the commit SHA-1"
+        );
     }
 
     #[tokio::test]
@@ -437,7 +448,12 @@ mod tests {
         );
         let (bare_a, _) = make_upstream_with_sha().await;
         let imp = engine
-            .import("acme", &format!("file://{}", bare_a.path().display()), None, 3600)
+            .import(
+                "acme",
+                &format!("file://{}", bare_a.path().display()),
+                None,
+                3600,
+            )
             .await
             .unwrap();
         let bare_b = tempfile::TempDir::new().unwrap();
@@ -487,11 +503,9 @@ mod tests {
         assert_eq!(res.default_branch.as_deref(), Some("main"));
         assert!(res.refs.iter().any(|r| r.name == "refs/heads/main"));
         // the workspace ref exists + its target's git SHA-1 == upstream main
-        let ws_ref = ledge_core::RefName::new(&format!(
-            "refs/workspaces/{}/heads/main",
-            res.workspace_id
-        ))
-        .unwrap();
+        let ws_ref =
+            ledge_core::RefName::new(&format!("refs/workspaces/{}/heads/main", res.workspace_id))
+                .unwrap();
         let entry = refs_dyn.get(&ws_ref).await.unwrap().expect("ws ref set");
         let got_sha = objects.sha1_of(entry.target).await.unwrap();
         let got_hex: String = got_sha.iter().map(|b| format!("{b:02x}")).collect();

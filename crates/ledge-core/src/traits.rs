@@ -173,10 +173,7 @@ mod tests {
                 (Some(_), None) => return Err(LedgeError::NotFound(new)),
                 _ => {}
             }
-            let version = self
-                .ver
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
+            let version = self.ver.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let entry = RefEntry {
                 target: new,
                 hlc: version,
@@ -329,9 +326,13 @@ mod tests {
     async fn test_ref_store_list_prefix() {
         let s = MemRefStore::new();
         for r in ["refs/heads/main", "refs/heads/dev", "refs/tags/v1"] {
-            s.update(&RefName::new(r).unwrap(), ObjectId::from_bytes([1u8; 32]), None)
-                .await
-                .unwrap();
+            s.update(
+                &RefName::new(r).unwrap(),
+                ObjectId::from_bytes([1u8; 32]),
+                None,
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(s.list("refs/heads/").await.unwrap().len(), 2);
         assert_eq!(s.list("refs/tags/").await.unwrap().len(), 1);

@@ -93,21 +93,47 @@ pub fn render() -> String {
     HANDLE.get().map(|h| h.render()).unwrap_or_default()
 }
 
-pub fn record_object_write() { metrics::counter!(OBJECT_WRITES_TOTAL).increment(1); }
-pub fn record_object_write_bytes(bytes: u64) { metrics::counter!(OBJECT_WRITE_BYTES_TOTAL).increment(bytes); }
-pub fn record_object_write_duration(d: std::time::Duration) { metrics::histogram!(OBJECT_WRITE_DURATION).record(d.as_secs_f64()); }
-pub fn record_object_read() { metrics::counter!(OBJECT_READS_TOTAL).increment(1); }
-pub fn record_ref_update() { metrics::counter!(REF_UPDATES_TOTAL).increment(1); }
-pub fn record_ref_cas_retries(n: u64) { metrics::counter!(REF_CAS_RETRIES_TOTAL).increment(n); }
-pub fn record_git_request(svc: &'static str) { metrics::counter!(GIT_REQUESTS_TOTAL, "service" => svc).increment(1); }
-pub fn record_git_request_duration(svc: &'static str, d: std::time::Duration) { metrics::histogram!(GIT_REQUEST_DURATION, "service" => svc).record(d.as_secs_f64()); }
+pub fn record_object_write() {
+    metrics::counter!(OBJECT_WRITES_TOTAL).increment(1);
+}
+pub fn record_object_write_bytes(bytes: u64) {
+    metrics::counter!(OBJECT_WRITE_BYTES_TOTAL).increment(bytes);
+}
+pub fn record_object_write_duration(d: std::time::Duration) {
+    metrics::histogram!(OBJECT_WRITE_DURATION).record(d.as_secs_f64());
+}
+pub fn record_object_read() {
+    metrics::counter!(OBJECT_READS_TOTAL).increment(1);
+}
+pub fn record_ref_update() {
+    metrics::counter!(REF_UPDATES_TOTAL).increment(1);
+}
+pub fn record_ref_cas_retries(n: u64) {
+    metrics::counter!(REF_CAS_RETRIES_TOTAL).increment(n);
+}
+pub fn record_git_request(svc: &'static str) {
+    metrics::counter!(GIT_REQUESTS_TOTAL, "service" => svc).increment(1);
+}
+pub fn record_git_request_duration(svc: &'static str, d: std::time::Duration) {
+    metrics::histogram!(GIT_REQUEST_DURATION, "service" => svc).record(d.as_secs_f64());
+}
 
 /// Gauge: live (unexpired, non-tombstoned) workspace count.
-pub fn set_workspaces_active(n: f64) { metrics::gauge!(WORKSPACES_ACTIVE).set(n); }
-pub fn record_workspace_fork() { metrics::counter!(WORKSPACE_FORKS_TOTAL).increment(1); }
-pub fn record_workspace_commit(n: u64) { metrics::counter!(WORKSPACE_COMMITS_TOTAL).increment(n); }
-pub fn record_workspace_release() { metrics::counter!(WORKSPACE_RELEASES_TOTAL).increment(1); }
-pub fn record_lease_expired(n: u64) { metrics::counter!(LEASES_EXPIRED_TOTAL).increment(n); }
+pub fn set_workspaces_active(n: f64) {
+    metrics::gauge!(WORKSPACES_ACTIVE).set(n);
+}
+pub fn record_workspace_fork() {
+    metrics::counter!(WORKSPACE_FORKS_TOTAL).increment(1);
+}
+pub fn record_workspace_commit(n: u64) {
+    metrics::counter!(WORKSPACE_COMMITS_TOTAL).increment(n);
+}
+pub fn record_workspace_release() {
+    metrics::counter!(WORKSPACE_RELEASES_TOTAL).increment(1);
+}
+pub fn record_lease_expired(n: u64) {
+    metrics::counter!(LEASES_EXPIRED_TOTAL).increment(n);
+}
 
 /// Record one GC pass: bump the run counter, reclaimed/bytes counters, the
 /// duration histogram, AND the last-pass grace-retained gauge (0 for single-node).
@@ -304,8 +330,7 @@ pub fn record_raft_metrics(
 /// Gauge: `1` if this node hosts `shard`, else `0`. Set once at host-build time
 /// in `build_cluster_stack` (cluster only); single-node never emits this series.
 pub fn set_shard_hosted(shard: u32, hosted: bool) {
-    metrics::gauge!(SHARD_HOSTED, "shard" => shard.to_string())
-        .set(if hosted { 1.0 } else { 0.0 });
+    metrics::gauge!(SHARD_HOSTED, "shard" => shard.to_string()).set(if hosted { 1.0 } else { 0.0 });
 }
 
 /// Counter: a shard-targeted ref op was APPLIED locally via `/cluster/ref-op`.
@@ -319,16 +344,22 @@ pub fn record_ref_op_applied(shard: u32) {
 //    single helper module. ─────────────────────────────────────────────────────
 
 /// Counter: a multi-shard 2PC transaction entered the prepare phase.
-pub fn record_txn_started() { metrics::counter!(TXN_STARTED_TOTAL).increment(1); }
+pub fn record_txn_started() {
+    metrics::counter!(TXN_STARTED_TOTAL).increment(1);
+}
 /// Counter: a transaction reached a durable `TxnDecide{commit}` (the commit point).
-pub fn record_txn_committed() { metrics::counter!(TXN_COMMITTED_TOTAL).increment(1); }
+pub fn record_txn_committed() {
+    metrics::counter!(TXN_COMMITTED_TOTAL).increment(1);
+}
 /// Counter: a transaction aborted. `reason` is the abort cause (e.g. `prepare_no`).
 pub fn record_txn_aborted(reason: &'static str) {
     metrics::counter!(TXN_ABORTED_TOTAL, "reason" => reason).increment(1);
 }
 /// Counter: a prepared lock was resolved by the crash-recovery `TxnResolver`
 /// (rolled forward after a Commit decision or released on presumed-abort).
-pub fn record_txn_recovered() { metrics::counter!(TXN_RECOVERED_TOTAL).increment(1); }
+pub fn record_txn_recovered() {
+    metrics::counter!(TXN_RECOVERED_TOTAL).increment(1);
+}
 /// Counter: one prepare vote; `vote` is `"yes"` or `"no"`.
 pub fn record_txn_prepare_vote(vote: &'static str) {
     metrics::counter!(TXN_PREPARE_VOTES_TOTAL, "vote" => vote).increment(1);
@@ -338,7 +369,9 @@ pub fn record_txn_duration(d: std::time::Duration) {
     metrics::histogram!(TXN_DURATION).record(d.as_secs_f64());
 }
 /// Gauge: number of currently-held prepared locks (in-doubt 2PC participants).
-pub fn set_prepared_locks(n: u64) { metrics::gauge!(PREPARED_LOCKS).set(n as f64); }
+pub fn set_prepared_locks(n: u64) {
+    metrics::gauge!(PREPARED_LOCKS).set(n as f64);
+}
 
 #[cfg(test)]
 mod tests {
@@ -435,7 +468,10 @@ mod tests {
     #[test]
     fn gc_metric_names_match_spec() {
         assert_eq!(GC_RUNS_TOTAL, "ledge_gc_runs_total");
-        assert_eq!(GC_OBJECTS_RECLAIMED_TOTAL, "ledge_gc_objects_reclaimed_total");
+        assert_eq!(
+            GC_OBJECTS_RECLAIMED_TOTAL,
+            "ledge_gc_objects_reclaimed_total"
+        );
         assert_eq!(GC_BYTES_FREED_TOTAL, "ledge_gc_bytes_freed_total");
         assert_eq!(GC_DURATION, "ledge_gc_duration_seconds");
         assert_eq!(GC_GRACE_RETAINED, "ledge_gc_grace_retained");
@@ -505,7 +541,10 @@ mod tests {
     #[test]
     fn webhook_metric_constants_correct() {
         assert_eq!(WEBHOOK_DELIVERIES_TOTAL, "ledge_webhook_deliveries_total");
-        assert_eq!(WEBHOOK_DELIVERY_DURATION, "ledge_webhook_delivery_duration_seconds");
+        assert_eq!(
+            WEBHOOK_DELIVERY_DURATION,
+            "ledge_webhook_delivery_duration_seconds"
+        );
         assert_eq!(WEBHOOKS_REGISTERED, "ledge_webhooks_registered");
     }
     #[test]

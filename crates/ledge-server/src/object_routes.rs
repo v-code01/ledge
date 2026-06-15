@@ -99,15 +99,18 @@ mod tests {
     /// Build a minimal `AppState` over a tempdir-backed store for handler tests.
     /// Only `objects_disk` is exercised by these routes; the other seams are the
     /// up-cast of the same local store (single-node shape).
-    async fn test_state() -> (AppState, tempfile::TempDir, Arc<ledge_object_store::DiskObjectStore>)
-    {
+    async fn test_state() -> (
+        AppState,
+        tempfile::TempDir,
+        Arc<ledge_object_store::DiskObjectStore>,
+    ) {
         use ledge_core::HLC;
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_path_buf();
-        let objects =
-            Arc::new(ledge_object_store::DiskObjectStore::new(data_dir.clone()).unwrap());
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(data_dir.clone()).unwrap());
         let hlc = Arc::new(HLC::new());
-        let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(data_dir.clone(), hlc.clone()).unwrap());
+        let refs =
+            Arc::new(ledge_ref_store::RefStoreImpl::open(data_dir.clone(), hlc.clone()).unwrap());
         let (workspaces, leases, gc) = crate::build_workspace_stack(
             data_dir.clone(),
             objects.clone(),
@@ -164,7 +167,9 @@ mod tests {
 
         let resp = get_object(State(state), Path((0, id_hex))).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let got = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&got[..], &body[..]);
     }
 

@@ -134,7 +134,10 @@ async fn import_roundtrips_sha1_over_http() {
     );
     std::fs::write(work.path().join("a.txt"), b"payload\n").unwrap();
     assert_git_ok(&git(&["add", "a.txt"], work.path()).await, "git add");
-    assert_git_ok(&git(&["commit", "-m", "c1"], work.path()).await, "git commit");
+    assert_git_ok(
+        &git(&["commit", "-m", "c1"], work.path()).await,
+        "git commit",
+    );
     assert_git_ok(
         &git(&["tag", "-a", "v1", "-m", "v1"], work.path()).await,
         "git tag",
@@ -237,11 +240,7 @@ async fn bad_upstream_is_clean_error() {
     assert_eq!(resp.status(), 502, "bad upstream ⇒ 502");
 
     // Server is still serving after the failed import.
-    let h = client
-        .get(format!("{base}/healthz"))
-        .send()
-        .await
-        .unwrap();
+    let h = client.get(format!("{base}/healthz")).send().await.unwrap();
     assert!(h.status().is_success(), "server healthy after bad import");
 }
 
@@ -265,7 +264,10 @@ async fn make_local_upstream() -> (String, String) {
     );
     std::fs::write(work.path().join("a.txt"), b"payload\n").unwrap();
     assert_git_ok(&git(&["add", "a.txt"], work.path()).await, "git add");
-    assert_git_ok(&git(&["commit", "-m", "c1"], work.path()).await, "git commit");
+    assert_git_ok(
+        &git(&["commit", "-m", "c1"], work.path()).await,
+        "git commit",
+    );
     let main_sha = String::from_utf8(git(&["rev-parse", "main"], work.path()).await.stdout)
         .unwrap()
         .trim()

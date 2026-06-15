@@ -15,7 +15,9 @@ pub fn read_size_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize)> {
     let mut result: usize = 0;
     let mut shift = 0u32;
     loop {
-        let b = *data.get(pos).ok_or_else(|| LedgeError::Corruption("delta: truncated varint".into()))?;
+        let b = *data
+            .get(pos)
+            .ok_or_else(|| LedgeError::Corruption("delta: truncated varint".into()))?;
         pos += 1;
         result |= ((b & 0x7f) as usize)
             .checked_shl(shift)
@@ -34,11 +36,15 @@ pub fn read_size_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize)> {
 /// Git's OFS_DELTA base-offset encoding (`((off+1)<<7)|x` continuation form).
 /// Returns (offset, next_pos).
 pub fn read_ofs_varint(data: &[u8], mut pos: usize) -> Result<(u64, usize)> {
-    let mut c = *data.get(pos).ok_or_else(|| LedgeError::Corruption("delta: truncated ofs".into()))?;
+    let mut c = *data
+        .get(pos)
+        .ok_or_else(|| LedgeError::Corruption("delta: truncated ofs".into()))?;
     pos += 1;
     let mut off = (c & 0x7f) as u64;
     while c & 0x80 != 0 {
-        c = *data.get(pos).ok_or_else(|| LedgeError::Corruption("delta: truncated ofs".into()))?;
+        c = *data
+            .get(pos)
+            .ok_or_else(|| LedgeError::Corruption("delta: truncated ofs".into()))?;
         pos += 1;
         off = off
             .checked_add(1)
@@ -117,7 +123,9 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                 .checked_add(cp_size)
                 .ok_or_else(|| LedgeError::Corruption("delta: copy overflow".into()))?;
             if end > base.len() {
-                return Err(LedgeError::Corruption("delta: copy out of base bounds".into()));
+                return Err(LedgeError::Corruption(
+                    "delta: copy out of base bounds".into(),
+                ));
             }
             out.extend_from_slice(&base[cp_off..end]);
         } else if op != 0 {
@@ -127,7 +135,9 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                 .checked_add(len)
                 .ok_or_else(|| LedgeError::Corruption("delta: insert overflow".into()))?;
             if end > delta.len() {
-                return Err(LedgeError::Corruption("delta: insert out of delta bounds".into()));
+                return Err(LedgeError::Corruption(
+                    "delta: insert out of delta bounds".into(),
+                ));
             }
             out.extend_from_slice(&delta[p..end]);
             p = end;
@@ -311,7 +321,20 @@ mod tests {
     }
     #[test]
     fn write_ofs_varint_roundtrips_read() {
-        for &off in &[0u64, 1, 2, 126, 127, 128, 129, 16_383, 16_384, 16_385, 1 << 21, (1 << 28) + 7] {
+        for &off in &[
+            0u64,
+            1,
+            2,
+            126,
+            127,
+            128,
+            129,
+            16_383,
+            16_384,
+            16_385,
+            1 << 21,
+            (1 << 28) + 7,
+        ] {
             let mut buf = Vec::new();
             write_ofs_varint(&mut buf, off);
             let (got, used) = read_ofs_varint(&buf, 0).unwrap();
@@ -329,12 +352,12 @@ mod tests {
         //   insert op 0x05 then b" RUST"
         //   copy op 0x91, off-byte 0x05, size-byte 0x06
         let delta: &[u8] = &[
-            0x0b, 0x10,
-            0x91, 0x00, 0x05,
-            0x05, b' ', b'R', b'U', b'S', b'T',
-            0x91, 0x05, 0x06,
+            0x0b, 0x10, 0x91, 0x00, 0x05, 0x05, b' ', b'R', b'U', b'S', b'T', 0x91, 0x05, 0x06,
         ];
-        assert_eq!(apply_delta(b"hello world", delta).unwrap(), b"hello RUST world".to_vec());
+        assert_eq!(
+            apply_delta(b"hello world", delta).unwrap(),
+            b"hello RUST world".to_vec()
+        );
     }
     #[test]
     fn apply_delta_rejects_base_size_mismatch() {
@@ -353,22 +376,45 @@ mod tests {
 
     #[test]
     fn encode_delta_roundtrips() {
-        let base500: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
-        let edited = String::from_utf8(base500.clone()).unwrap().replace("line 250\n", "LINE TWO FIFTY\n").into_bytes();
+        let base500: Vec<u8> = (0..500)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let edited = String::from_utf8(base500.clone())
+            .unwrap()
+            .replace("line 250\n", "LINE TWO FIFTY\n")
+            .into_bytes();
         let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (base500.clone(), edited.clone()),
             (base500.clone(), base500.clone()),
-            (base500.clone(), [base500.clone(), b"appended tail\n".to_vec()].concat()),
-            ([b"prefix\n".to_vec(), base500.clone()].concat(), base500.clone()),
+            (
+                base500.clone(),
+                [base500.clone(), b"appended tail\n".to_vec()].concat(),
+            ),
+            (
+                [b"prefix\n".to_vec(), base500.clone()].concat(),
+                base500.clone(),
+            ),
             (b"".to_vec(), b"hello".to_vec()),
             (b"hello".to_vec(), b"".to_vec()),
-            ((0..2000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect(),
-             (0..2000u32).map(|i| (i.wrapping_mul(40503) >> 24) as u8).collect()),
+            (
+                (0..2000u32)
+                    .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+                    .collect(),
+                (0..2000u32)
+                    .map(|i| (i.wrapping_mul(40503) >> 24) as u8)
+                    .collect(),
+            ),
         ];
         for (base, target) in cases {
             let d = encode_delta(&base, &target);
             let out = apply_delta(&base, &d).expect("apply");
-            assert_eq!(out, target, "round-trip (base {} target {})", base.len(), target.len());
+            assert_eq!(
+                out,
+                target,
+                "round-trip (base {} target {})",
+                base.len(),
+                target.len()
+            );
         }
     }
     proptest::proptest! {
@@ -397,12 +443,20 @@ mod tests {
     fn delta_index_matches_encode_delta() {
         // The reusable DeltaIndex must produce byte-identical deltas to the
         // one-shot encode_delta over the full roundtrip corpus.
-        let base500: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
-        let edited = String::from_utf8(base500.clone()).unwrap().replace("line 250\n", "X\n").into_bytes();
+        let base500: Vec<u8> = (0..500)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let edited = String::from_utf8(base500.clone())
+            .unwrap()
+            .replace("line 250\n", "X\n")
+            .into_bytes();
         let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (base500.clone(), edited),
             (base500.clone(), base500.clone()),
-            (base500.clone(), [base500.clone(), b"tail\n".to_vec()].concat()),
+            (
+                base500.clone(),
+                [base500.clone(), b"tail\n".to_vec()].concat(),
+            ),
             (b"".to_vec(), b"hello".to_vec()),
             (b"hello".to_vec(), b"".to_vec()),
         ];
@@ -416,9 +470,19 @@ mod tests {
 
     #[test]
     fn encode_delta_small_edit_is_small() {
-        let base: Vec<u8> = (0..500).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
-        let target = String::from_utf8(base.clone()).unwrap().replace("line 250\n", "X\n").into_bytes();
+        let base: Vec<u8> = (0..500)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let target = String::from_utf8(base.clone())
+            .unwrap()
+            .replace("line 250\n", "X\n")
+            .into_bytes();
         let d = encode_delta(&base, &target);
-        assert!(d.len() < target.len() / 2, "delta {} should be << target {}", d.len(), target.len());
+        assert!(
+            d.len() < target.len() / 2,
+            "delta {} should be << target {}",
+            d.len(),
+            target.len()
+        );
     }
 }

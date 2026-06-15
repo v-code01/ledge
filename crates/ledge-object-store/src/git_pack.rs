@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use ledge_core::delta::{apply_delta, encode_delta, DeltaIndex, write_ofs_varint};
+use ledge_core::delta::{apply_delta, encode_delta, write_ofs_varint, DeltaIndex};
 use ledge_core::{LedgeError, Result};
 
 /// Cap on delta-chain depth. git's own default is `--depth=50`; we honour the
@@ -38,8 +38,7 @@ pub fn pack_name_hash(name: &[u8]) -> u32 {
 }
 
 fn zlib(data: &[u8]) -> Vec<u8> {
-    let mut e =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(data).expect("zlib write to Vec infallible");
     e.finish().expect("zlib finish infallible")
 }
@@ -106,7 +105,8 @@ pub fn write_git_pack(
     // (when the object is processed) and reused across every later target that
     // probes it. Without this, a `window`-wide search rebuilt each base's index
     // per target — the cost wall that made a 250-wide window unaffordable.
-    let mut indices: std::collections::HashMap<usize, DeltaIndex> = std::collections::HashMap::new();
+    let mut indices: std::collections::HashMap<usize, DeltaIndex> =
+        std::collections::HashMap::new();
     for &i in &order {
         if window > 0 {
             let target = &objects[i].content;
@@ -136,7 +136,8 @@ pub fn write_git_pack(
             if let Some((b, delta)) = best {
                 // self-verify the winner (never emit a delta git would mis-decode),
                 // and only commit if its zlib actually beats the full object's zlib.
-                let verified = matches!(apply_delta(&objects[b].content, &delta), Ok(ref r) if r == target);
+                let verified =
+                    matches!(apply_delta(&objects[b].content, &delta), Ok(ref r) if r == target);
                 if verified && zlib(&delta).len() < zlib(target).len() {
                     depth[i] = depth[b] + 1;
                     chosen[i] = Some((b, delta));
@@ -284,7 +285,18 @@ mod tests {
     fn obj_header_roundtrips() {
         // Cover boundary sizes around the 4-bit and each 7-bit varint chunk.
         for &size in &[
-            0usize, 1, 15, 16, 17, 127, 128, 2047, 2048, 65_535, 1 << 20, (1 << 28) + 5,
+            0usize,
+            1,
+            15,
+            16,
+            17,
+            127,
+            128,
+            2047,
+            2048,
+            65_535,
+            1 << 20,
+            (1 << 28) + 5,
         ] {
             for git_type in 1u8..=4 {
                 let mut out = Vec::new();
@@ -582,7 +594,11 @@ mod tests {
             ))
             .output()
             .unwrap();
-        assert!(st.status.success(), "unpack: {}", String::from_utf8_lossy(&st.stderr));
+        assert!(
+            st.status.success(),
+            "unpack: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
         for o in &objs {
             let hex: String = o.sha1.iter().map(|b| format!("{b:02x}")).collect();
             let ty = match o.git_type {
@@ -592,7 +608,11 @@ mod tests {
                 4 => "tag",
                 _ => unreachable!(),
             };
-            assert_eq!(git(&["cat-file", ty, &hex], dst.path()), o.content, "object {hex} mismatch");
+            assert_eq!(
+                git(&["cat-file", ty, &hex], dst.path()),
+                o.content,
+                "object {hex} mismatch"
+            );
         }
     }
 }

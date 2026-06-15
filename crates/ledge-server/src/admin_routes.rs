@@ -74,7 +74,10 @@ pub async fn admin_snapshot(
         Ok(Ok(stats)) => stats,
         Ok(Err(e)) => {
             warn!(error = %e, "snapshot clone failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("snapshot failed: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("snapshot failed: {e}"),
+            )
                 .into_response();
         }
         Err(e) => {
@@ -188,7 +191,11 @@ pub async fn admin_recover(State(state): State<AppState>) -> Response {
     // recover_from_s3 returns Ok(0) when no cold tier is configured — treat that as 503.
     if state.objects_disk.cold_enabled() {
         match state.objects_disk.recover_from_s3().await {
-            Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "packs_recovered": n }))).into_response(),
+            Ok(n) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "packs_recovered": n })),
+            )
+                .into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         }
     } else {
@@ -234,8 +241,7 @@ mod tests {
 
     #[test]
     fn snapshot_request_response_roundtrip() {
-        let req: SnapshotRequest =
-            serde_json::from_str(r#"{"dest":"/tmp/snap"}"#).unwrap();
+        let req: SnapshotRequest = serde_json::from_str(r#"{"dest":"/tmp/snap"}"#).unwrap();
         assert_eq!(req.dest, "/tmp/snap");
 
         let resp = SnapshotResponse {
@@ -258,7 +264,7 @@ mod route_tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use ledge_core::{HLC, ObjectStore, RefName, RefStore};
+    use ledge_core::{ObjectStore, RefName, RefStore, HLC};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tower::ServiceExt; // oneshot
@@ -268,8 +274,15 @@ mod route_tests {
         let hlc = Arc::new(HLC::new());
         let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
         let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
-        let (workspaces, leases, gc) =
-            crate::build_workspace_stack(p.clone(), objects.clone(), refs.clone(), hlc, ledge_workspace::QuotaLimits::default(), std::sync::Arc::new(ledge_workspace::UsageMap::default())).unwrap();
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc,
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
         AppState {
             objects: objects.clone() as std::sync::Arc<dyn ledge_core::ObjectStore>,
             objects_disk: objects.clone(),
@@ -340,14 +353,20 @@ mod route_tests {
         let snap_refs = ledge_ref_store::RefStoreImpl::open(dest.clone(), hlc2).unwrap();
 
         let read_back = snap_objects.read(oid).await.unwrap();
-        assert_eq!(read_back, content, "object content must survive the snapshot");
+        assert_eq!(
+            read_back, content,
+            "object content must survive the snapshot"
+        );
 
         let ref_entry = snap_refs
             .get(&ref_name)
             .await
             .unwrap()
             .expect("ref must exist in the snapshot");
-        assert_eq!(ref_entry.target, oid, "ref target must survive the snapshot");
+        assert_eq!(
+            ref_entry.target, oid,
+            "ref target must survive the snapshot"
+        );
     }
 
     /// `POST /admin/repack` returns 200 and a JSON body carrying the pass stats.

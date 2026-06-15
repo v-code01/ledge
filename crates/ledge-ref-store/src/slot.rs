@@ -36,7 +36,10 @@ impl RefSlot {
     /// Construct an unlocked slot wrapping a committed entry.
     #[inline]
     pub fn committed(entry: RefEntry) -> Self {
-        RefSlot { committed: entry, prepared: None }
+        RefSlot {
+            committed: entry,
+            prepared: None,
+        }
     }
 
     /// True iff a prepared lock is held by a *different* transaction than `txn`.

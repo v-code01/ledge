@@ -96,17 +96,35 @@ async fn harness() -> (
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
     ])
@@ -176,6 +194,9 @@ async fn cluster_gc_run_emits_gc_series() {
         Some(0.0)
     );
     // grace_retained gauge reflects the single retained candidate.
-    assert!(m.0.iter().any(|(ck, v)| ck.key().name() == "ledge_gc_grace_retained"
-        && matches!(v, DebugValue::Gauge(g) if (g.0 - 1.0).abs() < f64::EPSILON)));
+    assert!(m
+        .0
+        .iter()
+        .any(|(ck, v)| ck.key().name() == "ledge_gc_grace_retained"
+            && matches!(v, DebugValue::Gauge(g) if (g.0 - 1.0).abs() < f64::EPSILON)));
 }

@@ -51,9 +51,11 @@ fn read_lidx(data: &[u8]) -> Result<Vec<LidxEntry>> {
     }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let need = 4usize
-        .checked_add(count.checked_mul(LIDX_ROW).ok_or_else(|| {
-            LedgeError::Corruption("lidx: count overflow".into())
-        })?)
+        .checked_add(
+            count
+                .checked_mul(LIDX_ROW)
+                .ok_or_else(|| LedgeError::Corruption("lidx: count overflow".into()))?,
+        )
         .ok_or_else(|| LedgeError::Corruption("lidx: size overflow".into()))?;
     if data.len() < need {
         return Err(LedgeError::Corruption("lidx: truncated entries".into()));
@@ -195,9 +197,9 @@ impl GitPackFile {
         match git_type {
             1..=4 => {
                 // full object: header then zlib(content)
-                let body = data
-                    .get(hdr_len..)
-                    .ok_or_else(|| LedgeError::Corruption("git_pack_file: truncated body".into()))?;
+                let body = data.get(hdr_len..).ok_or_else(|| {
+                    LedgeError::Corruption("git_pack_file: truncated body".into())
+                })?;
                 zlib_inflate(body)
             }
             7 => {
@@ -460,7 +462,10 @@ mod tests {
         for (i, po) in objs.iter().enumerate() {
             let oid = ObjectId::from_bytes(blake3::hash(&po.content).into());
             let got = gpf.read(oid).unwrap().expect("present");
-            assert_eq!(got, po.content, "object {i} round-trips through GitPackFile");
+            assert_eq!(
+                got, po.content,
+                "object {i} round-trips through GitPackFile"
+            );
             assert_eq!(gpf.git_type_of(oid).unwrap(), po.git_type);
             assert_eq!(gpf.sha1_of(oid).unwrap(), po.sha1);
         }
@@ -471,7 +476,10 @@ mod tests {
             let oid = ObjectId::from_bytes(blake3::hash(&po.content).into());
             gpf.delta_base_of(oid).unwrap().is_some()
         });
-        assert!(any_delta, "the pack must contain a REF_DELTA to exercise resolution");
+        assert!(
+            any_delta,
+            "the pack must contain a REF_DELTA to exercise resolution"
+        );
 
         // git still accepts the stored pack
         let vp = std::process::Command::new("git")

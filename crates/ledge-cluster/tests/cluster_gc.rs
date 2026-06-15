@@ -48,17 +48,35 @@ async fn harness() -> (
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
     ])
@@ -76,7 +94,10 @@ async fn harness() -> (
 }
 
 async fn write_blob(store: &DiskObjectStore, content: &[u8]) -> ObjectId {
-    store.write_git_object(3, Bytes::copy_from_slice(content)).await.unwrap()
+    store
+        .write_git_object(3, Bytes::copy_from_slice(content))
+        .await
+        .unwrap()
 }
 
 /// blob -> tree -> commit (git on-disk wire formats); returns (blob, tree, commit).
@@ -94,12 +115,23 @@ async fn build_graph(store: &DiskObjectStore) -> (ObjectId, ObjectId, ObjectId) 
         "tree {}\nauthor a <a@b> 0 +0000\ncommitter a <a@b> 0 +0000\n\nmsg\n",
         hex_lower(&tree_sha1)
     );
-    let commit = store.write_git_object(1, Bytes::from(commit_body.into_bytes())).await.unwrap();
+    let commit = store
+        .write_git_object(1, Bytes::from(commit_body.into_bytes()))
+        .await
+        .unwrap();
     (blob, tree, commit)
 }
 
 fn lease(id: WorkspaceId, expires_at_ms: u64) -> Lease {
-    Lease { id, source_refs: Vec::new(), created_at_ms: 0, expires_at_ms, hlc: 0, generation: 0, tenant_id: "root".to_string() }
+    Lease {
+        id,
+        source_refs: Vec::new(),
+        created_at_ms: 0,
+        expires_at_ms,
+        hlc: 0,
+        generation: 0,
+        tenant_id: "root".to_string(),
+    }
 }
 
 // 1 ── Cross-shard liveness: an object reachable from EITHER co-hosted shard's
@@ -116,13 +148,19 @@ async fn cross_shard_liveness_keeps_objects_from_either_shard() {
     let mut tbody = Vec::new();
     tbody.extend_from_slice(b"100644 other.txt\0");
     tbody.extend_from_slice(&blob1_sha1);
-    let tree1 = objects.write_git_object(2, Bytes::from(tbody)).await.unwrap();
+    let tree1 = objects
+        .write_git_object(2, Bytes::from(tbody))
+        .await
+        .unwrap();
     let tree1_sha1 = objects.sha1_of(tree1).await.unwrap();
     let cbody = format!(
         "tree {}\nauthor a <a@b> 0 +0000\ncommitter a <a@b> 0 +0000\n\nmsg2\n",
         hex_lower(&tree1_sha1)
     );
-    let c1 = objects.write_git_object(1, Bytes::from(cbody.into_bytes())).await.unwrap();
+    let c1 = objects
+        .write_git_object(1, Bytes::from(cbody.into_bytes()))
+        .await
+        .unwrap();
 
     // An orphan referenced by NO shard.
     let orphan = write_blob(&objects, b"orphan").await;
@@ -138,15 +176,27 @@ async fn cross_shard_liveness_keeps_objects_from_either_shard() {
     store1.update(&a, c0, None).await.unwrap(); // shard A ref → first graph
     store1.update(&b, c1, None).await.unwrap(); // shard B ref → second graph
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let stats = gc.run(4_000_000_000).await.unwrap();
 
     // BOTH graphs survive; only the orphan is reclaimed. If GC marked only ONE
     // shard, one of these objects would be gone and this loop would fail.
     for id in [b0, t0, c0, blob1, tree1, c1] {
-        assert!(objects.exists(id).await.unwrap(), "{id:?} reachable from a hosted shard must survive");
+        assert!(
+            objects.exists(id).await.unwrap(),
+            "{id:?} reachable from a hosted shard must survive"
+        );
     }
-    assert!(!objects.exists(orphan).await.unwrap(), "the cross-shard orphan is reclaimed");
+    assert!(
+        !objects.exists(orphan).await.unwrap(),
+        "the cross-shard orphan is reclaimed"
+    );
     assert_eq!(stats.reclaimed, 1, "exactly the orphan");
 }
 
@@ -187,22 +237,43 @@ async fn prepared_intent_pins_staged_object() {
 
     // GC while prepared-but-not-committed: the staged object is rooted by the
     // prepared intent → NOT deleted.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     gc.run(4_000_000_000).await.unwrap();
-    assert!(objects.exists(staged).await.unwrap(), "prepared staged target must be pinned");
+    assert!(
+        objects.exists(staged).await.unwrap(),
+        "prepared staged target must be pinned"
+    );
 
     // Commit the intent; the now-committed object is still present and reachable.
     store1
         .op_on_shard(
             a_shard,
-            ClusterOp::CommitPrepared { txn_id: txn, name: a.as_str().to_string() },
+            ClusterOp::CommitPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
         )
         .await
         .unwrap();
     assert_eq!(store1.get(&a).await.unwrap().unwrap().target, staged);
-    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc2 = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     gc2.run(4_000_000_001).await.unwrap();
-    assert!(objects.exists(staged).await.unwrap(), "committed target still present");
+    assert!(
+        objects.exists(staged).await.unwrap(),
+        "committed target still present"
+    );
 }
 
 // 3 ── Abort then reclaim: prepare → abort → a GC pass past grace reclaims the
@@ -232,16 +303,28 @@ async fn abort_then_reclaim_releases_staged_object() {
     store1
         .op_on_shard(
             a_shard,
-            ClusterOp::AbortPrepared { txn_id: txn, name: a.as_str().to_string() },
+            ClusterOp::AbortPrepared {
+                txn_id: txn,
+                name: a.as_str().to_string(),
+            },
         )
         .await
         .unwrap();
 
     // Now no committed ref AND no prepared lock references `staged`. A grace-0
     // pass reclaims it.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let stats = gc.run(4_000_000_000).await.unwrap();
-    assert!(!objects.exists(staged).await.unwrap(), "aborted staged target is reclaimed");
+    assert!(
+        !objects.exists(staged).await.unwrap(),
+        "aborted staged target is reclaimed"
+    );
     assert_eq!(stats.reclaimed, 1);
 }
 
@@ -259,7 +342,13 @@ async fn grace_fence_keeps_fresh_sweeps_old() {
         .as_secs();
     let one_hour = Duration::from_secs(3600);
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), one_hour, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        one_hour,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let kept = gc.run(real_now).await.unwrap();
     assert_eq!(kept.reclaimed, 0, "a fresh orphan is within grace and kept");
     assert_eq!(kept.skipped_grace, 1, "retained solely by grace");
@@ -290,10 +379,19 @@ async fn freeze_guard_excludes_post_freeze_writes() {
 
     // And an end-to-end pass that began before the write leaves it intact: run a
     // grace-0 GC, THEN write — the just-written object survives.
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     gc.run(4_000_000_000).await.unwrap();
     let late = write_blob(&objects, b"written after a completed pass").await;
-    assert!(objects.exists(late).await.unwrap(), "post-pass write survives");
+    assert!(
+        objects.exists(late).await.unwrap(),
+        "post-pass write survives"
+    );
 }
 
 // 6 ── Crash idempotence: a re-run equals a single pass (no double-delete error,
@@ -306,13 +404,22 @@ async fn crash_idempotent_rerun_equals_single_pass() {
     let (a, _b) = cluster.two_durable_names_on_distinct_shards();
     store1.update(&a, c, None).await.unwrap();
 
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let first = gc.run(4_000_000_000).await.unwrap();
     assert_eq!(first.reclaimed, 1, "the orphan is reclaimed once");
 
     // Second pass: deleted objects are no longer candidates → nothing new.
     let second = gc.run(4_000_000_001).await.unwrap();
-    assert_eq!(second.reclaimed, 0, "re-run reclaims nothing new (idempotent)");
+    assert_eq!(
+        second.reclaimed, 0,
+        "re-run reclaims nothing new (idempotent)"
+    );
     // Reachable graph intact across both passes.
     for id in [b, t, c] {
         assert!(objects.exists(id).await.unwrap());
@@ -327,12 +434,24 @@ async fn live_lease_workspace_roots_kept_expired_reclaimed() {
     let (b, t, c) = build_graph(&objects).await;
     let id = WorkspaceId::generate(&hlc);
     let ref_name = format!("refs/workspaces/{}/heads/main", id.to_hex());
-    store1.update(&RefName::new(&ref_name).unwrap(), c, None).await.unwrap();
+    store1
+        .update(&RefName::new(&ref_name).unwrap(), c, None)
+        .await
+        .unwrap();
 
     // Live lease: GC at now_secs whose ms is < expiry keeps the trio.
     let now_secs = 1_000_000u64;
-    leases.put(lease(id, now_secs * 1000 + 1_000_000)).await.unwrap();
-    let gc = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    leases
+        .put(lease(id, now_secs * 1000 + 1_000_000))
+        .await
+        .unwrap();
+    let gc = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let kept = gc.run(now_secs).await.unwrap();
     assert_eq!(kept.reclaimed, 0, "live-lease workspace refs root the trio");
     for id in [b, t, c] {
@@ -341,7 +460,13 @@ async fn live_lease_workspace_roots_kept_expired_reclaimed() {
 
     // Expire the lease (expiry ≤ now_ms) → its refs are not roots → trio reclaimed.
     leases.put(lease(id, now_secs * 1000 - 1)).await.unwrap();
-    let gc2 = ClusterGc::new(store1.clone(), leases.clone(), objects.clone(), Duration::ZERO, Arc::new(ledge_workspace::UsageMap::default()));
+    let gc2 = ClusterGc::new(
+        store1.clone(),
+        leases.clone(),
+        objects.clone(),
+        Duration::ZERO,
+        Arc::new(ledge_workspace::UsageMap::default()),
+    );
     let swept = gc2.run(now_secs).await.unwrap();
     assert_eq!(swept.reclaimed, 3, "expired lease contributes no roots");
 }

@@ -63,7 +63,10 @@ mod tests {
             hlc: 0,
             version: 1,
         };
-        let next = RefEntry { version: 2, ..base.clone() };
+        let next = RefEntry {
+            version: 2,
+            ..base.clone()
+        };
         assert_ne!(base, next);
     }
 }

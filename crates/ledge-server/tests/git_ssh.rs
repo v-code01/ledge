@@ -54,7 +54,9 @@ async fn start() -> (String, u16, TempDir) {
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr: SocketAddr = http.local_addr().unwrap();
     let app = build_app(state.clone());
-    tokio::spawn(async move { axum::serve(http, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(http, app).await.ok();
+    });
 
     // SSH listener (under test) on an ephemeral port.
     let ssh = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -71,7 +73,11 @@ async fn start() -> (String, u16, TempDir) {
     tokio::task::yield_now().await;
 
     // We must keep data_dir alive; return it.
-    (format!("http://127.0.0.1:{}", http_addr.port()), ssh_port, data_dir)
+    (
+        format!("http://127.0.0.1:{}", http_addr.port()),
+        ssh_port,
+        data_dir,
+    )
 }
 
 async fn git(args: &[&str], cwd: &Path, ssh_cmd: Option<&str>) -> std::process::Output {
@@ -90,7 +96,11 @@ async fn git(args: &[&str], cwd: &Path, ssh_cmd: Option<&str>) -> std::process::
 }
 
 fn ok(o: &std::process::Output, ctx: &str) {
-    assert!(o.status.success(), "{ctx} failed: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "{ctx} failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }
 
 #[tokio::test]
@@ -105,7 +115,11 @@ async fn clone_fetch_push_over_ssh() {
         .output()
         .await
         .expect("ssh-keygen");
-    assert!(kg.status.success(), "ssh-keygen: {}", String::from_utf8_lossy(&kg.stderr));
+    assert!(
+        kg.status.success(),
+        "ssh-keygen: {}",
+        String::from_utf8_lossy(&kg.stderr)
+    );
     let ssh_cmd = format!(
         "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes",
         key.display()
@@ -113,55 +127,141 @@ async fn clone_fetch_push_over_ssh() {
 
     // Seed a 3-commit repo over HTTP.
     let src = TempDir::new().unwrap();
-    ok(&git(&["init", "--initial-branch=main", "."], src.path(), None).await, "init");
-    ok(&git(&["config", "user.email", "t@l"], src.path(), None).await, "email");
-    ok(&git(&["config", "user.name", "t"], src.path(), None).await, "name");
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path(), None).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path(), None).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path(), None).await,
+        "name",
+    );
     for i in 0..3 {
         std::fs::write(src.path().join("f.txt"), format!("line {i}\n")).unwrap();
         ok(&git(&["add", "."], src.path(), None).await, "add");
-        ok(&git(&["commit", "-m", &format!("c{i}")], src.path(), None).await, "commit");
+        ok(
+            &git(&["commit", "-m", &format!("c{i}")], src.path(), None).await,
+            "commit",
+        );
     }
     let remote_http = format!("{http}/sshrepo");
-    ok(&git(&["push", &remote_http, "main:refs/heads/main"], src.path(), None).await, "seed push");
-    let tip1 = String::from_utf8(git(&["rev-parse", "main"], src.path(), None).await.stdout).unwrap().trim().to_string();
+    ok(
+        &git(
+            &["push", &remote_http, "main:refs/heads/main"],
+            src.path(),
+            None,
+        )
+        .await,
+        "seed push",
+    );
+    let tip1 = String::from_utf8(git(&["rev-parse", "main"], src.path(), None).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // CLONE over SSH.
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/sshrepo");
     let clone = TempDir::new().unwrap();
     let clone_path = clone.path().join("c");
-    let cl = git(&["clone", "--quiet", &ssh_url, clone_path.to_str().unwrap()], Path::new("/"), Some(&ssh_cmd)).await;
+    let cl = git(
+        &["clone", "--quiet", &ssh_url, clone_path.to_str().unwrap()],
+        Path::new("/"),
+        Some(&ssh_cmd),
+    )
+    .await;
     ok(&cl, "ssh clone");
-    let got = String::from_utf8(git(&["rev-parse", "main"], &clone_path, None).await.stdout).unwrap().trim().to_string();
+    let got = String::from_utf8(git(&["rev-parse", "main"], &clone_path, None).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert_eq!(got, tip1, "ssh-cloned HEAD matches the source");
 
     // Advance upstream (HTTP push), then FETCH over SSH.
     std::fs::write(src.path().join("f.txt"), "newline\n").unwrap();
     ok(&git(&["add", "."], src.path(), None).await, "add2");
-    ok(&git(&["commit", "-m", "c-new"], src.path(), None).await, "commit2");
-    let tip2 = String::from_utf8(git(&["rev-parse", "main"], src.path(), None).await.stdout).unwrap().trim().to_string();
-    ok(&git(&["push", &remote_http, "main:refs/heads/main"], src.path(), None).await, "update push");
+    ok(
+        &git(&["commit", "-m", "c-new"], src.path(), None).await,
+        "commit2",
+    );
+    let tip2 = String::from_utf8(git(&["rev-parse", "main"], src.path(), None).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    ok(
+        &git(
+            &["push", &remote_http, "main:refs/heads/main"],
+            src.path(),
+            None,
+        )
+        .await,
+        "update push",
+    );
 
     let fe = git(&["fetch", "origin"], &clone_path, Some(&ssh_cmd)).await;
     ok(&fe, "ssh fetch");
-    let after = String::from_utf8(git(&["rev-parse", "origin/main"], &clone_path, None).await.stdout).unwrap().trim().to_string();
+    let after = String::from_utf8(
+        git(&["rev-parse", "origin/main"], &clone_path, None)
+            .await
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
     assert_eq!(after, tip2, "ssh fetch advanced origin/main to the new tip");
 
     // PUSH over SSH: commit in the clone, push via ssh://, verify it landed by
     // cloning the repo back over HTTP and checking the tip.
-    ok(&git(&["merge", "--ff-only", "origin/main"], &clone_path, None).await, "ff to origin");
-    ok(&git(&["config", "user.email", "c@l"], &clone_path, None).await, "clone email");
-    ok(&git(&["config", "user.name", "c"], &clone_path, None).await, "clone name");
+    ok(
+        &git(&["merge", "--ff-only", "origin/main"], &clone_path, None).await,
+        "ff to origin",
+    );
+    ok(
+        &git(&["config", "user.email", "c@l"], &clone_path, None).await,
+        "clone email",
+    );
+    ok(
+        &git(&["config", "user.name", "c"], &clone_path, None).await,
+        "clone name",
+    );
     std::fs::write(clone_path.join("pushed.txt"), "via ssh\n").unwrap();
     ok(&git(&["add", "."], &clone_path, None).await, "add push");
-    ok(&git(&["commit", "-m", "pushed-over-ssh"], &clone_path, None).await, "commit push");
-    let pushed_tip = String::from_utf8(git(&["rev-parse", "HEAD"], &clone_path, None).await.stdout).unwrap().trim().to_string();
-    let pr = git(&["push", "origin", "HEAD:refs/heads/main"], &clone_path, Some(&ssh_cmd)).await;
+    ok(
+        &git(&["commit", "-m", "pushed-over-ssh"], &clone_path, None).await,
+        "commit push",
+    );
+    let pushed_tip = String::from_utf8(git(&["rev-parse", "HEAD"], &clone_path, None).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let pr = git(
+        &["push", "origin", "HEAD:refs/heads/main"],
+        &clone_path,
+        Some(&ssh_cmd),
+    )
+    .await;
     ok(&pr, "ssh push");
 
     // Verify over HTTP that the server now has the SSH-pushed commit.
     let verify = TempDir::new().unwrap();
     let vpath = verify.path().join("v");
-    ok(&git(&["clone", "--quiet", &remote_http, vpath.to_str().unwrap()], Path::new("/"), None).await, "verify clone");
-    let landed = String::from_utf8(git(&["rev-parse", "main"], &vpath, None).await.stdout).unwrap().trim().to_string();
-    assert_eq!(landed, pushed_tip, "the SSH-pushed commit is durable on the server");
+    ok(
+        &git(
+            &["clone", "--quiet", &remote_http, vpath.to_str().unwrap()],
+            Path::new("/"),
+            None,
+        )
+        .await,
+        "verify clone",
+    );
+    let landed = String::from_utf8(git(&["rev-parse", "main"], &vpath, None).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        landed, pushed_tip,
+        "the SSH-pushed commit is durable on the server"
+    );
 }

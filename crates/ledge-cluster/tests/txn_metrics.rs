@@ -98,17 +98,35 @@ async fn two_shard_cluster() -> (
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
     ])
@@ -156,7 +174,10 @@ async fn commit_increments_started_committed_yes_votes_and_duration() {
         .commit_atomic(vec![(a.clone(), oid(1), None), (b.clone(), oid(2), None)])
         .await
         .unwrap();
-    assert!(matches!(res, AtomicCommitResult::Committed(_)), "expected commit, got {res:?}");
+    assert!(
+        matches!(res, AtomicCommitResult::Committed(_)),
+        "expected commit, got {res:?}"
+    );
 
     let msnap = MetricSnap::capture(&snap);
 
@@ -201,17 +222,17 @@ async fn conflict_increments_aborted_prepare_no_and_no_vote() {
         ])
         .await
         .unwrap();
-    assert!(matches!(res, AtomicCommitResult::Aborted { .. }), "expected abort, got {res:?}");
+    assert!(
+        matches!(res, AtomicCommitResult::Aborted { .. }),
+        "expected abort, got {res:?}"
+    );
 
     let msnap = MetricSnap::capture(&snap);
 
     assert_eq!(msnap.counter_sum("ledge_txn_started_total", &[]), 1);
     assert_eq!(msnap.counter_sum("ledge_txn_committed_total", &[]), 0);
     assert_eq!(
-        msnap.counter_sum(
-            "ledge_txn_aborted_total",
-            &[("reason", "prepare_no")]
-        ),
+        msnap.counter_sum("ledge_txn_aborted_total", &[("reason", "prepare_no")]),
         1,
         "a vote-NO abort is reason=prepare_no"
     );
@@ -243,7 +264,10 @@ async fn single_shard_fast_path_emits_no_txn_metrics() {
         .commit_atomic(vec![(a.clone(), oid(1), None), (b.clone(), oid(2), None)])
         .await
         .unwrap();
-    assert!(matches!(res, AtomicCommitResult::Committed(_)), "fast path commit, got {res:?}");
+    assert!(
+        matches!(res, AtomicCommitResult::Committed(_)),
+        "fast path commit, got {res:?}"
+    );
 
     let msnap = MetricSnap::capture(&snap);
 
@@ -377,4 +401,3 @@ async fn resolver_presumed_abort_increments_recovered() {
     // Presumed-abort released the lock; NO ref advanced.
     assert!(store1.get(&a).await.unwrap().is_none());
 }
-

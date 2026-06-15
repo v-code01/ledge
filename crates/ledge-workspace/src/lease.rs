@@ -615,7 +615,10 @@ mod tests {
             .into_iter()
             .map(|l| l.id)
             .collect();
-        assert_eq!(reopened, live_ids, "all live leases must survive compaction");
+        assert_eq!(
+            reopened, live_ids,
+            "all live leases must survive compaction"
+        );
     }
 
     /// A lease serialized WITHOUT a `tenant_id` field must decode with

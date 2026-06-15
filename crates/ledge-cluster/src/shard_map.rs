@@ -167,17 +167,35 @@ mod tests {
             (
                 ShardId(0),
                 vec![
-                    Replica { node_id: 1, addr: "http://n1:8401".into() },
-                    Replica { node_id: 2, addr: "http://n2:8402".into() },
-                    Replica { node_id: 3, addr: "http://n3:8403".into() },
+                    Replica {
+                        node_id: 1,
+                        addr: "http://n1:8401".into(),
+                    },
+                    Replica {
+                        node_id: 2,
+                        addr: "http://n2:8402".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "http://n3:8403".into(),
+                    },
                 ],
             ),
             (
                 ShardId(1),
                 vec![
-                    Replica { node_id: 3, addr: "http://n3:8403".into() },
-                    Replica { node_id: 4, addr: "http://n4:8404".into() },
-                    Replica { node_id: 5, addr: "http://n5:8405".into() },
+                    Replica {
+                        node_id: 3,
+                        addr: "http://n3:8403".into(),
+                    },
+                    Replica {
+                        node_id: 4,
+                        addr: "http://n4:8404".into(),
+                    },
+                    Replica {
+                        node_id: 5,
+                        addr: "http://n5:8405".into(),
+                    },
                 ],
             ),
         ])
@@ -254,11 +272,15 @@ mod tests {
     fn pick_forward_target_prefers_leader_when_member() {
         let m = map_5n2s();
         // prefer_leader=Some(4) and 4 is a member of shard 1 → pick 4.
-        let t = m.pick_forward_target(ShardId(1), Some(4)).expect("a member");
+        let t = m
+            .pick_forward_target(ShardId(1), Some(4))
+            .expect("a member");
         assert_eq!(t.node_id, 4);
         // prefer_leader names a non-member (1 is not in shard 1) → fall back to
         // the first member deterministically.
-        let t = m.pick_forward_target(ShardId(1), Some(1)).expect("a member");
+        let t = m
+            .pick_forward_target(ShardId(1), Some(1))
+            .expect("a member");
         assert_eq!(t.node_id, 3);
         // No preference → first member.
         let t = m.pick_forward_target(ShardId(0), None).expect("a member");
@@ -278,11 +300,23 @@ mod tests {
         let err = ShardMap::from_entries([(
             ShardId(0),
             vec![
-                Replica { node_id: 7, addr: "http://a:1".into() },
-                Replica { node_id: 7, addr: "http://b:2".into() },
+                Replica {
+                    node_id: 7,
+                    addr: "http://a:1".into(),
+                },
+                Replica {
+                    node_id: 7,
+                    addr: "http://b:2".into(),
+                },
             ],
         )])
         .unwrap_err();
-        assert!(matches!(err, ShardMapError::DuplicateNode { shard: ShardId(0), node_id: 7 }));
+        assert!(matches!(
+            err,
+            ShardMapError::DuplicateNode {
+                shard: ShardId(0),
+                node_id: 7
+            }
+        ));
     }
 }

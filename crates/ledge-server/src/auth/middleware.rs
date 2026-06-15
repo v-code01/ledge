@@ -83,8 +83,7 @@ fn secret_matches(presented: &str, configured: &Option<String>) -> bool {
     match configured {
         Some(s) => {
             use subtle::ConstantTimeEq;
-            presented.len() == s.len()
-                && bool::from(presented.as_bytes().ct_eq(s.as_bytes()))
+            presented.len() == s.len() && bool::from(presented.as_bytes().ct_eq(s.as_bytes()))
         }
         None => false,
     }
@@ -417,7 +416,13 @@ mod tests {
         );
         // A client key (not the service secret) → 401.
         assert_eq!(
-            status_of(app.clone(), "POST", "/cluster/gc", Some(("Bearer", &client))).await,
+            status_of(
+                app.clone(),
+                "POST",
+                "/cluster/gc",
+                Some(("Bearer", &client))
+            )
+            .await,
             StatusCode::UNAUTHORIZED
         );
         // Correct secret → 200 (the test router echoes the service principal).

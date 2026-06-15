@@ -290,7 +290,10 @@ impl ReplicatedObjectStore {
     ///
     /// Same quorum-durability + ordering contract as [`ObjectStore::write`].
     pub async fn write_git_object(&self, git_type: u8, content: Bytes) -> Result<ObjectId> {
-        let id = self.local.write_git_object(git_type, content.clone()).await?;
+        let id = self
+            .local
+            .write_git_object(git_type, content.clone())
+            .await?;
         let need = self.quorum();
         let mut acks = 1usize;
         if acks >= need {
@@ -348,8 +351,9 @@ mod tests {
     #[test]
     fn set_peers_swaps_peer_set() {
         let dir = tempfile::TempDir::new().unwrap();
-        let local =
-            std::sync::Arc::new(ledge_object_store::DiskObjectStore::new(dir.path().to_path_buf()).unwrap());
+        let local = std::sync::Arc::new(
+            ledge_object_store::DiskObjectStore::new(dir.path().to_path_buf()).unwrap(),
+        );
         let store = ReplicatedObjectStore::new(local.clone(), vec![]);
         assert_eq!(store.peer_count(), 0);
         let peer: std::sync::Arc<dyn ObjectPeer> = std::sync::Arc::new(LocalObjectPeer::new(local));

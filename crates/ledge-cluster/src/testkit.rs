@@ -544,7 +544,10 @@ impl MultiShardCluster {
     /// election. Returns once the node's `Raft` has fully shut down.
     pub async fn kill_replica(&self, shard: ShardId, node: NodeId) {
         let reps = self.replicas.get(&shard).expect("shard exists");
-        let rep = reps.iter().find(|r| r.node == node).expect("replica exists");
+        let rep = reps
+            .iter()
+            .find(|r| r.node == node)
+            .expect("replica exists");
         rep.raft.shutdown().await.expect("raft shutdown");
         self.registry.deregister(shard, node);
     }
@@ -615,7 +618,10 @@ impl MultiShardCluster {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("shard {shard:?}: ref {} not replicated to all replicas", name.as_str());
+        panic!(
+            "shard {shard:?}: ref {} not replicated to all replicas",
+            name.as_str()
+        );
     }
 }
 
@@ -633,17 +639,35 @@ mod placement_tests {
             (
                 ShardId(0),
                 vec![
-                    Replica { node_id: 1, addr: "inproc-1".into() },
-                    Replica { node_id: 2, addr: "inproc-2".into() },
-                    Replica { node_id: 3, addr: "inproc-3".into() },
+                    Replica {
+                        node_id: 1,
+                        addr: "inproc-1".into(),
+                    },
+                    Replica {
+                        node_id: 2,
+                        addr: "inproc-2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "inproc-3".into(),
+                    },
                 ],
             ),
             (
                 ShardId(1),
                 vec![
-                    Replica { node_id: 2, addr: "inproc-2".into() },
-                    Replica { node_id: 3, addr: "inproc-3".into() },
-                    Replica { node_id: 4, addr: "inproc-4".into() },
+                    Replica {
+                        node_id: 2,
+                        addr: "inproc-2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "inproc-3".into(),
+                    },
+                    Replica {
+                        node_id: 4,
+                        addr: "inproc-4".into(),
+                    },
                 ],
             ),
         ])
@@ -658,9 +682,15 @@ mod placement_tests {
         // Hosting: node 1 builds shard 0 only; node 4 builds shard 1 only;
         // node 2 builds both. (start_placed records (shard,node) hosting.)
         assert!(cluster.hosts(ShardId(0), 1));
-        assert!(!cluster.hosts(ShardId(1), 1), "node 1 must NOT build shard 1");
+        assert!(
+            !cluster.hosts(ShardId(1), 1),
+            "node 1 must NOT build shard 1"
+        );
         assert!(cluster.hosts(ShardId(1), 4));
-        assert!(!cluster.hosts(ShardId(0), 4), "node 4 must NOT build shard 0");
+        assert!(
+            !cluster.hosts(ShardId(0), 4),
+            "node 4 must NOT build shard 0"
+        );
         assert!(cluster.hosts(ShardId(0), 2) && cluster.hosts(ShardId(1), 2));
 
         // Each shard built a Raft group spanning exactly its members.
@@ -670,7 +700,13 @@ mod placement_tests {
         // Each shard elects a leader AMONG ITS OWN MEMBERS (not a foreign node).
         let l0 = cluster.wait_for_leader(ShardId(0)).await;
         let l1 = cluster.wait_for_leader(ShardId(1)).await;
-        assert!([1, 2, 3].contains(&l0), "shard0 leader {l0} must be a shard0 member");
-        assert!([2, 3, 4].contains(&l1), "shard1 leader {l1} must be a shard1 member");
+        assert!(
+            [1, 2, 3].contains(&l0),
+            "shard0 leader {l0} must be a shard0 member"
+        );
+        assert!(
+            [2, 3, 4].contains(&l1),
+            "shard1 leader {l1} must be a shard1 member"
+        );
     }
 }

@@ -159,13 +159,21 @@ impl Wal {
 
         // Only replay from the last checkpoint onward.  Earlier entries have
         // already been incorporated into that checkpoint's snapshot.
-        let last_cp = all.iter().rposition(|e| matches!(e, WalEntry::Checkpoint { .. }));
+        let last_cp = all
+            .iter()
+            .rposition(|e| matches!(e, WalEntry::Checkpoint { .. }));
         let replay: Vec<WalEntry> = match last_cp {
             Some(i) => all[i..].to_vec(),
             None => all,
         };
 
-        Ok((Wal { file: Mutex::new(file), path }, replay))
+        Ok((
+            Wal {
+                file: Mutex::new(file),
+                path,
+            },
+            replay,
+        ))
     }
 
     /// Append a single `WalEntry` to the WAL.
@@ -209,9 +217,7 @@ impl Wal {
     /// Used by higher-level compaction triggers to decide when to compact.
     /// Returns 0 if the metadata call fails (e.g., file deleted externally).
     pub fn file_size_bytes(&self) -> u64 {
-        std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -222,7 +228,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_entry(byte: u8, version: u64) -> RefEntry {
-        RefEntry { target: ObjectId::from_bytes([byte; 32]), hlc: version, version }
+        RefEntry {
+            target: ObjectId::from_bytes([byte; 32]),
+            hlc: version,
+            version,
+        }
     }
 
     #[tokio::test]

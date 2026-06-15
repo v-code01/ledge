@@ -81,10 +81,17 @@ mod tests {
 
     #[test]
     fn root_is_always_exempt_even_enabled() {
-        let q = QuotaLimits { enabled: true, max_workspaces: Some(1), ..Default::default() };
+        let q = QuotaLimits {
+            enabled: true,
+            max_workspaces: Some(1),
+            ..Default::default()
+        };
         assert!(!q.enforced_for("root"), "root exempt");
         assert!(!q.enforced_for(""), "legacy empty ⇒ root ⇒ exempt");
-        assert!(q.enforced_for("acme"), "a real tenant is enforced when enabled");
+        assert!(
+            q.enforced_for("acme"),
+            "a real tenant is enforced when enabled"
+        );
     }
 
     #[test]
@@ -93,17 +100,38 @@ mod tests {
         let snap = m.load();
         assert!(snap.is_empty());
         let cur = snap.get("acme").copied().unwrap_or_default();
-        assert_eq!(cur, TenantUsage { bytes: 0, objects: 0 });
+        assert_eq!(
+            cur,
+            TenantUsage {
+                bytes: 0,
+                objects: 0
+            }
+        );
     }
 
     #[test]
     fn usage_map_store_then_load_roundtrips() {
         let m = UsageMap::default();
         let mut fresh = HashMap::new();
-        fresh.insert("acme".to_string(), TenantUsage { bytes: 100, objects: 3 });
+        fresh.insert(
+            "acme".to_string(),
+            TenantUsage {
+                bytes: 100,
+                objects: 3,
+            },
+        );
         m.store(std::sync::Arc::new(fresh));
         let snap = m.load();
-        assert_eq!(snap.get("acme").copied().unwrap(), TenantUsage { bytes: 100, objects: 3 });
-        assert_eq!(snap.get("globex").copied().unwrap_or_default(), TenantUsage::default());
+        assert_eq!(
+            snap.get("acme").copied().unwrap(),
+            TenantUsage {
+                bytes: 100,
+                objects: 3
+            }
+        );
+        assert_eq!(
+            snap.get("globex").copied().unwrap_or_default(),
+            TenantUsage::default()
+        );
     }
 }

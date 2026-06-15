@@ -78,10 +78,16 @@ async fn write_replicates_to_all_peers() {
     let (local, peers, peer_stores, _dirs) = build_3_replica_object_group();
     let store = ReplicatedObjectStore::new(local.clone(), peers);
 
-    let id = store.write(Bytes::from_static(b"hello-object")).await.unwrap();
+    let id = store
+        .write(Bytes::from_static(b"hello-object"))
+        .await
+        .unwrap();
 
     // On return the object is quorum-durable: local + at least one peer have it.
-    assert!(local.exists(id).await.unwrap(), "local must have the object");
+    assert!(
+        local.exists(id).await.unwrap(),
+        "local must have the object"
+    );
     let mut on_peers = 0usize;
     for ps in &peer_stores {
         if ps.exists(id).await.unwrap() {
@@ -89,7 +95,10 @@ async fn write_replicates_to_all_peers() {
         }
     }
     // local(1) + on_peers >= quorum (2 of 3).
-    assert!(1 + on_peers >= store.quorum(), "write must be quorum-durable");
+    assert!(
+        1 + on_peers >= store.quorum(),
+        "write must be quorum-durable"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +172,10 @@ async fn read_fetches_from_peer_when_local_missing() {
     let bytes = store.read(id).await.unwrap();
     assert_eq!(&bytes[..], b"only-on-peer");
     // Anti-entropy: the read repaired the local replica.
-    assert!(local.exists(id).await.unwrap(), "read must repair local replica");
+    assert!(
+        local.exists(id).await.unwrap(),
+        "read must repair local replica"
+    );
 }
 
 /// A peer that returns bytes whose content address does NOT match the requested
@@ -247,7 +259,10 @@ async fn exists_and_write_batch() {
         assert!(store.exists(*id).await.unwrap());
         // Each object reached a quorum across the replica set.
         let on_peers = count_has(&peer_stores, id).await;
-        assert!(1 + on_peers >= quorum, "batch object must be quorum-durable");
+        assert!(
+            1 + on_peers >= quorum,
+            "batch object must be quorum-durable"
+        );
     }
 
     // `exists` falls back to peers when local is missing.
@@ -280,7 +295,11 @@ async fn typed_write_preserves_git_type_across_replicas() {
 
     assert_eq!(local.git_type_of(id).await.unwrap(), 1);
     for ps in &peer_stores {
-        assert_eq!(ps.git_type_of(id).await.unwrap(), 1, "type byte must replicate");
+        assert_eq!(
+            ps.git_type_of(id).await.unwrap(),
+            1,
+            "type byte must replicate"
+        );
     }
 }
 
@@ -302,7 +321,10 @@ async fn ref_update_references_quorum_durable_object() {
     let objs = ReplicatedObjectStore::new(local.clone(), peers);
 
     // Correct composition: write object to quorum FIRST, then ref-update.
-    let oid = objs.write(Bytes::from_static(b"commit-bytes")).await.unwrap();
+    let oid = objs
+        .write(Bytes::from_static(b"commit-bytes"))
+        .await
+        .unwrap();
 
     // Invariant the ordering contract guarantees: when the ref is allowed to
     // commit, the object is already present on a quorum of replicas.

@@ -543,15 +543,16 @@ mod tests {
             .mint("acme", PrincipalKind::User, rw_scopes(), None, 0)
             .await
             .unwrap();
-        let (kid, _) = tok2.strip_prefix("ledge_").unwrap().split_once('_').unwrap();
+        let (kid, _) = tok2
+            .strip_prefix("ledge_")
+            .unwrap()
+            .split_once('_')
+            .unwrap();
         assert!(
             store.revoke(kid).await.unwrap(),
             "revoke returns true for a present key"
         );
-        assert!(
-            store.verify(&tok2, 0).is_none(),
-            "revoked key fails verify"
-        );
+        assert!(store.verify(&tok2, 0).is_none(), "revoked key fails verify");
         assert!(
             !store.revoke("nope").await.unwrap(),
             "revoke of absent key returns false"

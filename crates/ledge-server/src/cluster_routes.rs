@@ -244,7 +244,11 @@ pub async fn cluster_reconfigure(
     //    passes). New voters also obtain existing objects via on-demand
     //    anti-entropy pull, so object availability does not depend on this push set.
     if let Some(objs) = &state.cluster_objects {
-        let self_node = state.cluster_refs.as_ref().map(|r| r.node_id()).unwrap_or(0);
+        let self_node = state
+            .cluster_refs
+            .as_ref()
+            .map(|r| r.node_id())
+            .unwrap_or(0);
         let client = build_internal_client(state.auth.cluster_secret.as_deref());
         let peers: Vec<std::sync::Arc<dyn ObjectPeer>> = target
             .iter()
@@ -599,7 +603,11 @@ pub async fn cluster_gc(
     }
 
     // Coordinator leg: this node's pass first.
-    let me = state.cluster_refs.as_ref().map(|r| r.node_id()).unwrap_or(0);
+    let me = state
+        .cluster_refs
+        .as_ref()
+        .map(|r| r.node_id())
+        .unwrap_or(0);
     let mut per_node: Vec<(u64, NodeGcOutcome)> = Vec::new();
     match run_local_gc(&state).await {
         Ok(stats) => per_node.push((me, NodeGcOutcome::Ok(stats))),
@@ -742,8 +750,20 @@ mod tests {
     #[test]
     fn cluster_gc_stats_aggregates_totals() {
         use ledge_workspace::GcStats;
-        let a = GcStats { scanned: 5, reachable: 3, reclaimed: 2, bytes_freed: 100, skipped_grace: 1 };
-        let b = GcStats { scanned: 4, reachable: 4, reclaimed: 0, bytes_freed: 0, skipped_grace: 0 };
+        let a = GcStats {
+            scanned: 5,
+            reachable: 3,
+            reclaimed: 2,
+            bytes_freed: 100,
+            skipped_grace: 1,
+        };
+        let b = GcStats {
+            scanned: 4,
+            reachable: 4,
+            reclaimed: 0,
+            bytes_freed: 0,
+            skipped_grace: 0,
+        };
         let agg = ClusterGcStats::from_entries(vec![
             (1, NodeGcOutcome::Ok(a.clone())),
             (2, NodeGcOutcome::Ok(b.clone())),
@@ -752,7 +772,11 @@ mod tests {
         assert_eq!(agg.totals.reclaimed, 2, "totals sum only the Ok nodes");
         assert_eq!(agg.totals.bytes_freed, 100);
         assert_eq!(agg.totals.skipped_grace, 1);
-        assert_eq!(agg.per_node.len(), 3, "a downed node is an entry, not a failure");
+        assert_eq!(
+            agg.per_node.len(),
+            3,
+            "a downed node is an entry, not a failure"
+        );
         let j = serde_json::to_string(&agg).unwrap();
         let back: ClusterGcStats = serde_json::from_str(&j).unwrap();
         assert_eq!(back.totals.reclaimed, 2);
@@ -766,6 +790,9 @@ mod tests {
         .unwrap();
         assert_eq!(r.shard, 0);
         assert_eq!(r.members.len(), 2);
-        assert_eq!(r.members.get("1").map(String::as_str), Some("http://h1:4001"));
+        assert_eq!(
+            r.members.get("1").map(String::as_str),
+            Some("http://h1:4001")
+        );
     }
 }

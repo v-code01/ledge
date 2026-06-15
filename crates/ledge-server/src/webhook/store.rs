@@ -301,7 +301,9 @@ mod tests {
     #[test]
     fn register_list_delete_in_memory() {
         let s = WebhookStore::in_memory();
-        let w = s.register("acme", "http://sink".into(), vec![], 100).unwrap();
+        let w = s
+            .register("acme", "http://sink".into(), vec![], 100)
+            .unwrap();
         assert_eq!(s.list("acme").len(), 1);
         assert_eq!(w.secret.len(), 32);
         assert_eq!(w.tenant_id, "acme");

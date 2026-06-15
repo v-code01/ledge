@@ -524,7 +524,10 @@ mod tests {
         // they are not even candidates → nothing to reclaim. Crash-mid-sweep
         // idempotency reduces to this same property (§6).
         let second = h.gc.run().await.unwrap();
-        assert_eq!(second.scanned, 0, "deleted objects are no longer candidates");
+        assert_eq!(
+            second.scanned, 0,
+            "deleted objects are no longer candidates"
+        );
         assert_eq!(second.reclaimed, 0);
         assert_eq!(second.bytes_freed, 0);
     }
@@ -558,8 +561,13 @@ mod tests {
 
         // Part B: replicate the freeze step and prove post-freeze writes are
         // excluded from the candidate snapshot.
-        let candidates_before: HashSet<ObjectId> =
-            h.objects.list_all_ids().await.unwrap().into_iter().collect();
+        let candidates_before: HashSet<ObjectId> = h
+            .objects
+            .list_all_ids()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
         let post_freeze = write_blob(&h.objects, b"written after the freeze").await;
         assert!(
             !candidates_before.contains(&post_freeze),
@@ -670,13 +678,19 @@ mod tests {
         // Each tenant: its own 3-object graph + the shared blob = 4 objects.
         assert_eq!(acme.objects, 4, "acme: commit+tree+blob+shared");
         assert_eq!(globex.objects, 4, "globex: commit+tree+blob+shared");
-        assert!(acme.bytes > 0 && globex.bytes > 0, "bytes are summed from file sizes");
+        assert!(
+            acme.bytes > 0 && globex.bytes > 0,
+            "bytes are summed from file sizes"
+        );
         // Overlap-counts-per-tenant: the shared blob is in BOTH counts, so the
         // sum of per-tenant objects (8) exceeds the physical distinct object count
         // (3 + 3 + 1 = 7). This is the documented dedup-crosses-tenants semantics.
         assert_eq!(acme.objects + globex.objects, 8);
         // Root tenant has NO durable refs here ⇒ absent or zero.
-        assert_eq!(snap.get("root").copied().unwrap_or_default(), TenantUsage::default());
+        assert_eq!(
+            snap.get("root").copied().unwrap_or_default(),
+            TenantUsage::default()
+        );
         let _ = (a_blob, a_tree, g_blob, g_tree); // silence unused (ids are wired via refs)
     }
 
@@ -697,7 +711,9 @@ mod tests {
 
         // `base`: a 400-line blob. `a`: the same content with one line changed,
         // so `a` is highly compressible as a delta against `base`.
-        let base_content: Vec<u8> = (0..400).flat_map(|i| format!("l{i}\n").into_bytes()).collect();
+        let base_content: Vec<u8> = (0..400)
+            .flat_map(|i| format!("l{i}\n").into_bytes())
+            .collect();
         let edited: Vec<u8> = String::from_utf8(base_content.clone())
             .unwrap()
             .replace("l200\n", "EDIT\n")
@@ -731,7 +747,10 @@ mod tests {
             "GC MUST retain the delta base (a needs it)"
         );
         assert_eq!(
-            ledge_core::ObjectStore::read(&*h.objects, a).await.unwrap().as_ref(),
+            ledge_core::ObjectStore::read(&*h.objects, a)
+                .await
+                .unwrap()
+                .as_ref(),
             edited.as_slice(),
             "a still resolves after GC"
         );

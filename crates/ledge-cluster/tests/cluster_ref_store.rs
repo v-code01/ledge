@@ -61,7 +61,10 @@ async fn cluster_get_reflects_update_on_all_nodes_of_shard() {
     let n = name("refs/workspaces/acme/main");
     let target = oid(0xa2);
 
-    h.cluster_ref_store(1).update(&n, target, None).await.unwrap();
+    h.cluster_ref_store(1)
+        .update(&n, target, None)
+        .await
+        .unwrap();
 
     for node in [1, 2, 3] {
         let got = h
@@ -290,11 +293,26 @@ async fn cluster_lease_live_and_expired() {
         .unwrap();
 
     // now = 500: ws_live (exp 1000) live, ws_dead (exp 100) expired.
-    let live: Vec<_> = leases.live(500).await.unwrap().into_iter().map(|l| l.id).collect();
-    let expired: Vec<_> = leases.expired(500).await.unwrap().into_iter().map(|l| l.id).collect();
+    let live: Vec<_> = leases
+        .live(500)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.id)
+        .collect();
+    let expired: Vec<_> = leases
+        .expired(500)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.id)
+        .collect();
     assert!(live.contains(&ws_live), "ws_live must be live at now=500");
     assert!(!live.contains(&ws_dead));
-    assert!(expired.contains(&ws_dead), "ws_dead must be expired at now=500");
+    assert!(
+        expired.contains(&ws_dead),
+        "ws_dead must be expired at now=500"
+    );
     assert!(!expired.contains(&ws_live));
 }
 
@@ -306,7 +324,10 @@ async fn cluster_update_replicates_to_all_replicas_of_shard() {
     let h = MultiShardCluster::start(2, &[1, 2, 3]).await;
     let n = name("refs/workspaces/acme/main");
     let target = oid(0xab);
-    h.cluster_ref_store(1).update(&n, target, None).await.unwrap();
+    h.cluster_ref_store(1)
+        .update(&n, target, None)
+        .await
+        .unwrap();
 
     let shard = h.router().shard_for(n.as_str());
     h.await_applied(shard, &n).await;
@@ -347,16 +368,31 @@ async fn committed_targets_by_shard_returns_hosted_shard_targets() {
         (
             ShardId(0),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 2, addr: "mem://2".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 2,
+                    addr: "mem://2".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
             ],
         ),
         (
             ShardId(1),
             vec![
-                Replica { node_id: 1, addr: "mem://1".into() },
-                Replica { node_id: 3, addr: "mem://3".into() },
+                Replica {
+                    node_id: 1,
+                    addr: "mem://1".into(),
+                },
+                Replica {
+                    node_id: 3,
+                    addr: "mem://3".into(),
+                },
                 // node 2 is intentionally NOT a member of shard 1
             ],
         ),
@@ -390,16 +426,26 @@ async fn committed_targets_by_shard_returns_hosted_shard_targets() {
 
     // node 1 hosts BOTH shards → sees BOTH committed targets.
     let by_shard1 = store1.committed_targets_by_shard().await.unwrap();
-    let all1: std::collections::HashSet<ObjectId> =
-        by_shard1.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+    let all1: std::collections::HashSet<ObjectId> = by_shard1
+        .iter()
+        .flat_map(|(_, t)| t.iter().copied())
+        .collect();
     assert!(all1.contains(&oid(10)), "shard-{a_shard:?} target present");
     assert!(all1.contains(&oid(20)), "shard-{b_shard:?} target present");
 
     // node 2 hosts ONLY shard 0 → it sees ONLY shard 0's target, never shard 1's.
-    let shards2: std::collections::HashSet<ShardId> =
-        store2.committed_targets_by_shard().await.unwrap().into_iter().map(|(s, _)| s).collect();
+    let shards2: std::collections::HashSet<ShardId> = store2
+        .committed_targets_by_shard()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
     assert!(shards2.contains(&ShardId(0)));
-    assert!(!shards2.contains(&ShardId(1)), "node 2 must not report a non-hosted shard");
+    assert!(
+        !shards2.contains(&ShardId(1)),
+        "node 2 must not report a non-hosted shard"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -407,12 +453,19 @@ async fn cluster_stale_get_reads_local_replica() {
     let h = MultiShardCluster::start(2, &[1, 2, 3]).await;
     let n = name("refs/workspaces/acme/main");
     let target = oid(0xcd);
-    h.cluster_ref_store(1).update(&n, target, None).await.unwrap();
+    h.cluster_ref_store(1)
+        .update(&n, target, None)
+        .await
+        .unwrap();
 
     let shard = h.router().shard_for(n.as_str());
     h.await_applied(shard, &n).await; // all replicas applied
 
     let stale = h.cluster_ref_store(2).with_mode(ConsistencyMode::Stale);
-    let got = stale.get(&n).await.unwrap().expect("stale read sees applied ref");
+    let got = stale
+        .get(&n)
+        .await
+        .unwrap()
+        .expect("stale read sees applied ref");
     assert_eq!(got.target, target);
 }

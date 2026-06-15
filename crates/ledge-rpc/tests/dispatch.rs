@@ -31,13 +31,13 @@ fn ctx() -> (RpcCtx, TempDir) {
         coordinator,
         ledge_workspace::QuotaLimits::default(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-        ));
+    ));
     let gc = Arc::new(ledge_workspace::Gc::new(
         refs.clone(),
         leases,
         objects.clone(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-        ));
+    ));
     let ctx = RpcCtx {
         objects,
         refs,
@@ -71,8 +71,13 @@ fn two_tenant_ctxs() -> (RpcCtx, RpcCtx, TempDir) {
         coordinator,
         ledge_workspace::QuotaLimits::default(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
-        ));
-    let gc = Arc::new(ledge_workspace::Gc::new(refs.clone(), leases, objects.clone(), std::sync::Arc::new(ledge_workspace::UsageMap::default())));
+    ));
+    let gc = Arc::new(ledge_workspace::Gc::new(
+        refs.clone(),
+        leases,
+        objects.clone(),
+        std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+    ));
     let base = RpcCtx {
         objects,
         refs,
@@ -81,7 +86,10 @@ fn two_tenant_ctxs() -> (RpcCtx, RpcCtx, TempDir) {
         default_ttl_secs: 3600,
         tenant_id: "acme".into(),
     };
-    let globex = RpcCtx { tenant_id: "globex".into(), ..base.clone() };
+    let globex = RpcCtx {
+        tenant_id: "globex".into(),
+        ..base.clone()
+    };
     (base, globex, dir)
 }
 
@@ -94,12 +102,23 @@ async fn seed_and_fork(ctx: &RpcCtx) -> String {
     let prefix = ledge_core::tenant_prefix(&ctx.tenant_id);
     let durable = RefName::new(&format!("refs/{prefix}heads/main")).unwrap();
     if ctx.refs.get(&durable).await.unwrap().is_none() {
-        let oid = ctx.objects.write(bytes::Bytes::from_static(b"seed")).await.unwrap();
+        let oid = ctx
+            .objects
+            .write(bytes::Bytes::from_static(b"seed"))
+            .await
+            .unwrap();
         ctx.refs.update(&durable, oid, None).await.unwrap();
     }
-    let out = dispatch(&fork_req(&["refs/heads/main"], 3600), ctx).await.unwrap();
+    let out = dispatch(&fork_req(&["refs/heads/main"], 3600), ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
         _ => panic!("expected workspace from fork"),
     }
@@ -110,7 +129,11 @@ fn assert_is_error(bytes: &[u8]) {
     let reader = read_response(bytes);
     assert!(
         matches!(
-            reader.get_root::<response::Reader>().unwrap().which().unwrap(),
+            reader
+                .get_root::<response::Reader>()
+                .unwrap()
+                .which()
+                .unwrap(),
             response::Which::Error(_)
         ),
         "expected a Response.error (cross-tenant isolation)"
@@ -238,9 +261,7 @@ async fn write_then_read_object_roundtrips() {
     let reader = read_response(&out);
     let resp = reader.get_root::<response::Reader>().unwrap();
     let id_bytes: [u8; 32] = match resp.which().unwrap() {
-        response::Which::ObjectId(oid) => {
-            oid.unwrap().get_bytes().unwrap().try_into().unwrap()
-        }
+        response::Which::ObjectId(oid) => oid.unwrap().get_bytes().unwrap().try_into().unwrap(),
         _ => panic!("expected objectId"),
     };
 
@@ -278,10 +299,16 @@ async fn fork_then_get_workspace() {
     let (ctx, _dir) = ctx();
     // Seed a durable ref so fork has a source.
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid = ctx.objects.write(bytes::Bytes::from_static(b"c")).await.unwrap();
+    let oid = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid, None).await.unwrap();
 
-    let out = dispatch(&fork_req(&["refs/heads/main"], 0), &ctx).await.unwrap();
+    let out = dispatch(&fork_req(&["refs/heads/main"], 0), &ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
     let resp = reader.get_root::<response::Reader>().unwrap();
     let ws_id = match resp.which().unwrap() {
@@ -323,12 +350,23 @@ async fn get_unknown_workspace_yields_error() {
 async fn fork_commit_promotes_durable_ref() {
     let (ctx, _dir) = ctx();
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid = ctx.objects.write(bytes::Bytes::from_static(b"c")).await.unwrap();
+    let oid = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid, None).await.unwrap();
 
-    let out = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx).await.unwrap();
+    let out = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
-    let ws_id = match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    let ws_id = match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
         _ => panic!("expected workspace"),
     };
@@ -339,7 +377,12 @@ async fn fork_commit_promotes_durable_ref() {
         .await
         .unwrap();
     let reader2 = read_response(&out2);
-    match reader2.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader2
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::CommitOutcomes(outs) => {
             let outs = outs.unwrap();
             assert_eq!(outs.len(), 1);
@@ -377,18 +420,26 @@ async fn commit_foreign_workspace_ref_rejected() {
     // workspace ref, which the manager rejects (encoded as Response.error).
     let (ctx, _dir) = ctx();
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid1 = ctx.objects.write(bytes::Bytes::from_static(b"v1")).await.unwrap();
+    let oid1 = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"v1"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid1, None).await.unwrap();
 
     // Workspace A — the commit target.
-    let out_a = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx).await.unwrap();
+    let out_a = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx)
+        .await
+        .unwrap();
     let ra = read_response(&out_a);
     let ws_a = match ra.get_root::<response::Reader>().unwrap().which().unwrap() {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
         _ => panic!("expected workspace"),
     };
     // Workspace B — a DIFFERENT workspace whose ref we maliciously feed to A.
-    let out_b = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx).await.unwrap();
+    let out_b = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx)
+        .await
+        .unwrap();
     let rb = read_response(&out_b);
     let ws_b = match rb.get_root::<response::Reader>().unwrap().which().unwrap() {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
@@ -406,7 +457,11 @@ async fn commit_foreign_workspace_ref_rejected() {
     .unwrap();
     let reader2 = read_response(&out2);
     assert!(matches!(
-        reader2.get_root::<response::Reader>().unwrap().which().unwrap(),
+        reader2
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap(),
         response::Which::Error(_)
     ));
     // No clobber: the durable target was never created.
@@ -422,18 +477,34 @@ async fn commit_foreign_workspace_ref_rejected() {
 async fn renew_returns_lease() {
     let (ctx, _dir) = ctx();
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid = ctx.objects.write(bytes::Bytes::from_static(b"c")).await.unwrap();
+    let oid = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid, None).await.unwrap();
-    let out = dispatch(&fork_req(&["refs/heads/main"], 1), &ctx).await.unwrap();
+    let out = dispatch(&fork_req(&["refs/heads/main"], 1), &ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
-    let ws_id = match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    let ws_id = match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
         _ => panic!(),
     };
 
     let out2 = dispatch(&renew_req(&ws_id, 3600), &ctx).await.unwrap();
     let reader2 = read_response(&out2);
-    match reader2.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader2
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Lease(l) => {
             let l = l.unwrap();
             assert_eq!(l.get_id().unwrap().to_string().unwrap(), ws_id);
@@ -447,7 +518,9 @@ async fn renew_returns_lease() {
 #[tokio::test]
 async fn renew_unknown_workspace_yields_error() {
     let (ctx, _dir) = ctx();
-    let out = dispatch(&renew_req(&"0".repeat(32), 60), &ctx).await.unwrap();
+    let out = dispatch(&renew_req(&"0".repeat(32), 60), &ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
     let resp = reader.get_root::<response::Reader>().unwrap();
     assert!(matches!(resp.which().unwrap(), response::Which::Error(_)));
@@ -457,11 +530,22 @@ async fn renew_unknown_workspace_yields_error() {
 async fn release_returns_ok_and_is_idempotent() {
     let (ctx, _dir) = ctx();
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid = ctx.objects.write(bytes::Bytes::from_static(b"c")).await.unwrap();
+    let oid = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid, None).await.unwrap();
-    let out = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx).await.unwrap();
+    let out = dispatch(&fork_req(&["refs/heads/main"], 60), &ctx)
+        .await
+        .unwrap();
     let reader = read_response(&out);
-    let ws_id = match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    let ws_id = match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Workspace(w) => w.unwrap().get_id().unwrap().to_string().unwrap(),
         _ => panic!(),
     };
@@ -470,7 +554,11 @@ async fn release_returns_ok_and_is_idempotent() {
         let out = dispatch(&release_req(&ws_id), &ctx).await.unwrap();
         let reader = read_response(&out);
         assert!(matches!(
-            reader.get_root::<response::Reader>().unwrap().which().unwrap(),
+            reader
+                .get_root::<response::Reader>()
+                .unwrap()
+                .which()
+                .unwrap(),
             response::Which::Ok(())
         ));
     }
@@ -478,7 +566,11 @@ async fn release_returns_ok_and_is_idempotent() {
     let out = dispatch(&get_workspace_req(&ws_id), &ctx).await.unwrap();
     let reader = read_response(&out);
     assert!(matches!(
-        reader.get_root::<response::Reader>().unwrap().which().unwrap(),
+        reader
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap(),
         response::Which::Error(_)
     ));
 }
@@ -487,14 +579,27 @@ async fn release_returns_ok_and_is_idempotent() {
 async fn list_workspaces_returns_live() {
     let (ctx, _dir) = ctx();
     let main = RefName::new("refs/heads/main").unwrap();
-    let oid = ctx.objects.write(bytes::Bytes::from_static(b"c")).await.unwrap();
+    let oid = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     ctx.refs.update(&main, oid, None).await.unwrap();
-    let _ = dispatch(&fork_req(&["refs/heads/main"], 3600), &ctx).await.unwrap();
-    let _ = dispatch(&fork_req(&["refs/heads/main"], 3600), &ctx).await.unwrap();
+    let _ = dispatch(&fork_req(&["refs/heads/main"], 3600), &ctx)
+        .await
+        .unwrap();
+    let _ = dispatch(&fork_req(&["refs/heads/main"], 3600), &ctx)
+        .await
+        .unwrap();
 
     let out = dispatch(&list_workspaces_req(), &ctx).await.unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::WorkspaceList(list) => {
             assert_eq!(list.unwrap().len(), 2);
         }
@@ -506,10 +611,19 @@ async fn list_workspaces_returns_live() {
 async fn run_gc_returns_stats() {
     let (ctx, _dir) = ctx();
     // Write an orphan object (no ref) -> GC reclaims it.
-    let _ = ctx.objects.write(bytes::Bytes::from_static(b"orphan")).await.unwrap();
+    let _ = ctx
+        .objects
+        .write(bytes::Bytes::from_static(b"orphan"))
+        .await
+        .unwrap();
     let out = dispatch(&run_gc_req(), &ctx).await.unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::GcStats(s) => {
             let s = s.unwrap();
             assert_eq!(s.get_scanned(), 1);
@@ -552,9 +666,12 @@ async fn cross_tenant_workspace_ops_are_isolated() {
     // commit: globex cannot promote through acme's workspace ref.
     let ws_ref = format!("refs/workspaces/{ws_id}/heads/main");
     assert_is_error(
-        &dispatch(&commit_req(&ws_id, &[(&ws_ref, "refs/heads/feature")]), &globex)
-            .await
-            .unwrap(),
+        &dispatch(
+            &commit_req(&ws_id, &[(&ws_ref, "refs/heads/feature")]),
+            &globex,
+        )
+        .await
+        .unwrap(),
     );
     // No clobber: the durable target globex aimed at was never created.
     assert!(globex
@@ -570,7 +687,12 @@ async fn cross_tenant_workspace_ops_are_isolated() {
     // After all the foreign attempts, acme still owns a live workspace.
     let out = dispatch(&get_workspace_req(&ws_id), &acme).await.unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::Workspace(w) => {
             assert_eq!(w.unwrap().get_id().unwrap().to_string().unwrap(), ws_id);
         }
@@ -588,7 +710,11 @@ async fn same_tenant_workspace_ops_succeed() {
     let out = dispatch(&renew_req(&ws_id, 3600), &acme).await.unwrap();
     let reader = read_response(&out);
     assert!(matches!(
-        reader.get_root::<response::Reader>().unwrap().which().unwrap(),
+        reader
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap(),
         response::Which::Lease(_)
     ));
 
@@ -596,7 +722,11 @@ async fn same_tenant_workspace_ops_succeed() {
     let out = dispatch(&release_req(&ws_id), &acme).await.unwrap();
     let reader = read_response(&out);
     assert!(matches!(
-        reader.get_root::<response::Reader>().unwrap().which().unwrap(),
+        reader
+            .get_root::<response::Reader>()
+            .unwrap()
+            .which()
+            .unwrap(),
         response::Which::Ok(())
     ));
 }
@@ -612,7 +742,12 @@ async fn list_workspaces_is_tenant_scoped() {
     // acme's list: exactly its own workspace, never globex's.
     let out = dispatch(&list_workspaces_req(), &acme).await.unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::WorkspaceList(list) => {
             let list = list.unwrap();
             assert_eq!(list.len(), 1, "acme sees only its own");
@@ -624,11 +759,19 @@ async fn list_workspaces_is_tenant_scoped() {
     // globex's list: exactly its own workspace, never acme's.
     let out = dispatch(&list_workspaces_req(), &globex).await.unwrap();
     let reader = read_response(&out);
-    match reader.get_root::<response::Reader>().unwrap().which().unwrap() {
+    match reader
+        .get_root::<response::Reader>()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         response::Which::WorkspaceList(list) => {
             let list = list.unwrap();
             assert_eq!(list.len(), 1, "globex sees only its own");
-            assert_eq!(list.get(0).get_id().unwrap().to_string().unwrap(), globex_ws);
+            assert_eq!(
+                list.get(0).get_id().unwrap().to_string().unwrap(),
+                globex_ws
+            );
         }
         _ => panic!("expected workspaceList"),
     }

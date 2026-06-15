@@ -141,7 +141,9 @@ async fn call(
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, bytes)
 }
 
@@ -168,7 +170,14 @@ async fn register_webhook(app: &axum::Router, token: &str, sink_port: u16) -> (S
 /// (a successful `CommitOutcome::Ok`, which is what fires the webhook).
 async fn drive_commit(app: &axum::Router, refs: &Arc<RefStoreImpl>, token: &str) -> String {
     // Fork an empty workspace.
-    let (status, bytes) = call(app, "POST", "/workspaces", token, r#"{"source":[],"ttl_seconds":3600}"#).await;
+    let (status, bytes) = call(
+        app,
+        "POST",
+        "/workspaces",
+        token,
+        r#"{"source":[],"ttl_seconds":3600}"#,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "fork must 200");
     let w = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"]
         .as_str()
@@ -182,11 +191,20 @@ async fn drive_commit(app: &axum::Router, refs: &Arc<RefStoreImpl>, token: &str)
     refs.update(&ws_ref, oid, None).await.unwrap();
 
     // Commit: map the workspace ref to the durable `refs/heads/main`.
-    let body = format!(
-        r#"{{"mappings":{{"refs/workspaces/{w}/heads/main":"refs/heads/main"}}}}"#
+    let body = format!(r#"{{"mappings":{{"refs/workspaces/{w}/heads/main":"refs/heads/main"}}}}"#);
+    let (status, _bytes) = call(
+        app,
+        "POST",
+        &format!("/workspaces/{w}/commit"),
+        token,
+        &body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "commit must 200 (CommitOutcome::Ok)"
     );
-    let (status, _bytes) = call(app, "POST", &format!("/workspaces/{w}/commit"), token, &body).await;
-    assert_eq!(status, StatusCode::OK, "commit must 200 (CommitOutcome::Ok)");
     w
 }
 
@@ -227,7 +245,10 @@ async fn signed_delivery() {
     assert_eq!(payload["event"], "ref.committed");
     assert_eq!(payload["tenant"], "acme");
     assert_eq!(payload["ref"], "refs/heads/main");
-    assert!(payload["new_target"].is_string(), "new_target must be present");
+    assert!(
+        payload["new_target"].is_string(),
+        "new_target must be present"
+    );
 
     // Event header.
     assert_eq!(
@@ -238,7 +259,10 @@ async fn signed_delivery() {
     // Signature: recompute blake3 keyed hash over the EXACT raw body.
     let got_sig = headers.get("x-ledge-signature").unwrap().to_str().unwrap();
     let expect_sig = ledge_server::webhook::sign(&secret, body);
-    assert_eq!(got_sig, expect_sig, "signature must verify against raw body");
+    assert_eq!(
+        got_sig, expect_sig,
+        "signature must verify against raw body"
+    );
 }
 
 /// Only acme registered a webhook; globex's commit must produce no delivery.
@@ -259,7 +283,10 @@ async fn tenant_isolation() {
     // Give any (erroneous) globex delivery a bounded window to appear; want=2 so
     // wait_for returns at the deadline if isolation holds.
     let len = wait_for(&recorded, 2).await;
-    assert_eq!(len, 1, "globex commit must not produce a delivery, got {len}");
+    assert_eq!(
+        len, 1,
+        "globex commit must not produce a delivery, got {len}"
+    );
 }
 
 /// Deleting the webhook stops further deliveries.
@@ -291,8 +318,19 @@ async fn dead_url_does_not_break_commit() {
     let dir = TempDir::new().unwrap();
     let (app, refs, acme, _globex) = app_with_webhooks(&dir).await;
 
-    let (status, bytes) = call(&app, "POST", "/webhooks", &acme, r#"{"url":"http://127.0.0.1:1/hook"}"#).await;
-    assert_eq!(status, StatusCode::CREATED, "register dead url must still 201");
+    let (status, bytes) = call(
+        &app,
+        "POST",
+        "/webhooks",
+        &acme,
+        r#"{"url":"http://127.0.0.1:1/hook"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "register dead url must still 201"
+    );
     let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     // The commit itself must succeed despite the unreachable target.

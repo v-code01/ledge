@@ -41,13 +41,18 @@ const WINDOW: usize = 250;
 /// pass statistics; on-disk size never increases.
 pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> {
     let all_ids = store.list_all_ids().await?;
-    let mut stats = RepackStats { objects_seen: all_ids.len(), ..Default::default() };
+    let mut stats = RepackStats {
+        objects_seen: all_ids.len(),
+        ..Default::default()
+    };
 
     // On-disk bytes of the (loose) repack candidates before the pass — the same
     // accounting the old internal-deltify path reported. A packed-only object has
     // no loose file, so its metadata read fails and contributes 0.
     for id in &all_ids {
-        stats.bytes_before += std::fs::metadata(store.object_path(id)).map(|m| m.len()).unwrap_or(0);
+        stats.bytes_before += std::fs::metadata(store.object_path(id))
+            .map(|m| m.len())
+            .unwrap_or(0);
     }
 
     // Real file count before the pack stage: every loose object file plus every
@@ -90,7 +95,12 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         let git_type = store.git_type_of(*id).await?;
         let sha1 = store.sha1_of(*id).await?;
         let name_hash = name_hash_by_sha1.get(&sha1).copied().unwrap_or(0);
-        pobjs.push(crate::git_pack::PackObject { git_type, content, sha1, name_hash });
+        pobjs.push(crate::git_pack::PackObject {
+            git_type,
+            content,
+            sha1,
+            name_hash,
+        });
         meta.push((*id, sha1, git_type));
     }
 
@@ -117,7 +127,8 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
     for (ext, bytes) in [("pack", &pack), ("idx", &idx), ("lidx", &lidx)] {
         let tmp = dir.join(format!(".{name}.{ext}.tmp"));
         std::fs::write(&tmp, bytes.as_slice()).map_err(ledge_core::LedgeError::Io)?;
-        std::fs::rename(&tmp, dir.join(format!("{name}.{ext}"))).map_err(ledge_core::LedgeError::Io)?;
+        std::fs::rename(&tmp, dir.join(format!("{name}.{ext}")))
+            .map_err(ledge_core::LedgeError::Io)?;
     }
     let new_pf = crate::git_pack_file::GitPackFile::open(&dir.join(format!("{name}.pack")))?;
     let new_ids = new_pf.oids();
@@ -127,13 +138,18 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
     // BEFORE deleting anything. A failure here returns Err via `?` with loose +
     // old packs still intact (the freshly written pack is at most an orphan).
     for id in &new_ids {
-        ledge_core::ObjectStore::read(store, *id).await
-            .map_err(|e| ledge_core::LedgeError::Corruption(format!("repack verify {}: {e}", id.to_hex())))?;
+        ledge_core::ObjectStore::read(store, *id)
+            .await
+            .map_err(|e| {
+                ledge_core::LedgeError::Corruption(format!("repack verify {}: {e}", id.to_hex()))
+            })?;
     }
     // safe now: delete loose files that are packed + the OLD pack/idx/lidx files.
     for id in &new_ids {
         let lp = store.object_path(id);
-        if lp.exists() { let _ = std::fs::remove_file(&lp); }
+        if lp.exists() {
+            let _ = std::fs::remove_file(&lp);
+        }
     }
     for op in &old_packs {
         for ext in ["pack", "idx", "lidx"] {
@@ -182,7 +198,9 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
         }
     }
     stats.objects_deltified = deltified;
-    stats.files_after = std::fs::read_dir(store.pack_dir()).map(|rd| rd.count()).unwrap_or(0);
+    stats.files_after = std::fs::read_dir(store.pack_dir())
+        .map(|rd| rd.count())
+        .unwrap_or(0);
 
     Ok(stats)
 }
@@ -216,7 +234,9 @@ fn count_loose_files(store: &DiskObjectStore) -> usize {
 
 /// Count entries currently in the pack directory (`.pack` + `.idx` files).
 fn count_pack_dir(store: &DiskObjectStore) -> usize {
-    std::fs::read_dir(store.pack_dir()).map(|rd| rd.count()).unwrap_or(0)
+    std::fs::read_dir(store.pack_dir())
+        .map(|rd| rd.count())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -229,27 +249,48 @@ mod tests {
     async fn repack_shrinks_similar_objects() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::disk::DiskObjectStore::new(dir.path().to_path_buf()).unwrap();
-        let base: Vec<u8> = (0..600).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let base: Vec<u8> = (0..600)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
         let mut ids = Vec::new();
         let mut contents = Vec::new();
         for v in 0..8 {
-            let c = String::from_utf8(base.clone()).unwrap().replace("line 300\n", &format!("CHANGED v{v}\n")).into_bytes();
-            ids.push(store.write_git_object(3, Bytes::from(c.clone())).await.unwrap());
+            let c = String::from_utf8(base.clone())
+                .unwrap()
+                .replace("line 300\n", &format!("CHANGED v{v}\n"))
+                .into_bytes();
+            ids.push(
+                store
+                    .write_git_object(3, Bytes::from(c.clone()))
+                    .await
+                    .unwrap(),
+            );
             contents.push(c);
         }
-        let before: u64 = ids.iter().map(|i| std::fs::metadata(store.object_path(i)).unwrap().len()).sum();
+        let before: u64 = ids
+            .iter()
+            .map(|i| std::fs::metadata(store.object_path(i)).unwrap().len())
+            .sum();
         let stats = repack(&store).await.unwrap();
         // repack now consolidates the deltified objects into a single pack and
         // unlinks the loose files, so the post-pass on-disk footprint is the
         // pack directory's total byte size.
-        let after: u64 = std::fs::read_dir(store.pack_dir()).unwrap()
+        let after: u64 = std::fs::read_dir(store.pack_dir())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| std::fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0))
             .sum();
-        assert!(stats.objects_deltified >= 1, "should deltify at least one ({stats:?})");
+        assert!(
+            stats.objects_deltified >= 1,
+            "should deltify at least one ({stats:?})"
+        );
         assert!(after < before, "store shrank: {after} < {before}");
         for (i, c) in ids.iter().zip(&contents) {
-            assert_eq!(ObjectStore::read(&store, *i).await.unwrap().as_ref(), c.as_slice(), "reads exact post-repack");
+            assert_eq!(
+                ObjectStore::read(&store, *i).await.unwrap().as_ref(),
+                c.as_slice(),
+                "reads exact post-repack"
+            );
         }
     }
 
@@ -257,42 +298,100 @@ mod tests {
     async fn repack_consolidates_to_one_pack() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::disk::DiskObjectStore::new(dir.path().to_path_buf()).unwrap();
-        let base: Vec<u8> = (0..600).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
-        let mut ids = Vec::new(); let mut contents = Vec::new();
+        let base: Vec<u8> = (0..600)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let mut ids = Vec::new();
+        let mut contents = Vec::new();
         for v in 0..10 {
-            let c = String::from_utf8(base.clone()).unwrap().replace("line 300\n", &format!("V{v}\n")).into_bytes();
-            ids.push(store.write_git_object(3, bytes::Bytes::from(c.clone())).await.unwrap());
+            let c = String::from_utf8(base.clone())
+                .unwrap()
+                .replace("line 300\n", &format!("V{v}\n"))
+                .into_bytes();
+            ids.push(
+                store
+                    .write_git_object(3, bytes::Bytes::from(c.clone()))
+                    .await
+                    .unwrap(),
+            );
             contents.push(c);
         }
         let loose_before = count_loose(dir.path());
         assert!(loose_before >= 10);
         let stats = repack(&store).await.unwrap();
         let loose_after = count_loose(dir.path());
-        assert_eq!(loose_after, 0, "all loose objects packed (was {loose_before})");
-        assert!(stats.objects_packed >= ids.len(), "packed {} >= {}", stats.objects_packed, ids.len());
+        assert_eq!(
+            loose_after, 0,
+            "all loose objects packed (was {loose_before})"
+        );
+        assert!(
+            stats.objects_packed >= ids.len(),
+            "packed {} >= {}",
+            stats.objects_packed,
+            ids.len()
+        );
         // every object still reads byte-exact from the pack
         for (i, c) in ids.iter().zip(&contents) {
-            assert_eq!(ledge_core::ObjectStore::read(&store, *i).await.unwrap().as_ref(), c.as_slice(), "exact post-pack");
+            assert_eq!(
+                ledge_core::ObjectStore::read(&store, *i)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                c.as_slice(),
+                "exact post-pack"
+            );
         }
         // exactly one .pack + one .idx + one .lidx remain
         let packdir = dir.path().join("objects").join("pack");
-        let packs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="pack")).count();
+        let packs = std::fs::read_dir(&packdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count();
         assert_eq!(packs, 1, "one pack file");
-        let idxs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="idx")).count();
+        let idxs = std::fs::read_dir(&packdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "idx"))
+            .count();
         assert_eq!(idxs, 1, "one idx file");
-        let lidxs = std::fs::read_dir(&packdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x=="lidx")).count();
+        let lidxs = std::fs::read_dir(&packdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "lidx"))
+            .count();
         assert_eq!(lidxs, 1, "one lidx file");
         // git itself must accept the stored pack as a valid git packfile.
-        let packfile = std::fs::read_dir(&packdir).unwrap()
-            .filter_map(|e| e.ok()).find(|e| e.path().extension().is_some_and(|x| x=="idx")).unwrap().path();
-        let vp = std::process::Command::new("git").args(["verify-pack","-v", packfile.to_str().unwrap()]).output().unwrap();
-        assert!(vp.status.success(), "git verify-pack on the stored pack: {}", String::from_utf8_lossy(&vp.stderr));
-        // empty loose dirs are pruned (else they dominate du after packing)
-        let empty_loose_dirs = std::fs::read_dir(dir.path().join("objects")).unwrap()
+        let packfile = std::fs::read_dir(&packdir)
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| { let n = e.file_name(); n != std::ffi::OsStr::new("pack") && n != std::ffi::OsStr::new("tmp") && e.path().is_dir() })
+            .find(|e| e.path().extension().is_some_and(|x| x == "idx"))
+            .unwrap()
+            .path();
+        let vp = std::process::Command::new("git")
+            .args(["verify-pack", "-v", packfile.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            vp.status.success(),
+            "git verify-pack on the stored pack: {}",
+            String::from_utf8_lossy(&vp.stderr)
+        );
+        // empty loose dirs are pruned (else they dominate du after packing)
+        let empty_loose_dirs = std::fs::read_dir(dir.path().join("objects"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                n != std::ffi::OsStr::new("pack")
+                    && n != std::ffi::OsStr::new("tmp")
+                    && e.path().is_dir()
+            })
             .count();
-        assert_eq!(empty_loose_dirs, 0, "repack prunes the empty objects/XX loose dirs");
+        assert_eq!(
+            empty_loose_dirs, 0,
+            "repack prunes the empty objects/XX loose dirs"
+        );
     }
 
     // counts loose object files under objects/XX/YY, excluding the pack/ and tmp/ dirs
@@ -302,8 +401,12 @@ mod tests {
         if let Ok(l1) = std::fs::read_dir(&root) {
             for d1 in l1.flatten() {
                 let name = d1.file_name();
-                if name == std::ffi::OsStr::new("tmp") || name == std::ffi::OsStr::new("pack") { continue; }
-                if !d1.path().is_dir() { continue; }
+                if name == std::ffi::OsStr::new("tmp") || name == std::ffi::OsStr::new("pack") {
+                    continue;
+                }
+                if !d1.path().is_dir() {
+                    continue;
+                }
                 if let Ok(l2) = std::fs::read_dir(d1.path()) {
                     for d2 in l2.flatten() {
                         if let Ok(l3) = std::fs::read_dir(d2.path()) {

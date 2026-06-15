@@ -103,14 +103,20 @@ async fn fork_commit_clone_roundtrip() {
     // 1. Seed durable /myrepo with an initial commit on refs/heads/main.
     let src = TempDir::new().unwrap();
     let sp = src.path();
-    assert_git_ok(&git(&["init", "--initial-branch=main", "."], sp).await, "init");
+    assert_git_ok(
+        &git(&["init", "--initial-branch=main", "."], sp).await,
+        "init",
+    );
     assert_git_ok(&git(&["config", "user.email", "a@b.c"], sp).await, "email");
     assert_git_ok(&git(&["config", "user.name", "T"], sp).await, "name");
     std::fs::write(sp.join("base.txt"), b"durable base\n").unwrap();
     assert_git_ok(&git(&["add", "."], sp).await, "add");
     assert_git_ok(&git(&["commit", "-m", "base"], sp).await, "commit");
     let durable = format!("{base}/myrepo");
-    assert_git_ok(&git(&["remote", "add", "ledge", &durable], sp).await, "remote");
+    assert_git_ok(
+        &git(&["remote", "add", "ledge", &durable], sp).await,
+        "remote",
+    );
     assert_git_ok(
         &git(&["push", "ledge", "main:refs/heads/main"], sp).await,
         "push durable",
@@ -148,7 +154,10 @@ async fn fork_commit_clone_roundtrip() {
     assert_git_ok(&git(&["config", "user.name", "T"], &wsdir).await, "ws name");
     std::fs::write(wsdir.join("work.txt"), b"agent work\n").unwrap();
     assert_git_ok(&git(&["add", "."], &wsdir).await, "ws add");
-    assert_git_ok(&git(&["commit", "-m", "agent work"], &wsdir).await, "ws commit");
+    assert_git_ok(
+        &git(&["commit", "-m", "agent work"], &wsdir).await,
+        "ws commit",
+    );
     assert_git_ok(
         &git(&["push", "origin", "main:refs/heads/main"], &wsdir).await,
         "push ws",
@@ -196,14 +205,20 @@ async fn release_then_gc_reclaims_discarded() {
     // Seed durable /myrepo.
     let src = TempDir::new().unwrap();
     let sp = src.path();
-    assert_git_ok(&git(&["init", "--initial-branch=main", "."], sp).await, "init");
+    assert_git_ok(
+        &git(&["init", "--initial-branch=main", "."], sp).await,
+        "init",
+    );
     assert_git_ok(&git(&["config", "user.email", "a@b.c"], sp).await, "email");
     assert_git_ok(&git(&["config", "user.name", "T"], sp).await, "name");
     std::fs::write(sp.join("keep.txt"), b"durable keep\n").unwrap();
     assert_git_ok(&git(&["add", "."], sp).await, "add");
     assert_git_ok(&git(&["commit", "-m", "keep"], sp).await, "commit");
     let durable = format!("{base}/myrepo");
-    assert_git_ok(&git(&["remote", "add", "ledge", &durable], sp).await, "remote");
+    assert_git_ok(
+        &git(&["remote", "add", "ledge", &durable], sp).await,
+        "remote",
+    );
     assert_git_ok(
         &git(&["push", "ledge", "main:refs/heads/main"], sp).await,
         "push",
@@ -281,7 +296,10 @@ async fn released_workspace_get_is_gone_or_not_found() {
     // Seed durable + fork.
     let src = TempDir::new().unwrap();
     let sp = src.path();
-    assert_git_ok(&git(&["init", "--initial-branch=main", "."], sp).await, "init");
+    assert_git_ok(
+        &git(&["init", "--initial-branch=main", "."], sp).await,
+        "init",
+    );
     assert_git_ok(&git(&["config", "user.email", "a@b.c"], sp).await, "email");
     assert_git_ok(&git(&["config", "user.name", "T"], sp).await, "name");
     std::fs::write(sp.join("f.txt"), b"x\n").unwrap();
@@ -341,9 +359,5 @@ async fn released_workspace_get_is_gone_or_not_found() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        del2.status().as_u16(),
-        200,
-        "release must be idempotent"
-    );
+    assert_eq!(del2.status().as_u16(), 200, "release must be idempotent");
 }

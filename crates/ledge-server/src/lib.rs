@@ -3,11 +3,11 @@ pub mod auth;
 pub mod cli;
 pub mod cluster_routes;
 pub mod config;
+pub mod lfs;
 pub mod metrics;
 pub mod object_routes;
 pub mod quota;
 pub mod routes;
-pub mod lfs;
 pub mod rpc_routes;
 pub mod ssh;
 pub mod ssrf;
@@ -21,17 +21,16 @@ pub mod workspace_routes;
 pub use auth::{Principal, Scopes};
 pub use routes::AppState;
 
+use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
-use axum::Router;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
-use ledge_core::{HLC, ObjectStore, RefStore};
+use ledge_core::{ObjectStore, RefStore, HLC};
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
 use ledge_workspace::{Gc, LeaseStore, WorkspaceManager};
 
-use std::collections::{BTreeMap, HashMap};
 use ledge_cluster::net_http::{HttpObjectPeer, HttpRaftNetworkFactory};
 use ledge_cluster::ref_store::ShardHandle;
 use ledge_cluster::{
@@ -39,6 +38,7 @@ use ledge_cluster::{
 };
 use ledge_raft::{StateMachineStore, TypeConfig, WalLogStore};
 use routes::ClusterHandles;
+use std::collections::{BTreeMap, HashMap};
 
 /// Open the lease store and assemble the workspace control-plane trio
 /// (manager, lease store, GC) from already-open object/ref stores.
@@ -269,7 +269,10 @@ pub async fn build_cluster_stack(
             }
         }
     }
-    let replicated = Arc::new(ReplicatedObjectStore::new(objects_disk.clone(), object_peers));
+    let replicated = Arc::new(ReplicatedObjectStore::new(
+        objects_disk.clone(),
+        object_peers,
+    ));
 
     Ok(ClusterStack {
         refs: cluster_refs.clone() as Arc<dyn RefStore>,
@@ -369,18 +372,12 @@ pub fn build_app(state: AppState) -> Router {
             "/admin/repack",
             axum::routing::post(admin_routes::admin_repack),
         )
-        .route(
-            "/admin/tier",
-            axum::routing::post(admin_routes::admin_tier),
-        )
+        .route("/admin/tier", axum::routing::post(admin_routes::admin_tier))
         .route(
             "/admin/recover",
             axum::routing::post(admin_routes::admin_recover),
         )
-        .route(
-            "/admin/warm",
-            axum::routing::post(admin_routes::admin_warm),
-        )
+        .route("/admin/warm", axum::routing::post(admin_routes::admin_warm))
         // ── Cluster control plane (spec §7) — inert (503) in single-node mode ──
         .route(
             "/raft/{shard}/{kind}",
@@ -419,7 +416,10 @@ pub fn build_app(state: AppState) -> Router {
             axum::routing::get(object_routes::get_object),
         )
         // ── Workspace-scoped git (segment = workspaces/{id}/) ──────────────
-        .route("/ws/{id}/info/refs", axum::routing::get(routes::ws_info_refs))
+        .route(
+            "/ws/{id}/info/refs",
+            axum::routing::get(routes::ws_info_refs),
+        )
         .route(
             "/ws/{id}/git-upload-pack",
             axum::routing::post(routes::ws_upload_pack),
@@ -507,17 +507,35 @@ mod build_cluster_stack_tests {
             (
                 ShardId(0),
                 vec![
-                    Replica { node_id: 1, addr: "http://n1".into() },
-                    Replica { node_id: 2, addr: "http://n2".into() },
-                    Replica { node_id: 3, addr: "http://n3".into() },
+                    Replica {
+                        node_id: 1,
+                        addr: "http://n1".into(),
+                    },
+                    Replica {
+                        node_id: 2,
+                        addr: "http://n2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "http://n3".into(),
+                    },
                 ],
             ),
             (
                 ShardId(1),
                 vec![
-                    Replica { node_id: 2, addr: "http://n2".into() },
-                    Replica { node_id: 3, addr: "http://n3".into() },
-                    Replica { node_id: 4, addr: "http://n4".into() },
+                    Replica {
+                        node_id: 2,
+                        addr: "http://n2".into(),
+                    },
+                    Replica {
+                        node_id: 3,
+                        addr: "http://n3".into(),
+                    },
+                    Replica {
+                        node_id: 4,
+                        addr: "http://n4".into(),
+                    },
                 ],
             ),
         ])
@@ -541,7 +559,10 @@ mod build_cluster_stack_tests {
         .unwrap();
 
         // Node 1 built exactly shard 0's Raft group, and NOT shard 1's.
-        assert!(stack.shards.contains_key(&ShardId(0)), "node 1 hosts shard 0");
+        assert!(
+            stack.shards.contains_key(&ShardId(0)),
+            "node 1 hosts shard 0"
+        );
         assert!(
             !stack.shards.contains_key(&ShardId(1)),
             "node 1 must NOT host shard 1"
@@ -569,13 +590,17 @@ mod tls_client_tests {
         crate::tls::install_crypto_provider();
         let d = tempfile::TempDir::new().unwrap();
         let (ca, _sc, _sk, cc, ck) = crate::tls::tests_support::mint();
-        let ca_p = d.path().join("ca.pem"); std::fs::write(&ca_p, ca).unwrap();
-        let cc_p = d.path().join("c.pem"); std::fs::write(&cc_p, cc).unwrap();
-        let ck_p = d.path().join("k.pem"); std::fs::write(&ck_p, ck).unwrap();
+        let ca_p = d.path().join("ca.pem");
+        std::fs::write(&ca_p, ca).unwrap();
+        let cc_p = d.path().join("c.pem");
+        std::fs::write(&cc_p, cc).unwrap();
+        let ck_p = d.path().join("k.pem");
+        std::fs::write(&ck_p, ck).unwrap();
         let cfg = crate::tls::client_config(
             ca_p.to_str().unwrap(),
             Some((cc_p.to_str().unwrap(), ck_p.to_str().unwrap())),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(cluster_client(Some("s3cr3t".to_string()), Some(cfg)).is_ok());
     }
 }

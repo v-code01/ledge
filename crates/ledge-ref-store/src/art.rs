@@ -66,7 +66,7 @@ pub struct Node16 {
 #[derive(Clone)]
 pub struct Node48 {
     pub prefix: Vec<u8>,
-    pub count: u8, // 0..=48
+    pub count: u8,            // 0..=48
     pub key_index: [u8; 256], // 0xFF = absent
     pub children: [Option<Arc<ArtNode>>; 48],
 }
@@ -215,7 +215,11 @@ pub fn art_lookup<'a>(node: &'a ArtNode, key: &[u8], depth: usize) -> Option<&'a
                 return None;
             }
             let after = depth + pfx.len();
-            let byte = if after >= key.len() { 0x00u8 } else { key[after] };
+            let byte = if after >= key.len() {
+                0x00u8
+            } else {
+                key[after]
+            };
             let next_depth = if after >= key.len() { after } else { after + 1 };
             if let Some(child) = &n.children[byte as usize] {
                 art_lookup(child, key, next_depth)
@@ -407,7 +411,11 @@ pub fn art_insert(
             } else if new_exhausted {
                 // new key is a prefix of existing_key — new leaf goes under 0x00.
                 let existing_byte = existing_key[depth + cp];
-                let (p0, p1) = if 0x00u8 < existing_byte { (0, 1) } else { (1, 0) };
+                let (p0, p1) = if 0x00u8 < existing_byte {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
                 new_node4.keys[p0] = 0x00;
                 new_node4.children[p0] = Some(new_leaf);
                 new_node4.keys[p1] = existing_byte;
@@ -417,7 +425,11 @@ pub fn art_insert(
                 let existing_byte = existing_key[depth + cp];
                 let new_byte = key[depth + cp];
                 // Place into sorted order.
-                let (pos_existing, pos_new) = if existing_byte < new_byte { (0, 1) } else { (1, 0) };
+                let (pos_existing, pos_new) = if existing_byte < new_byte {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
                 new_node4.keys[pos_existing] = existing_byte;
                 new_node4.children[pos_existing] = Some(existing_leaf);
                 new_node4.keys[pos_new] = new_byte;
@@ -438,7 +450,10 @@ pub fn art_insert(
             let after = depth + pfx.len();
             if after >= key.len() {
                 // Key terminates exactly at node boundary: store as null-byte child.
-                let leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+                let leaf = Arc::new(ArtNode::Leaf(LeafNode {
+                    key: key.into(),
+                    entry,
+                }));
                 return node4_with_child(n, 0x00, leaf);
             }
             let byte = key[after];
@@ -459,7 +474,10 @@ pub fn art_insert(
             }
             let after = depth + pfx.len();
             if after >= key.len() {
-                let leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+                let leaf = Arc::new(ArtNode::Leaf(LeafNode {
+                    key: key.into(),
+                    entry,
+                }));
                 return node16_with_child(n, 0x00, leaf);
             }
             let byte = key[after];
@@ -479,7 +497,10 @@ pub fn art_insert(
             }
             let after = depth + pfx.len();
             if after >= key.len() {
-                let leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+                let leaf = Arc::new(ArtNode::Leaf(LeafNode {
+                    key: key.into(),
+                    entry,
+                }));
                 return node48_with_child(n, 0x00, leaf);
             }
             let byte = key[after];
@@ -502,7 +523,10 @@ pub fn art_insert(
             }
             let after = depth + pfx.len();
             if after >= key.len() {
-                let leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+                let leaf = Arc::new(ArtNode::Leaf(LeafNode {
+                    key: key.into(),
+                    entry,
+                }));
                 return node256_with_child(n, 0x00, leaf);
             }
             let byte = key[after];
@@ -535,7 +559,10 @@ fn split_inner_node4(
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
     let old_child = Arc::new(ArtNode::Node4(old_n));
-    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode {
+        key: key.into(),
+        entry,
+    }));
 
     let mut split_node = Node4::new(new_prefix);
     let (p0, p1) = if old_byte < new_byte { (0, 1) } else { (1, 0) };
@@ -561,7 +588,10 @@ fn split_inner_node16(
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
     let old_child = Arc::new(ArtNode::Node16(old_n));
-    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode {
+        key: key.into(),
+        entry,
+    }));
 
     let mut split_node = Node4::new(new_prefix);
     let (p0, p1) = if old_byte < new_byte { (0, 1) } else { (1, 0) };
@@ -587,7 +617,10 @@ fn split_inner_node48(
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
     let old_child = Arc::new(ArtNode::Node48(Box::new(old_n)));
-    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode {
+        key: key.into(),
+        entry,
+    }));
 
     let mut split_node = Node4::new(new_prefix);
     let (p0, p1) = if old_byte < new_byte { (0, 1) } else { (1, 0) };
@@ -613,7 +646,10 @@ fn split_inner_node256(
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
     let old_child = Arc::new(ArtNode::Node256(old_n));
-    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode { key: key.into(), entry }));
+    let new_leaf = Arc::new(ArtNode::Leaf(LeafNode {
+        key: key.into(),
+        entry,
+    }));
 
     let mut split_node = Node4::new(new_prefix);
     let (p0, p1) = if old_byte < new_byte { (0, 1) } else { (1, 0) };
@@ -743,7 +779,11 @@ pub fn art_delete(node: Arc<ArtNode>, key: &[u8], depth: usize) -> Option<Arc<Ar
                 return Some(node);
             }
             let after = depth + pfx.len();
-            let byte = if after >= key.len() { 0x00usize } else { key[after] as usize };
+            let byte = if after >= key.len() {
+                0x00usize
+            } else {
+                key[after] as usize
+            };
             let next_depth = if after >= key.len() { after } else { after + 1 };
             let child = n.children[byte].as_ref()?;
             let new_child = art_delete(Arc::clone(child), key, next_depth);
@@ -861,13 +901,17 @@ fn node_prefix_compatible(node_prefix: &[u8], search_prefix: &[u8], depth: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use ledge_core::{ObjectId, RefEntry, TxnId};
     use crate::slot::{PreparedIntent, RefSlot};
+    use ledge_core::{ObjectId, RefEntry, TxnId};
+    use std::sync::Arc;
 
     fn make_slot(byte: u8, version: u64) -> RefSlot {
         RefSlot {
-            committed: RefEntry { target: ObjectId::from_bytes([byte; 32]), hlc: version, version },
+            committed: RefEntry {
+                target: ObjectId::from_bytes([byte; 32]),
+                hlc: version,
+                version,
+            },
             prepared: None,
         }
     }
@@ -885,7 +929,10 @@ mod tests {
         let root = art_insert(None, key, slot.clone(), 0);
         let got = art_lookup(&root, key, 0).unwrap();
         assert_eq!(got.committed.version, 1);
-        assert!(got.prepared.is_some(), "ART leaf must preserve the prepared lock");
+        assert!(
+            got.prepared.is_some(),
+            "ART leaf must preserve the prepared lock"
+        );
         assert_eq!(got.prepared.as_ref().unwrap().staged_hlc, 42);
     }
 
@@ -905,14 +952,22 @@ mod tests {
 
     #[test]
     fn insert_multiple_lookup_each() {
-        let keys: &[&[u8]] = &[b"refs/heads/main", b"refs/heads/feature", b"refs/tags/v1.0", b"refs/agents/a1"];
+        let keys: &[&[u8]] = &[
+            b"refs/heads/main",
+            b"refs/heads/feature",
+            b"refs/tags/v1.0",
+            b"refs/agents/a1",
+        ];
         let mut root = None;
         for (i, k) in keys.iter().enumerate() {
             root = Some(art_insert(root, k, make_slot(i as u8, i as u64 + 1), 0));
         }
         let root = root.unwrap();
         for (i, k) in keys.iter().enumerate() {
-            assert_eq!(art_lookup(&root, k, 0), Some(&make_slot(i as u8, i as u64 + 1)));
+            assert_eq!(
+                art_lookup(&root, k, 0),
+                Some(&make_slot(i as u8, i as u64 + 1))
+            );
         }
     }
 
@@ -948,7 +1003,12 @@ mod tests {
 
     #[test]
     fn prefix_iter_subtree() {
-        let keys: &[&[u8]] = &[b"refs/heads/main", b"refs/heads/dev", b"refs/tags/v1.0", b"refs/agents/a1"];
+        let keys: &[&[u8]] = &[
+            b"refs/heads/main",
+            b"refs/heads/dev",
+            b"refs/tags/v1.0",
+            b"refs/agents/a1",
+        ];
         let mut root = None;
         for (i, k) in keys.iter().enumerate() {
             root = Some(art_insert(root, k, make_slot(i as u8, i as u64 + 1), 0));
@@ -978,7 +1038,12 @@ mod tests {
     fn node16_to_node48_upgrade() {
         let mut root = None;
         for c in 0u8..17 {
-            root = Some(art_insert(root, &[b'r', b'e', b'f', b's', b'/', c], make_slot(c, c as u64), 0));
+            root = Some(art_insert(
+                root,
+                &[b'r', b'e', b'f', b's', b'/', c],
+                make_slot(c, c as u64),
+                0,
+            ));
         }
         let root = root.unwrap();
         for c in 0u8..17 {
@@ -990,7 +1055,12 @@ mod tests {
     fn node48_to_node256_upgrade() {
         let mut root = None;
         for c in 0u8..49 {
-            root = Some(art_insert(root, &[b'r', b'e', b'f', b's', b'/', c], make_slot(c, c as u64), 0));
+            root = Some(art_insert(
+                root,
+                &[b'r', b'e', b'f', b's', b'/', c],
+                make_slot(c, c as u64),
+                0,
+            ));
         }
         let root = root.unwrap();
         for c in 0u8..49 {
@@ -1001,7 +1071,10 @@ mod tests {
     #[test]
     fn prefix_iter_empty_prefix_returns_all() {
         let mut root = None;
-        for (i, k) in [b"refs/heads/main" as &[u8], b"refs/tags/v1"].iter().enumerate() {
+        for (i, k) in [b"refs/heads/main" as &[u8], b"refs/tags/v1"]
+            .iter()
+            .enumerate()
+        {
             root = Some(art_insert(root, k, make_slot(i as u8, i as u64 + 1), 0));
         }
         assert_eq!(art_prefix_iter(&root.unwrap(), b"", 0).len(), 2);
@@ -1016,7 +1089,13 @@ mod tests {
         // Delete the shorter key
         let root = art_delete(root.unwrap(), b"refs/a", 0);
         let root = root.expect("tree not empty");
-        assert!(art_lookup(&root, b"refs/a", 0).is_none(), "refs/a should be deleted");
-        assert!(art_lookup(&root, b"refs/ab", 0).is_some(), "refs/ab should still exist");
+        assert!(
+            art_lookup(&root, b"refs/a", 0).is_none(),
+            "refs/a should be deleted"
+        );
+        assert!(
+            art_lookup(&root, b"refs/ab", 0).is_some(),
+            "refs/ab should still exist"
+        );
     }
 }

@@ -59,7 +59,11 @@ async fn elects_leader() {
             assert_eq!(m.current_leader, Some(id));
         }
         // Every node agrees on who the leader is.
-        assert_eq!(m.current_leader, Some(leader), "node {id} disagrees on leader");
+        assert_eq!(
+            m.current_leader,
+            Some(leader),
+            "node {id} disagrees on leader"
+        );
     }
     assert_eq!(leaders, 1, "expected exactly one leader");
 }
@@ -71,7 +75,10 @@ async fn replicates_writes() {
     let leader = c.wait_for_leader().await;
 
     // Write three refs through the leader.
-    for (i, name) in ["refs/heads/a", "refs/heads/b", "refs/heads/c"].iter().enumerate() {
+    for (i, name) in ["refs/heads/a", "refs/heads/b", "refs/heads/c"]
+        .iter()
+        .enumerate()
+    {
         let r = c
             .leader(leader)
             .client_write(op_create(name, 0x10 + i as u8, (i + 1) as u64))
@@ -83,7 +90,10 @@ async fn replicates_writes() {
     // Every node's state machine must converge to all three refs.
     // Followers apply asynchronously; poll briefly.
     for id in [1, 2, 3] {
-        for (i, name) in ["refs/heads/a", "refs/heads/b", "refs/heads/c"].iter().enumerate() {
+        for (i, name) in ["refs/heads/a", "refs/heads/b", "refs/heads/c"]
+            .iter()
+            .enumerate()
+        {
             let want = ObjectId::from_bytes([0x10 + i as u8; 32]);
             let mut got = None;
             for _ in 0..200 {
@@ -128,10 +138,19 @@ async fn cas_linearizable() {
     );
 
     // Exactly one Updated, exactly one Conflict.
-    let updated = [&a, &b].iter().filter(|r| matches!(r, LedgeResp::RefUpdated(_))).count();
-    let conflict = [&a, &b].iter().filter(|r| matches!(r, LedgeResp::Conflict(_))).count();
+    let updated = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, LedgeResp::RefUpdated(_)))
+        .count();
+    let conflict = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, LedgeResp::Conflict(_)))
+        .count();
     assert_eq!(updated, 1, "expected exactly one winner: a={a:?} b={b:?}");
-    assert_eq!(conflict, 1, "expected exactly one conflict: a={a:?} b={b:?}");
+    assert_eq!(
+        conflict, 1,
+        "expected exactly one conflict: a={a:?} b={b:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

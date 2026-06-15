@@ -95,15 +95,27 @@ mod tests {
     #[test]
     fn classifies_addresses() {
         let blocked = [
-            "127.0.0.1", "10.1.2.3", "192.168.0.1", "172.16.5.5",
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.5.5",
             "169.254.169.254", // cloud metadata
-            "0.0.0.0", "100.64.0.1", "::1", "fe80::1", "fc00::1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
             "::ffff:127.0.0.1", // IPv4-mapped loopback
         ];
         for s in blocked {
             assert!(is_blocked_ip(s.parse().unwrap()), "{s} must be blocked");
         }
-        let public = ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"];
+        let public = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ];
         for s in public {
             assert!(!is_blocked_ip(s.parse().unwrap()), "{s} must be allowed");
         }
@@ -111,11 +123,19 @@ mod tests {
 
     #[tokio::test]
     async fn guard_blocks_private_allows_public_and_opts_out() {
-        assert!(guard_outbound("http://169.254.169.254/latest/meta-data", false).await.is_err());
-        assert!(guard_outbound("http://127.0.0.1:8080/hook", false).await.is_err());
+        assert!(
+            guard_outbound("http://169.254.169.254/latest/meta-data", false)
+                .await
+                .is_err()
+        );
+        assert!(guard_outbound("http://127.0.0.1:8080/hook", false)
+            .await
+            .is_err());
         assert!(guard_outbound("ftp://example.com", false).await.is_err()); // scheme
         assert!(guard_outbound("http://1.1.1.1/hook", false).await.is_ok());
         // allow_private opts out entirely (single-tenant/dev).
-        assert!(guard_outbound("http://127.0.0.1:8080/hook", true).await.is_ok());
+        assert!(guard_outbound("http://127.0.0.1:8080/hook", true)
+            .await
+            .is_ok());
     }
 }

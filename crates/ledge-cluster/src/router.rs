@@ -11,8 +11,9 @@
 use ledge_workspace::id::WorkspaceId;
 
 /// Identifier of one shard (one independent Raft group). `0..num_shards`.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct ShardId(pub u32);
 
 /// Which shards a `list(prefix)` must consult, per [`ShardRouter::shards_for_prefix`].
@@ -179,7 +180,11 @@ mod tests {
             let r = ShardRouter::new(n);
             for name in corpus() {
                 let s = r.shard_for(&name);
-                assert!(s.0 < n, "ref {name} → shard {} out of range (num_shards={n})", s.0);
+                assert!(
+                    s.0 < n,
+                    "ref {name} → shard {} out of range (num_shards={n})",
+                    s.0
+                );
             }
         }
     }
@@ -234,7 +239,10 @@ mod tests {
             "tenants clustered into too few shards: {buckets:?}"
         );
         let max = buckets.values().copied().max().unwrap();
-        assert!(max < 200 * 6 / 10, "one shard hoards {max}/200 tenants: {buckets:?}");
+        assert!(
+            max < 200 * 6 / 10,
+            "one shard hoards {max}/200 tenants: {buckets:?}"
+        );
     }
 
     #[test]
