@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod object_routes;
 pub mod quota;
 pub mod routes;
+pub mod lfs;
 pub mod rpc_routes;
 pub mod ssh;
 pub mod ssrf;
@@ -436,6 +437,15 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/{repo}/git-receive-pack",
             axum::routing::post(routes::receive_pack),
+        )
+        // ── Git LFS (Batch API + basic transfer) for the durable repo ──────
+        .route(
+            "/{repo}/info/lfs/objects/batch",
+            axum::routing::post(lfs::lfs_batch),
+        )
+        .route(
+            "/{repo}/info/lfs/objects/{oid}",
+            axum::routing::put(lfs::lfs_upload).get(lfs::lfs_download),
         )
         .with_state(state)
         .layer(

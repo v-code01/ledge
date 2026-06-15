@@ -64,6 +64,8 @@ smaller; the bridge is the content-addressing tax. (Details in
   history for fast CI checkouts.
 - **Partial clone** (`git clone --filter=blob:none` / `blob:limit=N`) — blobless
   checkouts that lazily fetch objects on demand, for big-repo / monorepo workflows.
+- **Git LFS** (Batch API + basic transfer) — large files move over the LFS API,
+  content-addressed (SHA-256) and verified on upload; `git lfs push/pull` round-trip.
 - **BLAKE3 content addressing** (`ObjectId = blake3(content)`), not SHA-1.
 - **Sharded Raft replication** (openraft): linearizable compare-and-swap on refs,
   leader-failover with no committed-data loss.
@@ -163,8 +165,8 @@ what is **not** ready — so you can decide where it fits:
   negotiation; `multi_ack_detailed` and shallow/partial clone are still follow-ons.
 - **SSH transport does clone + fetch + push.** Shallow (`--depth N`) and partial
   (`--filter=blob:none` / `blob:limit=N`) clone are supported over HTTP and SSH.
-  **No LFS, no sparse / tree-filter clone**; shallow *deepen-with-history* is a
-  follow-on. SSH auth is an authorized-keys allowlist where each key's **comment
+  **No sparse / tree-filter clone**; shallow *deepen-with-history* and LFS file
+  locking are follow-ons. SSH auth is an authorized-keys allowlist where each key's **comment
   is its tenant** (`ssh-ed25519 … acme` ⇒ tenant `acme`; no comment ⇒ root), and
   SSH access to a workspace is gated by tenant ownership — same isolation as HTTP.
   Empty/absent allowlist accepts any key as root (dev only).
