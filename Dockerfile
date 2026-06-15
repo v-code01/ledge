@@ -25,6 +25,11 @@ WORKDIR /build
 # Copy the full workspace (the .dockerignore drops target/.git/docs/formal). A
 # cargo-chef dependency-cache layer is a documented follow-on; correctness first.
 COPY . .
+# Override the workspace's .cargo/config.toml rustflags for the image: keep the
+# fast `lld` linker but DROP `target-cpu=native` — a published image must run on
+# any CPU of its arch, not just the one it was built on. RUSTFLAGS (env) takes
+# precedence over the config's target rustflags, so this fully replaces them.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 RUN cargo build --release -p ledge-server
 
 # ---- runtime ----------------------------------------------------------------
