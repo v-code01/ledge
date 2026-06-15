@@ -2147,6 +2147,7 @@ dependencies = [
  "hex",
  "ledge-core",
  "ledge-object-store",
+ "metrics",
  "proptest",
  "sha1 0.10.6",
  "tempfile",

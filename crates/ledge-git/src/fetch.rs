@@ -524,6 +524,22 @@ async fn build_upload_pack_response(
     Ok(response)
 }
 
+/// Observability for a served upload-pack: a `kind`×`transport` counter and an
+/// objects-served histogram. The histogram makes the incremental-fetch / shallow
+/// savings visible (a fetch serves a handful of objects, a clone the full closure).
+fn record_upload_pack(kind: &'static str, transport: &'static str, objects: usize) {
+    metrics::counter!("ledge_upload_pack_total", "kind" => kind, "transport" => transport)
+        .increment(1);
+    metrics::histogram!("ledge_upload_pack_objects", "kind" => kind).record(objects as f64);
+}
+
+/// Upload-pack response-cache outcome. A `hit` is a warm/precomputed clone served
+/// without re-walking the graph — the eager-warming win, made measurable.
+fn record_upload_pack_cache(hit: bool) {
+    let result = if hit { "hit" } else { "miss" };
+    metrics::counter!("ledge_upload_pack_cache_total", "result" => result).increment(1);
+}
+
 /// Read the object count from a NAK-framed upload-pack response: the pack
 /// header's big-endian u32 object count, which sits at bytes [8..12] of the
 /// PACK header — itself preceded by the 8-byte "0008NAK\n" pkt-line. Used only
@@ -625,6 +641,7 @@ pub async fn handle_upload_pack(
         if done {
             resp.extend_from_slice(&encode(b"NAK\n"));
             resp.extend_from_slice(&encode_pack(&pack_objects));
+            record_upload_pack("shallow", "http", pack_objects.len());
         }
         return Ok(resp);
     }
@@ -637,10 +654,14 @@ pub async fn handle_upload_pack(
         let cache_key = upload_pack_cache_key(segment, &wanted_sha1s);
         if let Some(c) = cache {
             if let Some(bytes) = c.get(&cache_key) {
+                record_upload_pack_cache(true);
+                record_upload_pack("clone", "http", count_pack_objects(&bytes));
                 return Ok((*bytes).clone());
             }
         }
+        record_upload_pack_cache(false);
         let response = build_upload_pack_response(&objects, sha1_store, &wanted_sha1s).await?;
+        record_upload_pack("clone", "http", count_pack_objects(&response));
         if let Some(c) = cache {
             c.put(cache_key, std::sync::Arc::new(response.clone()));
         }
@@ -674,6 +695,7 @@ pub async fn handle_upload_pack(
     // HTTP the client re-sends all haves each round, so `commons` here is complete.
     let exclude = reachable_closure(&objects, sha1_store, &commons).await;
     let pack_objects = collect_pack_objects(&objects, sha1_store, &wanted_sha1s, &exclude).await;
+    record_upload_pack("fetch", "http", pack_objects.len());
     let pack = encode_pack(&pack_objects);
     let ack = match commons.last() {
         Some(h) => encode(format!("ACK {}\n", hex::encode(h)).as_bytes()),
@@ -1020,6 +1042,7 @@ where
             }
         }
         let pack = encode_pack(&pack_objects);
+        record_upload_pack("shallow", "ssh", pack_objects.len());
         stream.write_all(&encode(b"NAK\n")).await.map_err(LedgeError::Io)?;
         stream.write_all(&pack).await.map_err(LedgeError::Io)?;
         stream.flush().await.map_err(LedgeError::Io)?;
@@ -1064,6 +1087,11 @@ where
         reachable_closure(&objects, sha1_store, &commons).await
     };
     let pack_objects = collect_pack_objects(&objects, sha1_store, &wants, &exclude).await;
+    record_upload_pack(
+        if commons.is_empty() { "clone" } else { "fetch" },
+        "ssh",
+        pack_objects.len(),
+    );
     let pack = encode_pack(&pack_objects);
     let ack = match commons.last() {
         Some(h) => encode(format!("ACK {}\n", hex::encode(h)).as_bytes()),
