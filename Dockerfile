@@ -15,9 +15,10 @@ FROM rust:1.89-bookworm AS builder
 
 # capnproto: crates/ledge-rpc/build.rs runs capnpc at build time.
 # cmake + clang: aws-lc-rs (rustls provider) compiles C at build time.
+# lld: the workspace's .cargo/config.toml links the linux build with `-fuse-ld=lld`.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends capnproto cmake clang \
+    && apt-get install -y --no-install-recommends capnproto cmake clang lld \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
