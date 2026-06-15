@@ -371,6 +371,28 @@ mod tests {
             assert_eq!(out, target, "round-trip (base {} target {})", base.len(), target.len());
         }
     }
+    proptest::proptest! {
+        // apply_delta runs on attacker-controlled bytes (a REF_DELTA/OFS_DELTA in a
+        // pushed pack). On ANY (base, delta) it must return Ok or Err — never panic,
+        // never hang, never over-allocate (the MAX_OBJECT_SIZE guard bounds output).
+        #[test]
+        fn apply_delta_never_panics(
+            base in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+            delta in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            let _ = apply_delta(&base, &delta);
+        }
+        // A valid encode→apply round-trips for arbitrary content.
+        #[test]
+        fn encode_apply_roundtrips_arbitrary(
+            base in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..1024),
+            target in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..1024),
+        ) {
+            let d = encode_delta(&base, &target);
+            proptest::prop_assert_eq!(apply_delta(&base, &d).unwrap(), target);
+        }
+    }
+
     #[test]
     fn delta_index_matches_encode_delta() {
         // The reusable DeltaIndex must produce byte-identical deltas to the

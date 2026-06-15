@@ -32,6 +32,16 @@ Pre-1.0: only the latest `main` is supported. Fixes land on `main`.
 - **Quotas:** per-tenant workspace-count, request-rate, durable-bytes, and
   object-count limits (`[quotas]`, default-off).
 
+## Untrusted-input hardening
+
+The receive-pack path ingests attacker-controlled packfiles. The pack decoder
+bounds each object's decompression to its header-declared size (capped at 1 GiB)
+and verifies the inflated length, so a **zlib decompression bomb cannot exhaust
+memory**; the read-path inflate is likewise bounded. The pack header parser, the
+pack-length probe, the `.lidx` parser, and the delta applier are **property-tested
+(proptest) to never panic, hang, or over-allocate on arbitrary bytes**, and the
+delta applier has a 2 GiB output guard.
+
 ## Known limitations (read before deploying)
 
 These are honest, documented gaps — not undisclosed bugs:

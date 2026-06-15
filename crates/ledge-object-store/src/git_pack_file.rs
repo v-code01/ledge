@@ -301,12 +301,24 @@ fn parse_pack_obj_header(data: &[u8]) -> Result<(u8, usize, usize)> {
     Ok((git_type, size, i + 1))
 }
 
-/// Inflate a zlib stream, reading exactly the bytes the stream consumes.
+/// Hard cap on a single decompressed pack object — bounds memory even if a pack
+/// (e.g. one restored from object storage) is corrupt or tampered into a zlib
+/// bomb. 1 GiB is far above any sane git object.
+const MAX_PACK_OBJECT: u64 = 1024 * 1024 * 1024;
+
+/// Inflate a zlib stream, BOUNDED to [`MAX_PACK_OBJECT`] so a malformed/bomb
+/// stream errors instead of exhausting memory.
 fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>> {
-    let mut dec = flate2::read::ZlibDecoder::new(data);
+    let dec = flate2::read::ZlibDecoder::new(data);
     let mut out = Vec::new();
-    dec.read_to_end(&mut out)
+    std::io::Read::take(dec, MAX_PACK_OBJECT + 1)
+        .read_to_end(&mut out)
         .map_err(|e| LedgeError::Corruption(format!("git_pack_file: zlib inflate failed: {e}")))?;
+    if out.len() as u64 > MAX_PACK_OBJECT {
+        return Err(LedgeError::Corruption(
+            "git_pack_file: object exceeds size limit (corrupt or zlib bomb)".into(),
+        ));
+    }
     Ok(out)
 }
 
@@ -381,6 +393,19 @@ mod tests {
             });
         }
         objs
+    }
+
+    proptest::proptest! {
+        // `.lidx` is parsed at pack-open time, including for files restored from
+        // object storage — on ANY bytes the parser must return Ok/Err, never panic.
+        #[test]
+        fn read_lidx_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048)) {
+            let _ = read_lidx(&data);
+        }
+        #[test]
+        fn parse_pack_header_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = parse_pack_obj_header(&data);
+        }
     }
 
     #[test]

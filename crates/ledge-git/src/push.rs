@@ -18,6 +18,11 @@ use std::sync::Arc;
 use crate::fetch::Sha1Provider;
 use crate::pack_delta::{apply_delta, read_ofs_varint};
 
+/// Hard cap on a single decompressed pack object — defends the receive-pack path
+/// against zlib decompression bombs in an untrusted pushed pack. 1 GiB is far
+/// above any sane git object yet bounds memory to a safe ceiling.
+const MAX_PACK_OBJECT: u64 = 1024 * 1024 * 1024;
+
 // ── Public types ────────────────────────────────────────────────────────────
 
 /// One ref-update command from a git push negotiation.
@@ -485,6 +490,7 @@ async fn decode_pack_objects(
         return Err(LedgeError::Corruption("pack: bad header".into()));
     }
     let num_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
+    use std::io::Read as _;
 
     enum Parsed {
         Base(u8, Vec<u8>),
@@ -500,15 +506,33 @@ async fn decode_pack_objects(
         let slice = pack
             .get(pos..)
             .ok_or_else(|| LedgeError::Corruption(format!("pack: short at obj {idx}")))?;
-        let (type_bits, _size, hdr_len, base_ref) = parse_pack_object_header(slice)?;
+        let (type_bits, size, hdr_len, base_ref) = parse_pack_object_header(slice)?;
         pos += hdr_len;
+        // The header declares the decompressed length. Reject an over-large
+        // object up front, then decompress BOUNDED to that length (+1 sentinel)
+        // and verify the actual matches — this defends an untrusted pushed pack
+        // against a zlib bomb (tiny compressed input inflating to gigabytes):
+        // a bomb either declares a huge size (rejected here) or a small one
+        // (caught by the length check) and can never exhaust memory.
+        if size as u64 > MAX_PACK_OBJECT {
+            return Err(LedgeError::Corruption(format!(
+                "pack: object {idx} declares {size} bytes (> {MAX_PACK_OBJECT} limit)"
+            )));
+        }
         let compressed = pack
             .get(pos..)
             .ok_or_else(|| LedgeError::Corruption(format!("pack: short payload obj {idx}")))?;
         let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-        let mut payload = Vec::new();
-        std::io::Read::read_to_end(&mut decoder, &mut payload)
+        let mut payload = Vec::with_capacity(size.min(1 << 20));
+        std::io::Read::take(&mut decoder, size as u64 + 1)
+            .read_to_end(&mut payload)
             .map_err(|e| LedgeError::Corruption(format!("pack: inflate obj {idx}: {e}")))?;
+        if payload.len() != size {
+            return Err(LedgeError::Corruption(format!(
+                "pack: object {idx} decompressed to {} bytes, header declared {size} (corrupt or zlib bomb)",
+                payload.len()
+            )));
+        }
         pos += decoder.total_in() as usize;
         offset_to_index.insert(start, idx);
         parsed.push((
@@ -688,6 +712,45 @@ mod tests {
     use ledge_core::{LedgeError, ObjectId, RefEntry, RefName, RefSnapshot};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    proptest::proptest! {
+        // The pack header parser and the pack-length probe both run on attacker
+        // bytes (an untrusted pushed pack); on ANY input they must return cleanly,
+        // never panic, never hang.
+        #[test]
+        fn pack_header_parse_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
+            let _ = parse_pack_object_header(&data);
+        }
+        #[test]
+        fn git_pack_len_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let _ = git_pack_len(&data);
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_zlib_bomb() {
+        // A blob whose header declares 5 bytes but whose zlib payload inflates to
+        // 1 MiB. The bounded decoder must reject it WITHOUT materializing the
+        // megabyte — proving the receive-pack path can't be OOM'd by a pushed bomb.
+        let big = vec![b'A'; 1024 * 1024];
+        let z = {
+            use flate2::write::ZlibEncoder;
+            use std::io::Write;
+            let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&big).unwrap();
+            e.finish().unwrap()
+        };
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        pack.push((3 << 4) | 5); // type=blob(3), declared size=5
+        pack.extend_from_slice(&z);
+        pack.extend_from_slice(&[0u8; 20]); // trailer (unverified by decode)
+        let store = MemObjectStore::new();
+        let r = decode_pack_objects(&pack, store.as_ref()).await;
+        assert!(r.is_err(), "a zlib bomb (size mismatch) must be rejected, not inflated");
+    }
 
     #[test]
     fn git_pack_len_detects_complete_and_partial() {
