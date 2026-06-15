@@ -152,7 +152,10 @@ async fn lfs_push_and_clone_roundtrips_large_file() {
         "the LFS object should be stored on the server"
     );
 
-    // Clone: git pulls the pointer, then git-lfs fetches the bytes back.
+    // Clone, then explicitly pull LFS objects. We don't rely on the clone's
+    // smudge filter (it only runs if git-lfs is configured globally, which varies
+    // by environment) — `git lfs install --local` + `git lfs pull` deterministically
+    // replaces the pointer with the real bytes fetched through Ledge's LFS API.
     let clone = TempDir::new().unwrap();
     let clp = clone.path().join("c");
     ok(
@@ -164,6 +167,11 @@ async fn lfs_push_and_clone_roundtrips_large_file() {
         .await,
         "clone",
     );
+    ok(
+        &run("git", &["lfs", "install", "--local"], &clp).await,
+        "clone lfs install",
+    );
+    ok(&run("git", &["lfs", "pull"], &clp).await, "lfs pull");
     let got = std::fs::read(clp.join("big.bin")).unwrap();
     assert_eq!(
         got, big,
