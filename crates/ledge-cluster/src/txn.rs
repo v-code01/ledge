@@ -102,7 +102,7 @@ impl TxnCoordinator {
         // All `Ok` ⇒ Committed; any `Conflict` ⇒ Aborted (the SM applied NONE).
         let mut committed = Vec::with_capacity(refs.len());
         let mut conflicts = Vec::new();
-        for ((name, _, _), outcome) in refs.iter().zip(outcomes.into_iter()) {
+        for ((name, _, _), outcome) in refs.iter().zip(outcomes) {
             match outcome {
                 BatchOutcome::Ok(e) => committed.push((name.clone(), e)),
                 BatchOutcome::Conflict(_) => conflicts.push(name.clone()),

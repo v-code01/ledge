@@ -206,7 +206,7 @@ pub fn write_git_pack(
     pack.extend_from_slice(&pack_sha);
 
     // ---- idx v2 ---- (entries sorted ascending by sha1)
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by_key(|e| e.0);
     let mut idx = Vec::new();
     idx.extend_from_slice(&[0xff, 0x74, 0x4f, 0x63]); // \377tOc
     idx.extend_from_slice(&2u32.to_be_bytes());
