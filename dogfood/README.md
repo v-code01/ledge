@@ -225,3 +225,19 @@ A node also runs `recover_from_s3` on boot, so a freshly-provisioned/wiped insta
 from S3. **This is the complete answer to "what survives the laptop dying": tier, lose
 everything local, recover from S3.** (Un-repacked loose objects aren't tiered — repack first;
 recovery pulls indexes eagerly + bodies lazily; byte-range restore is a v3 perf follow-on.)
+
+## Transport-feature savings (`dogfood/transport-features.sh`)
+
+One command proving the object-transfer savings of the git-protocol features
+against a real `git` client — latest run **5 PASS / 0 FAIL**
+([`results/2026-06-15-transport-features.txt`](results/2026-06-15-transport-features.txt)),
+on a 20-commit / 60-object repo:
+
+- **incremental fetch** (have-line negotiation): one new commit transfers **3
+  objects, not the 60-object history**.
+- **shallow clone** (`--depth 1`): exactly **1 commit**.
+- **partial clone** (`--filter=blob:none`): a **promisor** repo whose checkout
+  lazily fetches only the blob it needs (the 20 historical blob versions stay
+  unfetched — genuinely partial).
+
+Complements `clone-speed.sh` (latency vs git) and `disk-parity.sh` (pack size vs git).

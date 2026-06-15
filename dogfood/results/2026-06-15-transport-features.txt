@@ -1,0 +1,14 @@
+Ledge transport-feature proof — 2026-06-15T19:34:44Z
+source: a 20-commit repo (full clone holds 60 objects)
+
+incremental fetch (1 new commit): transferred 3 objects (vs 60 full history)
+shallow clone (--depth 1)       : 1 commit(s)
+partial clone (--filter=blob:none): promisor=true, working-tree-ok=yes, historical-blobs-lazy=20
+
+  PASS: incremental fetch moved only the new objects (<=8, not the history)
+  PASS: shallow --depth 1 yielded exactly 1 commit
+  PASS: partial clone is a promisor repo
+  PASS: partial clone checkout lazily fetched the needed blob (working tree correct)
+  PASS: partial clone left historical blobs unfetched (genuinely partial)
+
+RESULT: 5 PASS / 0 FAIL
