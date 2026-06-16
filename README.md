@@ -178,6 +178,10 @@ what is **not** ready — so you can decide where it fits:
 single-node use where you control the client and the repos. **Not yet for:**
 hosting strangers' code as a managed multi-tenant service.
 
+A first-party **security & production-readiness review** — threat model,
+severity-rated findings, ranked residual risks, and a scoped verdict — is in
+[`AUDIT.md`](AUDIT.md).
+
 ## License
 
 Ledge is **source-available** under the **Business Source License 1.1** (see

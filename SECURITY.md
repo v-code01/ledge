@@ -2,7 +2,9 @@
 
 ## Status
 
-Ledge is early-stage and has **not** had an external security audit. Run it
+A **first-party security & production-readiness review** (threat model, findings,
+ranked residual risks, scoped verdict) is in [`AUDIT.md`](AUDIT.md). Ledge has
+**not** had an *independent* external audit. Run it
 behind your own trust boundary; do not expose an instance to untrusted tenants
 on the public internet yet. See "Known limitations" below before deploying.
 
