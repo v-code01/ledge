@@ -1,0 +1,38 @@
+# Local monitoring stack: Prometheus (scrape + alerts) + Grafana (auto-provisioned
+# datasource + the Ledge overview dashboard). Designed to be MERGED with the main
+# single-node compose so Prometheus can resolve `ledge:9090` on the shared network:
+#
+#   docker compose \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/monitoring/docker-compose.monitoring.yml up -d
+#
+#   Prometheus → http://localhost:9091   (targets, alerts)
+#   Grafana    → http://localhost:3001   (admin / admin; Ledge Overview dashboard)
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Canonical alert rules live under the Helm chart's files/ dir (single
+      # source of truth); mount them where prometheus.yml's rule_files expects.
+      - ../helm/ledge/files/ledge-alerts.yml:/etc/prometheus/alerts/ledge-alerts.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped

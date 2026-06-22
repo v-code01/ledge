@@ -1,0 +1,129 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["ledge"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "title": "Ledge Overview",
+  "uid": "ledge-overview",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active workspaces",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "sum(ledge_workspaces_active)", "legendFormat": "active" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Registered webhooks",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "sum(ledge_webhooks_registered)", "legendFormat": "webhooks" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Live API keys",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "sum(ledge_auth_keys)", "legendFormat": "keys" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "TLS posture (1=on)",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "max(ledge_tls_enabled)", "legendFormat": "tls" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "max(ledge_tls_mtls_enabled)", "legendFormat": "mtls" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Git request rate by service",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "sum by (service) (rate(ledge_git_requests_total[5m]))", "legendFormat": "{{service}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Git mean latency by service",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_git_request_duration_seconds_sum[5m]) / clamp_min(rate(ledge_git_request_duration_seconds_count[5m]), 0.001)", "legendFormat": "{{service}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Object store ops/s",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_object_writes_total[5m])", "legendFormat": "writes" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_object_reads_total[5m])", "legendFormat": "reads" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Ref updates vs CAS retries/s",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_ref_updates_total[5m])", "legendFormat": "updates" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_ref_cas_retries_total[5m])", "legendFormat": "cas retries" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Auth failures/s by result",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "sum by (result) (rate(ledge_auth_requests_total{result=~\"unauthenticated|forbidden\"}[5m]))", "legendFormat": "{{result}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "rate(ledge_tenant_denied_total[5m])", "legendFormat": "tenant denied" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Raft leader by shard (cluster; 0 = no leader)",
+      "datasource": { "type": "prometheus", "uid": "ledge-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "ledge-prometheus" }, "expr": "ledge_raft_leader", "legendFormat": "shard {{shard}}" }
+      ]
+    }
+  ]
+}

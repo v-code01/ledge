@@ -1,0 +1,154 @@
+# Ledge alerting rules — the SINGLE SOURCE OF TRUTH for alerts.
+#
+# Consumed by three places, so they cannot drift:
+#   1. Helm:        deploy/helm/ledge/templates/prometheusrule.yaml embeds this
+#                   file via `.Files.Get` (Prometheus Operator users).
+#   2. Standalone:  deploy/monitoring/docker-compose.monitoring.yml mounts it and
+#                   loads it via prometheus.yml `rule_files`.
+#   3. CI test:     crates/ledge-server/tests/metrics_alerts.rs asserts every
+#                   `ledge_*` series referenced below actually appears in the
+#                   server's rendered /metrics output — so a renamed/removed
+#                   metric fails the build instead of silently disabling an alert.
+#
+# Every expression references only metrics defined in
+# crates/ledge-server/src/metrics.rs. Histograms are exported as Prometheus
+# SUMMARIES (the recorder configures no buckets), so latency is computed as
+# rate(<name>_sum) / rate(<name>_count) — never histogram_quantile over _bucket
+# (no _bucket series exist). The cluster-only series (ledge_raft_*, ledge_txn_*,
+# ledge_prepared_locks) are absent on a single-node server, so those alerts
+# simply never fire there — correct by construction.
+groups:
+  - name: ledge-availability
+    rules:
+      - alert: LedgeInstanceDown
+        expr: up{job="ledge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ledge target {{ $labels.instance }} is down"
+          description: "The Prometheus target has been unreachable for >2m. Check the process, the :9090 metrics listener, and container health (/healthz)."
+
+  - name: ledge-latency
+    rules:
+      - alert: LedgeGitLatencyHigh
+        expr: (rate(ledge_git_request_duration_seconds_sum[5m]) / clamp_min(rate(ledge_git_request_duration_seconds_count[5m]), 0.001)) > 2 and rate(ledge_git_request_duration_seconds_count[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Git {{ $labels.service }} mean latency >2s on {{ $labels.instance }}"
+          description: "Mean git-wire request latency has exceeded 2s for 10m under real traffic. Check the upload-pack want-set cache hit rate, pack build cost, disk I/O, and load."
+      - alert: LedgeObjectWriteLatencyHigh
+        expr: (rate(ledge_object_write_duration_seconds_sum[5m]) / clamp_min(rate(ledge_object_write_duration_seconds_count[5m]), 0.001)) > 0.5 and rate(ledge_object_write_duration_seconds_count[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Object-store write mean latency >500ms on {{ $labels.instance }}"
+          description: "Mean object write latency has exceeded 500ms for 10m under load. Check disk throughput/fsync, the cold-tier path, and contention."
+      - alert: LedgeRpcLatencyHigh
+        expr: (rate(ledge_rpc_request_duration_seconds_sum[5m]) / clamp_min(rate(ledge_rpc_request_duration_seconds_count[5m]), 0.001)) > 1 and rate(ledge_rpc_request_duration_seconds_count[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC {{ $labels.method }} mean latency >1s on {{ $labels.instance }}"
+          description: "Mean native-SDK RPC latency has exceeded 1s for 10m under load. Inspect the slow method and downstream store/ref-store latency."
+
+  - name: ledge-errors
+    rules:
+      - alert: LedgeAuthFailureSpike
+        expr: rate(ledge_auth_requests_total{result=~"unauthenticated|forbidden"}[5m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Auth failures >5/s ({{ $labels.result }}) on {{ $labels.instance }}"
+          description: "Sustained authentication failures for 10m — possible credential brute-force, an expired/rotated key, or a misconfigured client."
+      - alert: LedgeTenantDeniedSpike
+        expr: rate(ledge_tenant_denied_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cross-tenant denials >1/s on {{ $labels.instance }}"
+          description: "A client is repeatedly hitting workspaces it does not own (ownership-mismatch 404s). Likely a misconfigured client or probing."
+      - alert: LedgeWebhookDeliveryFailureRate
+        expr: (sum by (instance) (rate(ledge_webhook_deliveries_total{result="failed"}[10m])) / clamp_min(sum by (instance) (rate(ledge_webhook_deliveries_total[10m])), 0.001)) > 0.2 and sum by (instance) (rate(ledge_webhook_deliveries_total{result="failed"}[10m])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook delivery failure rate >20% on {{ $labels.instance }}"
+          description: "More than 20% of webhook deliveries are failing over 10m. Check downstream endpoints, the SSRF allowlist, and network egress."
+      - alert: LedgeSyncFailing
+        expr: rate(ledge_sync_total{result="failed"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GitHub sync ({{ $labels.op }}) failing on {{ $labels.instance }}"
+          description: "An import/export sync op has been failing for 15m. Check upstream credentials/reachability and the sync logs."
+      - alert: LedgeQuotaDenials
+        expr: sum by (instance, resource) (rate(ledge_quota_denied_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Quota denials for {{ $labels.resource }} on {{ $labels.instance }}"
+          description: "Requests are being rejected by the {{ $labels.resource }} quota for 15m. A tenant may need a higher limit, or this is expected backpressure."
+
+  - name: ledge-storage
+    rules:
+      - alert: LedgeRefCasContentionHigh
+        expr: (rate(ledge_ref_cas_retries_total[5m]) / clamp_min(rate(ledge_ref_updates_total[5m]), 0.001)) > 1 and rate(ledge_ref_updates_total[5m]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ref CAS contention high on {{ $labels.instance }}"
+          description: "More than one compare-and-swap retry per successful ref update over 15m — heavy write contention on hot refs. Consider batching or sharding the hot namespace."
+
+  - name: ledge-cluster
+    rules:
+      - alert: LedgeRaftNoLeader
+        expr: ledge_raft_leader == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Raft shard {{ $labels.shard }} has no leader on {{ $labels.instance }}"
+          description: "The leader gauge is 0 (node ids start at 1, so 0 means no leader) for >1m. Writes to this shard block until a leader is elected. Check peer connectivity, mTLS, and quorum."
+      - alert: LedgeRaftElectionsFlapping
+        expr: changes(ledge_raft_term[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Raft shard {{ $labels.shard }} elections flapping on {{ $labels.instance }}"
+          description: "The Raft term advanced more than 3 times in 15m — repeated elections. Check network stability, leader CPU/IO starvation, and clock skew."
+      - alert: LedgeRaftApplyLag
+        expr: (ledge_raft_commit_index - ledge_raft_last_applied) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Raft shard {{ $labels.shard }} apply lag >1000 on {{ $labels.instance }}"
+          description: "Committed entries are not being applied to the state machine fast enough for 5m. The node may be IO-bound or stalled applying snapshots."
+      - alert: LedgePreparedLocksStuck
+        expr: ledge_prepared_locks > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "In-doubt 2PC prepared locks held >15m on {{ $labels.instance }}"
+          description: "Cross-shard 2PC prepared locks have been outstanding for 15m — a transaction is stuck in-doubt. Check the TxnResolver / crash-recovery path and participant reachability."
+      - alert: LedgeTxnAbortSpike
+        expr: sum by (instance) (rate(ledge_txn_aborted_total[10m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cross-shard 2PC abort rate >1/s on {{ $labels.instance }}"
+          description: "Sustained 2PC aborts for 10m — contention, prepare-vote NOs, or participant failures. Inspect the abort reason label at the source."

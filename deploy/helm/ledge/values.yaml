@@ -38,6 +38,14 @@ metrics:
     enabled: false
     # interval: 30s
     # labels: {}
+  # PrometheusRule (alerting rules) — Prometheus Operator. Mirrors the standalone
+  # alerts in deploy/monitoring/; both embed the same canonical
+  # files/ledge-alerts.yml so they never diverge.
+  prometheusRule:
+    enabled: false
+    # Extra labels so your operator's ruleSelector picks this up,
+    # e.g. { release: kube-prometheus-stack }.
+    # labels: {}
 
 # Cluster (sharded Raft). When enabled, the chart renders a single-shard map over
 # all replicaCount pods and the entrypoint derives each pod's node_id from its

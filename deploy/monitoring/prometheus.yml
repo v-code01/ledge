@@ -1,0 +1,20 @@
+# Standalone Prometheus config for the local monitoring stack
+# (deploy/monitoring/docker-compose.monitoring.yml). For Kubernetes use the
+# Helm chart's ServiceMonitor + PrometheusRule instead (Prometheus Operator).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Loads the canonical alert rules, bind-mounted from the Helm chart's files/ dir
+# (the single source of truth — see deploy/helm/ledge/files/ledge-alerts.yml).
+rule_files:
+  - /etc/prometheus/alerts/ledge-alerts.yml
+
+scrape_configs:
+  # Job name MUST be "ledge": the LedgeInstanceDown alert keys on up{job="ledge"}.
+  - job_name: ledge
+    metrics_path: /metrics
+    static_configs:
+      # Resolves when this file is merged with deploy/compose/docker-compose.yml
+      # (shared default network). The metrics port is plain HTTP, TLS-agnostic.
+      - targets: ["ledge:9090"]
