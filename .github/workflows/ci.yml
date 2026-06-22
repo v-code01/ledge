@@ -12,7 +12,7 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install native build deps
         # capnproto: ledge-rpc codegen. cmake + clang: aws-lc-rs (rustls provider).
         run: |
@@ -40,6 +40,6 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build image
         run: docker build -t ledge:ci .
