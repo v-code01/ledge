@@ -485,7 +485,8 @@ async fn decode_pack_objects(
     if pack.len() < 12 || &pack[..4] != b"PACK" {
         return Err(LedgeError::Corruption("pack: bad header".into()));
     }
-    let num_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
+    // Indexing is safe: the guard above rejected any pack shorter than 12 bytes.
+    let num_objects = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
     use std::io::Read as _;
 
     enum Parsed {
@@ -582,7 +583,14 @@ async fn decode_pack_objects(
         sha1_to_idx.insert(sha, idx);
         resolved[idx] = Some((ty, content));
     }
-    Ok(resolved.into_iter().map(|o| o.unwrap()).collect())
+    // Every index was assigned `Some` in the loop above (any unresolved delta
+    // returned `Err` before reaching here), so this is currently infallible — but
+    // collect through `Option` so a future refactor that breaks that invariant
+    // returns a clean error on an untrusted pack instead of panicking.
+    resolved
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| LedgeError::Corruption("pack: object left unresolved".into()))
 }
 
 // ── Stream transport: receive-pack (push) over SSH / a direct connection ──────
@@ -720,6 +728,34 @@ mod tests {
         #[test]
         fn git_pack_len_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
             let _ = git_pack_len(&data);
+        }
+        // The full decoder (header parse + varint + bounded inflate + delta
+        // resolution) runs on attacker bytes too. On ANY raw input it must return
+        // Ok/Err cleanly — never panic, hang, or over-allocate. Most random inputs
+        // fail the magic check; the next case forces the object loop to run.
+        #[test]
+        fn decode_pack_objects_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..1024)) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let store = MemObjectStore::new();
+            let _ = rt.block_on(decode_pack_objects(&data, store.as_ref()));
+        }
+        // A well-formed 12-byte header (so the magic/version pass) followed by
+        // arbitrary object bytes — drives the per-object parse/inflate/delta path
+        // on fuzzed payloads with a declared object count, the part the raw-bytes
+        // case rarely reaches. Must still only ever return Ok/Err.
+        #[test]
+        fn decode_with_valid_header_never_panics(
+            count in 0u32..8,
+            body in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..1024),
+        ) {
+            let mut pack = Vec::with_capacity(12 + body.len());
+            pack.extend_from_slice(b"PACK");
+            pack.extend_from_slice(&2u32.to_be_bytes());
+            pack.extend_from_slice(&count.to_be_bytes());
+            pack.extend_from_slice(&body);
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let store = MemObjectStore::new();
+            let _ = rt.block_on(decode_pack_objects(&pack, store.as_ref()));
         }
     }
 
