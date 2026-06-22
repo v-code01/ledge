@@ -18,8 +18,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends capnproto cmake clang
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve pinned toolchain
+        id: toolchain
+        # Single source of truth: read the channel from rust-toolchain.toml so CI
+        # cannot drift from local/Docker. Bump the toml, never this workflow.
+        run: |
+          channel=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format

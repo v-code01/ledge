@@ -1,0 +1,10 @@
+# Single source of truth for the Rust toolchain — local dev, CI, and the Docker
+# builder all resolve the compiler from this one file, so they cannot drift apart.
+# Drift was the recurring cause of red CI: a freshly-released `stable` shipping new
+# clippy lints that the local toolchain hadn't seen yet. Pinning an exact version
+# removes that surprise. To upgrade: bump the `channel` here (and the Dockerfile
+# base tag in lockstep), run `rustup show`, then fix any new lints in one commit.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

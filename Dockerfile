@@ -7,11 +7,11 @@
 # dynamically-linked binary runs as-is.
 
 # ---- builder ----------------------------------------------------------------
-# Pinned to 1.89 (the locally-verified toolchain). The workspace declares
-# rust-version = "1.78", but transitive deps (e.g. constant_time_eq 0.4.2) now
-# require a newer Cargo manifest parser, so the effective MSRV is higher than the
-# stale declaration. 1.89 is known-good (builds + passes the full suite).
-FROM rust:1.89-bookworm AS builder
+# Base tracks the minor pinned in rust-toolchain.toml (the single source of truth
+# for local + CI + this builder). The COPY'd rust-toolchain.toml then pins the
+# exact patch, so the released binary is built with the same compiler CI tested
+# it with — no toolchain drift. Bump this tag in lockstep with the toml.
+FROM rust:1.96-bookworm AS builder
 
 # capnproto: crates/ledge-rpc/build.rs runs capnpc at build time.
 # cmake + clang: aws-lc-rs (rustls provider) compiles C at build time.
