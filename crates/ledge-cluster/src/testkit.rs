@@ -144,6 +144,47 @@ impl TestCluster {
         }
     }
 
+    /// Poll until the cluster has converged on a *stable, agreed* leader: exactly
+    /// one node in `Leader` state and **every** node reporting the same
+    /// `current_leader`. Unlike [`Self::wait_for_leader`] — which returns the
+    /// instant any one node observes a valid leader — this waits for heartbeat
+    /// propagation so followers have caught up. Use it before asserting on the
+    /// whole cluster's view: right after an election a follower's `current_leader`
+    /// can lag the leader by one heartbeat, which made `elects_leader` flaky under
+    /// CI load. Same 30s budget + panic-on-timeout discipline as `wait_for_leader`.
+    pub async fn wait_for_stable_leader(&self) -> NodeId {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let leader = self.wait_for_leader().await;
+            let mut leaders = 0;
+            let mut all_agree = true;
+            for n in self.nodes.values() {
+                let m = n.raft.metrics().borrow().clone();
+                if m.state == ServerState::Leader {
+                    leaders += 1;
+                }
+                if m.current_leader != Some(leader) {
+                    all_agree = false;
+                }
+            }
+            if leaders == 1 && all_agree {
+                return leader;
+            }
+            if Instant::now() >= deadline {
+                let dump: Vec<_> = self
+                    .nodes
+                    .values()
+                    .map(|n| {
+                        let m = n.raft.metrics().borrow().clone();
+                        (n.id, m.state, m.current_leader)
+                    })
+                    .collect();
+                panic!("cluster did not converge on a single agreed leader within 30s; metrics = {dump:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// The `Raft` handle for node `id`.
     pub fn leader(&self, id: NodeId) -> &RaftHandle {
         &self.node(id).raft

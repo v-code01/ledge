@@ -48,7 +48,10 @@ async fn one_node_client_write_roundtrip() {
 async fn elects_leader() {
     let c = TestCluster::new_single_shard(&[1, 2, 3], None).await;
     c.initialize(1).await;
-    let leader = c.wait_for_leader().await;
+    // Wait for full convergence (all nodes agree, exactly one leader) rather than
+    // the first leader sighting — a follower's view can lag the election by a
+    // heartbeat, which made the per-node assertions below racy under CI load.
+    let leader = c.wait_for_stable_leader().await;
 
     // Exactly one node reports Leader; the other two are Followers.
     let mut leaders = 0;
