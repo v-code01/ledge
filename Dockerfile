@@ -30,6 +30,10 @@ COPY . .
 # any CPU of its arch, not just the one it was built on. RUSTFLAGS (env) takes
 # precedence over the config's target rustflags, so this fully replaces them.
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+# This stage has no crate cache, so it re-fetches every dep on each build —
+# exposing it to transient crates.io resets. Retry downloads (default is 3)
+# rather than failing the whole image build on a single connection reset.
+ENV CARGO_NET_RETRY=10
 RUN cargo build --release -p ledge-server
 
 # ---- runtime ----------------------------------------------------------------
