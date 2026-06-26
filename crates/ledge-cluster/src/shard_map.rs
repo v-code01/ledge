@@ -114,6 +114,19 @@ impl ShardMap {
             .collect()
     }
 
+    /// The shards `node_id` should AUTO-INITIALIZE on boot: those it hosts AND is
+    /// the lowest-id member of, each paired with the `id → addr` member map to
+    /// pass to `Raft::initialize`. Choosing the lowest-id member makes exactly one
+    /// node per shard the initializer, deterministically and with no extra config,
+    /// so automatic bootstrap can't double-initialize a shard from two nodes.
+    pub fn bootstrap_shards_for(&self, node_id: u64) -> Vec<(ShardId, BTreeMap<u64, String>)> {
+        self.shards_hosted_by(node_id)
+            .into_iter()
+            .map(|s| (s, self.member_map(s)))
+            .filter(|(_, members)| members.keys().next().copied() == Some(node_id))
+            .collect()
+    }
+
     /// All `(shard, replica-set)` entries in ascending shard order. Round-trips
     /// [`Self::from_entries`] — used to rebuild a map on live reconfiguration
     /// (swap one shard's replica set, keep the rest).
@@ -258,6 +271,42 @@ mod tests {
         assert_eq!(mm.get(&3).map(String::as_str), Some("http://n3:8403"));
         assert_eq!(mm.get(&5).map(String::as_str), Some("http://n5:8405"));
         assert!(!mm.contains_key(&1));
+    }
+
+    #[test]
+    fn bootstrap_shards_for_picks_one_initializer_per_shard() {
+        // Map: shard 0 → {1,2,3}, shard 1 → {3,4,5}. The lowest-id member of each
+        // shard is its sole initializer: node 1 → shard 0, node 3 → shard 1.
+        let m = map_5n2s();
+
+        let n1 = m.bootstrap_shards_for(1);
+        assert_eq!(n1.len(), 1, "node 1 initializes exactly shard 0");
+        assert_eq!(n1[0].0, ShardId(0));
+        assert_eq!(n1[0].1.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let n3 = m.bootstrap_shards_for(3);
+        // Node 3 hosts BOTH shards but is lowest-id only in shard 1.
+        assert_eq!(n3.len(), 1, "node 3 initializes only shard 1");
+        assert_eq!(n3[0].0, ShardId(1));
+
+        // Non-lowest members and non-members initialize nothing.
+        assert!(
+            m.bootstrap_shards_for(2).is_empty(),
+            "node 2 is not lowest in shard 0"
+        );
+        assert!(m.bootstrap_shards_for(4).is_empty());
+        assert!(m.bootstrap_shards_for(5).is_empty());
+        assert!(
+            m.bootstrap_shards_for(99).is_empty(),
+            "non-member hosts nothing"
+        );
+
+        // Exactly one initializer per shard across the whole cluster (no double-init).
+        let mut initialized: Vec<ShardId> = (1..=5)
+            .flat_map(|n| m.bootstrap_shards_for(n).into_iter().map(|(s, _)| s))
+            .collect();
+        initialized.sort_by_key(|s| s.0);
+        assert_eq!(initialized, vec![ShardId(0), ShardId(1)]);
     }
 
     #[test]

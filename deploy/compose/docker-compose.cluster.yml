@@ -4,7 +4,8 @@
 # (/raft, /cluster, /objects) authenticate via the shared cluster_secret.
 #
 #   docker compose -f deploy/compose/docker-compose.cluster.yml up -d
-#   # leader election + replication over compose DNS; ledge-1 is the client entry.
+#   # Self-bootstraps: node 1 auto-initializes shard 0 (auto_bootstrap, default on),
+#   # so a leader is elected with NO manual POST /cluster/init. ledge-1 is the entry.
 #   curl -fsS http://localhost:3000/healthz
 #
 # NOTE: the dev cluster_secret below is for local use only — set a strong secret

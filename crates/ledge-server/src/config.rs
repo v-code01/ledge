@@ -112,6 +112,17 @@ pub struct ClusterConfig {
     pub shards: Vec<ShardSpec>,
     /// Local bind address this node serves its `/raft/*` endpoints on.
     pub raft_bind: String,
+    /// When true (default), on boot the lowest-node-id member of each shard this
+    /// node hosts automatically runs `Raft::initialize` with the shard's full
+    /// member set from the static map — no manual `POST /cluster/init` needed.
+    /// Exactly one node initializes each shard; the rest (and any restart) see
+    /// openraft's "already initialized" and no-op. Set false to bootstrap manually.
+    #[serde(default = "cluster_def_auto_bootstrap")]
+    pub auto_bootstrap: bool,
+}
+
+fn cluster_def_auto_bootstrap() -> bool {
+    true
 }
 
 /// One cluster peer: a Raft node id and the base URL it serves `/raft/*` on.

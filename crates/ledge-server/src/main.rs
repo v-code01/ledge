@@ -278,6 +278,52 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
 
+            // ── Automatic, idempotent cluster bootstrap ──────────────────────────
+            // Replaces a manual `POST /cluster/init`. For each shard this node
+            // hosts AND is the lowest-id member of (`bootstrap_shards_for`, exactly
+            // one initializer per shard), call `Raft::initialize` with the shard's
+            // full member set from the static map. `initialize` only appends the
+            // membership entry locally and starts the campaign — it does not block
+            // on quorum — so this is safe on the boot path before peers are up.
+            // openraft's "already initialized" (restart, or a peer that lost the
+            // race) is a benign no-op. Disable with `[cluster].auto_bootstrap=false`.
+            if cfg.cluster.auto_bootstrap {
+                let to_init = stack.map.bootstrap_shards_for(cfg.cluster.node_id);
+                for (shard, raft) in stack.shards.iter() {
+                    let sid = ledge_cluster::ShardId(shard.0);
+                    let Some((_, members)) = to_init.iter().find(|(s, _)| *s == sid) else {
+                        continue;
+                    };
+                    let init_members: std::collections::BTreeMap<ledge_raft::NodeId, ledge_raft::Node> =
+                        members
+                            .iter()
+                            .map(|(id, addr)| (*id, ledge_raft::Node::new(addr.clone())))
+                            .collect();
+                    match raft.initialize(init_members).await {
+                        Ok(()) => info!(
+                            shard = shard.0,
+                            members = members.len(),
+                            "cluster auto-bootstrap: shard initialized"
+                        ),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("already") || msg.contains("initialize") {
+                                info!(
+                                    shard = shard.0,
+                                    "cluster auto-bootstrap: shard already initialized (no-op)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    shard = shard.0,
+                                    error = %msg,
+                                    "cluster auto-bootstrap: initialize failed; run POST /cluster/init manually"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Clustered atomic-commit coordinator over the SAME ClusterRefStore:
             // cross-shard promotions go through 2PC, single-shard through one
             // RefBatch. Built here (in `ledge-server`) so `ledge-workspace` never

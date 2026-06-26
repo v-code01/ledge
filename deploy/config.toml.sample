@@ -86,6 +86,10 @@ enabled = false
 # node_id = 1
 # num_shards = 1
 # raft_bind = "0.0.0.0:4001"   # parsed but not a separate listener; /raft is on [server].addr
+# auto_bootstrap = true        # default. On boot the lowest-id member of each shard
+#                              # this node hosts auto-runs Raft::initialize from the
+#                              # shard map below — no manual POST /cluster/init.
+#                              # Idempotent on restart. Set false to bootstrap by hand.
 #
 # [[cluster.shards]]
 # id = 0

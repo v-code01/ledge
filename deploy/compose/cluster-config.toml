@@ -14,6 +14,9 @@ data_dir = "/var/lib/ledge"
 enabled = true
 num_shards = 1
 raft_bind = "0.0.0.0:4001"  # parsed but currently unwired; /raft is on the client port
+# auto_bootstrap defaults true: on boot, node 1 (lowest-id member of shard 0)
+# auto-initializes the Raft group from the map below, so the cluster self-forms
+# with NO manual POST /cluster/init. Idempotent across restarts.
 
 [[cluster.shards]]
 id = 0

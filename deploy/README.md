@@ -132,6 +132,27 @@ scripts (verified end-to-end by `verify-roundtrip.sh`).
       namespace, exempt from tenancy + quotas).
 - [ ] Rotate certs by rolling restart (no hot reload yet).
 
+## Cluster bootstrap (automatic)
+
+A fresh cluster forms itself. On boot, for each shard a node hosts, the
+**lowest-node-id member** runs `Raft::initialize` with the shard's full member set
+from the static map — exactly one initializer per shard, chosen deterministically,
+with no manual `POST /cluster/init`. It is idempotent: a restart (or a node that
+lost the race) sees openraft's "already initialized" and no-ops. `initialize` only
+appends the membership entry locally and starts campaigning, so it is safe before
+peers are up — election completes once a quorum is reachable.
+
+So `docker compose -f deploy/compose/docker-compose.cluster.yml up -d` yields a
+cluster with an elected leader and no extra step. Verify:
+
+```sh
+bash deploy/compose/verify-cluster-bootstrap.sh   # spins a local 3-node cluster, asserts a leader, no manual init
+curl -fsS http://<node>:3000/cluster/status -H "Authorization: Bearer <cluster_secret>"
+```
+
+Set `[cluster].auto_bootstrap = false` to bootstrap by hand (then `POST
+/cluster/init` per shard). `POST /cluster/init` remains available either way.
+
 ## Live cluster reconfiguration (Phase 4g)
 
 Change a shard's replica set on a running cluster — grow the replication factor,
