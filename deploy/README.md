@@ -115,7 +115,9 @@ auth/      API-key WAL (when [auth] enabled)
 shard-N/   per-shard Raft log + state machine (cluster mode)
 ```
 Back up `data_dir` (or use `POST /admin/snapshot` for a CoW snapshot). For
-Kubernetes, the per-pod PVC holds this.
+Kubernetes, the per-pod PVC holds this. See
+[`deploy/backup/`](backup/) for the cold/hot backup + restore runbook and
+scripts (verified end-to-end by `verify-roundtrip.sh`).
 
 ## Production security checklist
 
