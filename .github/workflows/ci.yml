@@ -11,6 +11,10 @@ env:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # Cap the job: a normal run is well under 10m even on a cold cache. A hung
+    # test (the cluster suite can starve on a 2-core runner) must fail fast here,
+    # not burn the full 6h GitHub default before being cancelled.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - name: Install native build deps
@@ -39,6 +43,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Build image
