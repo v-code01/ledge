@@ -66,6 +66,9 @@ enabled = false
 # listener; outbound peer clients present this node's identity).
 [tls]
 enabled = false
+# Rotate certs hot: overwrite these PEM files in place, then `systemctl reload
+# ledge` (or `kill -HUP <pid>`) — the live listeners swap to the new cert/key
+# (and peer CA under mTLS) with no restart or dropped connections.
 # cert_path = "/etc/ledge/tls/tls.crt"
 # key_path = "/etc/ledge/tls/tls.key"
 # ca_path = "/etc/ledge/tls/ca.crt"

@@ -130,7 +130,12 @@ scripts (verified end-to-end by `verify-roundtrip.sh`).
       `/metrics` publicly if your series are sensitive; scrape it from inside.
 - [ ] Don't issue **root-tenant** keys to untrusted clients (root is a superuser
       namespace, exempt from tenancy + quotas).
-- [ ] Rotate certs by rolling restart (no hot reload yet).
+- [ ] Rotate TLS certs **hot** (no restart, no dropped connections): overwrite the
+      cert/key PEM files in place, then `systemctl reload ledge` (or
+      `kill -HUP <pid>`). The server re-reads the cert/key — and the peer CA under
+      mTLS — and swaps them into the live listeners; a bad/missing PEM is logged
+      and the current certs are kept. Rotating the mTLS **trust roots** (CA) for
+      new client identities still applies on the next reload too.
 
 ## Cluster bootstrap (automatic)
 

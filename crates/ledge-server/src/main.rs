@@ -718,6 +718,21 @@ async fn main() -> anyhow::Result<()> {
         let ca = cfg.tls.ca_path.as_deref().expect("validated: tls.ca_path");
         let peer_tls = ledge_server::tls::server_config_mtls(cert, key, ca)?;
         let peer_rustls = axum_server::tls_rustls::RustlsConfig::from_config(peer_tls);
+        // Hot cert rotation: SIGHUP rebuilds BOTH the client and peer TLS configs
+        // from their PEM paths and swaps them into the live listeners.
+        spawn_cert_reloader(vec![
+            CertReloadTarget::Tls {
+                handle: client_rustls.clone(),
+                cert: cert.to_owned(),
+                key: key.to_owned(),
+            },
+            CertReloadTarget::Mtls {
+                handle: peer_rustls.clone(),
+                cert: cert.to_owned(),
+                key: key.to_owned(),
+                ca: ca.to_owned(),
+            },
+        ]);
         let peer_app = app.clone();
         info!(client_addr = %addr, peer_addr = %peer_addr, "ledge listening (https client + mTLS peer listeners)");
         let client_fut =
@@ -730,9 +745,78 @@ async fn main() -> anyhow::Result<()> {
         )?;
     } else {
         info!(bound_addr = %addr, "ledge listening (https client listener)");
+        // Hot cert rotation: SIGHUP rebuilds the client TLS config from its PEM
+        // paths and swaps it into the live listener.
+        spawn_cert_reloader(vec![CertReloadTarget::Tls {
+            handle: client_rustls.clone(),
+            cert: cert.to_owned(),
+            key: key.to_owned(),
+        }]);
         axum_server::bind_rustls(addr, client_rustls)
             .serve(app.into_make_service())
             .await?;
     }
     Ok(())
 }
+
+/// A live TLS listener config plus the PEM paths needed to rebuild it on reload.
+enum CertReloadTarget {
+    Tls {
+        handle: axum_server::tls_rustls::RustlsConfig,
+        cert: String,
+        key: String,
+    },
+    Mtls {
+        handle: axum_server::tls_rustls::RustlsConfig,
+        cert: String,
+        key: String,
+        ca: String,
+    },
+}
+
+/// Spawn a SIGHUP handler that hot-reloads each listener's certificate from its
+/// PEM paths — rotate certs with `kill -HUP <pid>` (or systemd `ExecReload`) with
+/// no restart and no dropped connections: in-flight handshakes keep their cert,
+/// new ones get the fresh one. A bad/missing PEM on reload is logged and the
+/// current certs are kept (a typo'd rotation never takes the listener down).
+#[cfg(unix)]
+fn spawn_cert_reloader(targets: Vec<CertReloadTarget>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGHUP unavailable; TLS cert hot-reload disabled");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            for t in &targets {
+                let reloaded = match t {
+                    CertReloadTarget::Tls { handle, cert, key } => {
+                        ledge_server::tls::server_config_tls_only(cert, key)
+                            .map(|c| handle.reload_from_config(c))
+                    }
+                    CertReloadTarget::Mtls {
+                        handle,
+                        cert,
+                        key,
+                        ca,
+                    } => ledge_server::tls::server_config_mtls(cert, key, ca)
+                        .map(|c| handle.reload_from_config(c)),
+                };
+                match reloaded {
+                    Ok(()) => tracing::info!("SIGHUP: reloaded TLS certificate"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SIGHUP: TLS cert reload failed; keeping current certs")
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Non-unix stub: cert hot-reload via signal is unix-only. The targets are
+/// constructed unconditionally at the call sites, so this consumes them.
+#[cfg(not(unix))]
+fn spawn_cert_reloader(_targets: Vec<CertReloadTarget>) {}

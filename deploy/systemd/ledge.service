@@ -9,6 +9,9 @@ Type=simple
 User=ledge
 Group=ledge
 ExecStart=/usr/local/bin/ledge start --config /etc/ledge/config.toml
+# Hot-reload TLS certs without dropping connections: `systemctl reload ledge`
+# sends SIGHUP, which re-reads the cert/key (and peer CA) PEM files in place.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65536

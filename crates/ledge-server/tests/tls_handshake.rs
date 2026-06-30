@@ -197,3 +197,69 @@ async fn mtls_signed_identity_succeeds_no_identity_and_rogue_rejected() {
         .await
         .is_err());
 }
+
+/// Like `boot`, but returns the `RustlsConfig` handle so the test can hot-reload
+/// the live listener's certificate (the same handle `spawn_cert_reloader` swaps).
+async fn boot_reloadable(server_cfg: Arc<rustls::ServerConfig>) -> (u16, RustlsConfig) {
+    let app = Router::new().route("/healthz", get(|| async { "ok" }));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let cfg = RustlsConfig::from_config(server_cfg);
+    let serving = cfg.clone();
+    tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, serving)
+            .serve(app.into_make_service())
+            .await
+            .ok();
+    });
+    tokio::task::yield_now().await;
+    (port, cfg)
+}
+
+/// GET `url` with a client that trusts ONLY `ca` (no built-in roots). `Some(body)`
+/// on a completed TLS handshake + request, `None` if the handshake/request errors
+/// (e.g. the served cert does not chain to `ca`).
+async fn get_with_ca(url: &str, ca: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(
+            ClientConfig::builder()
+                .with_root_certificates(roots(ca))
+                .with_no_client_auth(),
+        )
+        .build()
+        .unwrap();
+    client.get(url).send().await.ok()?.text().await.ok()
+}
+
+/// Hot cert rotation: the LIVE listener serves a NEW certificate after
+/// `reload_from_config` re-reads the same PEM paths — no restart. This is exactly
+/// what the server's SIGHUP handler (`spawn_cert_reloader`) does.
+#[tokio::test]
+async fn tls_cert_hot_reload_swaps_served_cert() {
+    tls::install_crypto_provider();
+    let d = tempfile::TempDir::new().unwrap();
+    // Two independent CAs + server identities. Identity A is written to the paths
+    // the listener loads from.
+    let (ca_a, sc_a, sk_a, ..) = mint();
+    let (ca_b, sc_b, sk_b, ..) = mint();
+    let cert_p = write(&d, "s.crt", &sc_a);
+    let key_p = write(&d, "s.key", &sk_a);
+
+    let (port, handle) =
+        boot_reloadable(tls::server_config_tls_only(&cert_p, &key_p).unwrap()).await;
+    let url = format!("https://127.0.0.1:{port}/healthz");
+
+    // Serving identity A: a client trusting CA-A succeeds; CA-B is rejected.
+    assert_eq!(get_with_ca(&url, &ca_a).await.as_deref(), Some("ok"));
+    assert!(get_with_ca(&url, &ca_b).await.is_none());
+
+    // Rotate the files in place to identity B and reload from the SAME paths.
+    std::fs::write(&cert_p, &sc_b).unwrap();
+    std::fs::write(&key_p, &sk_b).unwrap();
+    handle.reload_from_config(tls::server_config_tls_only(&cert_p, &key_p).unwrap());
+
+    // The live listener now serves identity B — CA-B succeeds, CA-A is rejected.
+    assert_eq!(get_with_ca(&url, &ca_b).await.as_deref(), Some("ok"));
+    assert!(get_with_ca(&url, &ca_a).await.is_none());
+}
