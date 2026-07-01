@@ -49,10 +49,18 @@ delta applier has a 2 GiB output guard.
 These are honest, documented gaps — not undisclosed bugs:
 
 - **No external audit.** The isolation and crypto choices are unaudited.
-- **Object confidentiality is reachability-based, not per-object ACLs.** Objects
-  are content-addressed and deduplicated across tenants; isolation rests on
-  ObjectId unguessability + ref reachability. An out-of-band ObjectId leak can
-  permit a cross-tenant read of that object.
+- **Git object confidentiality is enforced by reachability, not per-object ACLs.**
+  Objects are content-addressed and deduplicated across tenants, but the
+  upload-pack path now **authorizes every `want`**: a client may only receive an
+  object that is an advertised tip of its segment or reachable from those tips
+  (over HTTP *and* SSH). A `want` for a leaked/guessed id outside the caller's
+  segment is refused with `ERR ... not our ref` — the same response as a
+  nonexistent object, so there is no existence oracle. Isolation therefore no
+  longer rests on ObjectId unguessability for git reads.
+  - **Remaining gap (LFS):** the Git-LFS download path is not yet segment-scoped —
+    an authenticated caller who knows an LFS oid can fetch it regardless of tenant.
+    Namespacing LFS by segment is the open follow-on; until then, treat LFS
+    objects as shared across tenants of one instance.
 - **`root` is a superuser namespace.** Do not issue root-tenant keys to
   untrusted clients.
 - **Webhook SSRF is guarded by default.** Webhook URLs are tenant-controlled, so

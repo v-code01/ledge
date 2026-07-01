@@ -359,6 +359,73 @@ async fn reachable_closure(
     seen
 }
 
+/// The advertised tip SHA-1s for `segment`: the git SHA-1 of every ref under
+/// `refs/{segment}`. These are exactly the objects a client may name directly
+/// (`allow-tip-sha1-in-want`), and the roots from which any other reachable
+/// object may be requested (`allow-reachable-sha1-in-want`).
+async fn segment_tip_sha1s(
+    refs: &dyn RefStore,
+    sha1_store: &dyn Sha1Provider,
+    segment: &str,
+) -> ledge_core::Result<std::collections::HashSet<[u8; 20]>> {
+    let entries = refs.list(&format!("refs/{segment}")).await?;
+    let mut tips = std::collections::HashSet::new();
+    for (_name, entry) in &entries {
+        if let Some(sha1) = sha1_store.sha1_of(entry.target).await {
+            tips.insert(sha1);
+        }
+    }
+    Ok(tips)
+}
+
+/// Authorize a fetch's `want`s for `segment` — per-tenant object confidentiality
+/// (audit F-3 / R-4).
+///
+/// A client may only receive objects that belong to the namespace it is fetching:
+/// every `want` must be an advertised tip of `segment`, OR reachable from those
+/// tips. An advertised tip is trivially allowed; any UNADVERTISED `want <sha>` (a
+/// partial-clone lazy blob fetch — or a probe for another tenant's object by a
+/// leaked/guessed id) is allowed ONLY if it lies in the reachable closure of this
+/// segment's refs. This makes the advertised `allow-reachable-sha1-in-want`
+/// capability honest: "reachable" means reachable from OUR refs.
+///
+/// Returns `Ok(Some(sha))` for the first unauthorized want (the caller replies
+/// with an `ERR upload-pack: not our ref <sha>` pkt-line — the SAME response
+/// whether the object is another tenant's or does not exist at all, so nothing
+/// about other tenants leaks, not even existence). `Ok(None)` = all authorized.
+/// The common clone/fetch case (every want is a tip) returns without walking the
+/// object graph at all.
+async fn authorize_wants(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    refs: &dyn RefStore,
+    segment: &str,
+    wants: &[[u8; 20]],
+) -> ledge_core::Result<Option<[u8; 20]>> {
+    if wants.is_empty() {
+        return Ok(None);
+    }
+    let tips = segment_tip_sha1s(refs, sha1_store, segment).await?;
+    let unadvertised: Vec<[u8; 20]> = wants
+        .iter()
+        .copied()
+        .filter(|w| !tips.contains(w))
+        .collect();
+    if unadvertised.is_empty() {
+        return Ok(None); // fast path: a plain clone/fetch of advertised tips
+    }
+    // Only now (an explicit non-tip want) do we pay for the reachability walk.
+    let tip_vec: Vec<[u8; 20]> = tips.into_iter().collect();
+    let authorized = reachable_closure(objects, sha1_store, &tip_vec).await;
+    Ok(unadvertised.into_iter().find(|w| !authorized.contains(w)))
+}
+
+/// The `ERR` pkt-line returned for an unauthorized/unknown want. Identical for an
+/// object that belongs to another tenant and one that does not exist.
+fn not_our_ref(sha1: &[u8; 20]) -> Vec<u8> {
+    encode(format!("ERR upload-pack: not our ref {}\n", hex::encode(sha1)).as_bytes())
+}
+
 /// Collect the `(git_type, content)` objects to pack for `wanted_sha1s`, BFS-ing
 /// the reachable closure but **never including or descending into anything in
 /// `exclude`**. With an empty `exclude` this is the full clone closure; with the
@@ -653,8 +720,6 @@ pub async fn handle_upload_pack(
     segment: &str,
     cache: Option<&UploadPackCache>,
 ) -> ledge_core::Result<Vec<u8>> {
-    let _ = refs; // selection is SHA-1-keyed via sha1_index, not ref-name-scoped
-
     // ── Parse the request: `want`s, `have`s, and whether the client said `done` ──
     // The body is `want…` lines, a flush, then (for a fetch) `have…` lines and
     // either another flush (more negotiation coming) or `done`. We must NOT stop
@@ -700,6 +765,18 @@ pub async fn handle_upload_pack(
                 }
             }
         }
+    }
+
+    // ── Per-tenant object confidentiality (R-4): a client may only fetch objects
+    //    reachable from a ref in ITS OWN segment. An unadvertised `want` for an
+    //    object outside this segment's closure — a leaked/guessed id for another
+    //    tenant's object — is refused with `ERR ... not our ref`, the identical
+    //    response given for a nonexistent object (no existence oracle). Advertised
+    //    tips (the plain clone/fetch case) pass without a graph walk. ────────────
+    if let Some(bad) =
+        authorize_wants(&objects, sha1_store, refs.as_ref(), segment, &wanted_sha1s).await?
+    {
+        return Ok(not_our_ref(&bad));
     }
 
     // ── Shallow path (`deepen N`): a depth-limited clone. Send the shallow-info
@@ -1107,6 +1184,18 @@ where
         }
     }
     if wants.is_empty() {
+        return Ok(());
+    }
+
+    // 2a. Per-tenant object confidentiality (R-4): reject an unadvertised want for
+    // an object outside this segment's reachable closure (same guard as HTTP).
+    if let Some(bad) = authorize_wants(&objects, sha1_store, refs.as_ref(), segment, &wants).await?
+    {
+        stream
+            .write_all(&not_our_ref(&bad))
+            .await
+            .map_err(LedgeError::Io)?;
+        stream.flush().await.map_err(LedgeError::Io)?;
         return Ok(());
     }
 
@@ -1547,8 +1636,12 @@ mod tests {
         assert!(pack[8..].starts_with(b"PACK"));
     }
 
+    /// A `want` for a tip advertised in the request's segment is served. (This
+    /// used to assert wants were "not ref-scoped"; per-tenant confidentiality
+    /// (R-4) made them segment-scoped — the negative case is
+    /// `upload_pack_rejects_want_outside_segment` below.)
     #[tokio::test]
-    async fn upload_pack_segment_is_want_resolved_not_ref_scoped() {
+    async fn upload_pack_serves_want_for_advertised_tip() {
         let objects = MemObjectStore::new();
         let refs = MemRefStore::new();
         let sha1 = make_sha1(0x09);
@@ -1572,6 +1665,76 @@ mod tests {
         .unwrap();
         assert!(pack.starts_with(b"0008NAK\n"));
         assert!(pack[8..].starts_with(b"PACK"));
+    }
+
+    /// Per-tenant object confidentiality (R-4). Tenant A owns a commit→tree→blob
+    /// graph; the blob is present in the shared, deduped store. From tenant B's
+    /// segment (which has its OWN unrelated ref), an unadvertised `want <blob>`
+    /// for A's blob — a leaked/guessed id — is refused with `ERR ... not our ref`,
+    /// the SAME response a nonexistent object gets (no existence oracle). And a
+    /// reachable, unadvertised `want` inside A's OWN segment (a legit partial-clone
+    /// lazy blob fetch) is still served.
+    #[tokio::test]
+    async fn upload_pack_rejects_want_outside_segment() {
+        let (objects, _base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+
+        // Resolve the child commit's tree, then a blob sha reachable from it.
+        let idx = objects.sha1_index().await;
+        let child_oid = *idx.get(&child).unwrap();
+        let child_content = store.read(child_oid).await.unwrap();
+        let tree_sha1 = commit_tree_sha1(&child_content).unwrap();
+        let tree_oid = *idx.get(&tree_sha1).unwrap();
+        let tree_content = store.read(tree_oid).await.unwrap();
+        // Second entry of the child tree is "b.txt" → the new blob.
+        let blob_sha1 = tree_child_sha1s(&tree_content)[1];
+
+        // ── Tenant A's segment advertises `child`; an unadvertised want for its
+        //    reachable blob is authorized (partial-clone lazy fetch works). ──────
+        let refs_a = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
+        let ok = handle_upload_pack(
+            fetch_body(&[blob_sha1], &[], true),
+            store.clone(),
+            refs_a,
+            objects.as_ref(),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ok.windows(4).any(|w| w == b"PACK"),
+            "a reachable, unadvertised want (lazy fetch) is served"
+        );
+
+        // ── Tenant B's segment has its own unrelated ref (an orphan blob), and
+        //    does NOT advertise A's history. A want for A's blob is refused. ──────
+        let orphan = objects.seed_typed(Bytes::from_static(b"tenant B data"), make_sha1(0x77), 3);
+        let refs_b = MemRefStore::new();
+        refs_b.insert("refs/workspaces/tenantB/heads/main", orphan);
+        let refs_b = refs_b as Arc<dyn ledge_core::RefStore>;
+        let denied = handle_upload_pack(
+            fetch_body(&[blob_sha1], &[], true),
+            store.clone(),
+            refs_b,
+            objects.as_ref(),
+            "workspaces/tenantB/",
+            None,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8_lossy(&denied);
+        assert!(
+            text.contains(&format!(
+                "ERR upload-pack: not our ref {}",
+                hex::encode(blob_sha1)
+            )),
+            "a want for another segment's object is refused with not-our-ref, got: {text:?}"
+        );
+        assert!(
+            !denied.windows(4).any(|w| w == b"PACK"),
+            "no pack is sent for an unauthorized want"
+        );
     }
 
     #[tokio::test]
@@ -1964,6 +2127,19 @@ mod tests {
         u32::from_be_bytes([resp[p + 8], resp[p + 9], resp[p + 10], resp[p + 11]])
     }
 
+    /// A ref store advertising `refs/heads/main -> <the object whose git sha1 is
+    /// `tip`>`, so the fetch handler treats `tip` as an advertised, fetchable tip.
+    /// A `want` must be an advertised tip or reachable from one (R-4
+    /// authorization), so handler tests that fetch a hand-built commit must
+    /// advertise it (a real client only ever wants tips the server advertised).
+    async fn refs_advertising(objects: &MemObjectStore, tip: [u8; 20]) -> Arc<MemRefStore> {
+        let refs = MemRefStore::new();
+        let idx = objects.sha1_index().await;
+        let oid = *idx.get(&tip).expect("tip object seeded before advertising");
+        refs.insert("refs/heads/main", oid);
+        refs
+    }
+
     /// Build a base→child history sharing a blob, return (store, refs, base_commit,
     /// child_commit). child adds one new blob in a new tree on top of base.
     async fn base_child_history() -> (Arc<MemObjectStore>, [u8; 20], [u8; 20]) {
@@ -2004,7 +2180,7 @@ mod tests {
     async fn fetch_with_have_sends_only_new_objects() {
         let (objects, base, child) = base_child_history().await;
         let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
-        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+        let refs = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
 
         // Full clone (no haves): the whole closure = 6 objects
         // (2 commits + 2 trees + 2 blobs).
@@ -2068,12 +2244,15 @@ mod tests {
 
         // Run one interactive stream session over an in-memory duplex; return the
         // bytes the client receives (advert + acks + pack).
-        async fn run(objects: Arc<MemObjectStore>, req: Vec<u8>) -> Vec<u8> {
+        async fn run(
+            objects: Arc<MemObjectStore>,
+            refs: Arc<dyn ledge_core::RefStore>,
+            req: Vec<u8>,
+        ) -> Vec<u8> {
             let (mut client, mut server) = tokio::io::duplex(1 << 20);
             let obj2 = objects.clone();
             let task = tokio::spawn(async move {
                 let store = obj2.clone() as Arc<dyn ledge_core::ObjectStore>;
-                let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
                 upload_pack_stream(&mut server, store, refs, obj2.as_ref(), "")
                     .await
                     .unwrap();
@@ -2085,13 +2264,15 @@ mod tests {
             out
         }
 
+        let refs = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
+
         // Clone: want child, flush, done → full closure (6 objects).
         let mut req = Vec::new();
         req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
         req.extend_from_slice(&encode_flush());
         req.extend_from_slice(&encode(b"done\n"));
         assert_eq!(
-            pack_count(&run(objects.clone(), req).await),
+            pack_count(&run(objects.clone(), refs.clone(), req).await),
             6,
             "stream clone = full closure"
         );
@@ -2103,7 +2284,7 @@ mod tests {
         req.extend_from_slice(&encode(format!("have {}\n", hex::encode(base)).as_bytes()));
         req.extend_from_slice(&encode(b"done\n"));
         assert_eq!(
-            pack_count(&run(objects.clone(), req).await),
+            pack_count(&run(objects.clone(), refs.clone(), req).await),
             3,
             "stream fetch = incremental"
         );
@@ -2190,7 +2371,7 @@ mod tests {
     async fn handle_upload_pack_shallow_emits_shallow_line_and_bounded_pack() {
         let (objects, _base, child) = base_child_history().await;
         let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
-        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+        let refs = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
         // Request: want child, deepen 1, flush, done.
         let mut req = Vec::new();
         req.extend_from_slice(&encode(format!("want {}\n", hex::encode(child)).as_bytes()));
@@ -2216,7 +2397,7 @@ mod tests {
     async fn fetch_negotiation_round_naks_without_pack() {
         let (objects, base, child) = base_child_history().await;
         let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
-        let refs = MemRefStore::new() as Arc<dyn ledge_core::RefStore>;
+        let refs = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
         // No `done`: a negotiation round. We advertise no multi_ack, so a bare ACK
         // would mean "pack follows" — we must NAK and send no pack until `done`.
         let resp = handle_upload_pack(
