@@ -82,9 +82,8 @@ smaller; the bridge is the content-addressing tax. (Details in
 ## Quickstart
 
 ```sh
-# Run a single node (Docker)
-docker build -t ledge .
-docker run -p 3000:3000 ledge
+# Run a single node — prebuilt multi-arch image (amd64 / arm64), or build locally
+docker run -p 3000:3000 ghcr.io/v-code01/ledge:latest      # or: docker build -t ledge . && docker run -p 3000:3000 ledge
 
 # Create a workspace and use it with a normal git client
 curl -X POST http://localhost:3000/workspaces
@@ -94,6 +93,20 @@ git push origin HEAD:refs/heads/main
 ```
 
 Deploy artifacts (Compose, Helm, systemd) live in [`deploy/`](deploy/).
+
+### Container images
+
+Signed, multi-arch (`linux/amd64` + `linux/arm64`) images are published to GHCR on
+each `v*` release, with SBOM + SLSA build-provenance attestations:
+
+```sh
+docker pull ghcr.io/v-code01/ledge:latest         # or a pinned tag, e.g. :v0.1.0
+
+# Verify the cosign signature (keyless — GitHub OIDC via Fulcio/Rekor, no keys):
+cosign verify ghcr.io/v-code01/ledge:latest \
+  --certificate-identity-regexp 'https://github.com/v-code01/ledge/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## Architecture
 
