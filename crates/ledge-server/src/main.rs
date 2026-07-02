@@ -381,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
         coordinator,
         quota.limits,
         quota.usage.clone(),
+        ledge_server::GC_GRACE,
     )?;
 
     // ── Lease WAL compaction: collapse the append log to a checkpoint when it

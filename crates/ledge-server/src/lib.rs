@@ -47,6 +47,11 @@ use std::collections::{BTreeMap, HashMap};
 /// the `Arc<dyn RefStore>` seam internally. The GC keeps the concrete
 /// `Arc<DiskObjectStore>` (it needs `DiskObjectStore`-only methods). Behavior is
 /// byte-identical to Phase 1/2 — the trait object is the same `RefStoreImpl`.
+/// The single-node GC grace window (matches the cluster GC): a candidate is swept
+/// only if it is unreachable AND older than this, closing the resurrection race
+/// with a push that lands between GC's candidate freeze and root read.
+pub const GC_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub fn build_workspace_stack(
     data_dir: std::path::PathBuf,
     objects: Arc<DiskObjectStore>,
@@ -54,6 +59,20 @@ pub fn build_workspace_stack(
     hlc: Arc<HLC>,
     quotas: ledge_workspace::QuotaLimits,
     usage: Arc<ledge_workspace::UsageMap>,
+) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
+    build_workspace_stack_graced(data_dir, objects, refs, hlc, quotas, usage, GC_GRACE)
+}
+
+/// As [`build_workspace_stack`], but with an explicit GC `grace` window. Tests
+/// that need deterministic immediate reclaim pass `Duration::ZERO`.
+pub fn build_workspace_stack_graced(
+    data_dir: std::path::PathBuf,
+    objects: Arc<DiskObjectStore>,
+    refs: Arc<RefStoreImpl>,
+    hlc: Arc<HLC>,
+    quotas: ledge_workspace::QuotaLimits,
+    usage: Arc<ledge_workspace::UsageMap>,
+    grace: std::time::Duration,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     // Single-node atomic-commit seam: one ArcSwap root swap over the SAME concrete
     // `RefStoreImpl` the manager already reads/writes. Built here, before the
@@ -70,6 +89,7 @@ pub fn build_workspace_stack(
         coordinator,
         quotas,
         usage,
+        grace,
     )
 }
 
@@ -79,6 +99,7 @@ pub fn build_workspace_stack(
 /// GC is per-node-local in Phase 3; see [`ledge_workspace::Gc`]). The single-node
 /// [`build_workspace_stack`] is a thin wrapper that up-casts a concrete
 /// `RefStoreImpl` into this.
+#[allow(clippy::too_many_arguments)] // a storage-stack builder; grouping would obscure
 pub fn build_workspace_stack_dyn(
     data_dir: std::path::PathBuf,
     objects_disk: Arc<DiskObjectStore>,
@@ -87,6 +108,7 @@ pub fn build_workspace_stack_dyn(
     coordinator: Arc<dyn ledge_ref_store::AtomicCommit>,
     quotas: ledge_workspace::QuotaLimits,
     usage: Arc<ledge_workspace::UsageMap>,
+    grace: std::time::Duration,
 ) -> ledge_core::Result<(Arc<WorkspaceManager>, Arc<LeaseStore>, Arc<Gc>)> {
     let leases = Arc::new(LeaseStore::open(data_dir, hlc.clone())?);
     let manager = Arc::new(WorkspaceManager::new(
@@ -97,7 +119,7 @@ pub fn build_workspace_stack_dyn(
         quotas,
         usage.clone(),
     ));
-    let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk, usage));
+    let gc = Arc::new(Gc::new(refs, leases.clone(), objects_disk, usage, grace));
     Ok((manager, leases, gc))
 }
 

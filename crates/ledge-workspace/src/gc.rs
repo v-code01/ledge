@@ -4,15 +4,21 @@
 //! root. Roots are (a) every durable ref — any ref NOT under `refs/workspaces/*`
 //! (covers `refs/heads/*`, `refs/tags/*`, and per-tenant `refs/tenants/<t>/*`,
 //! Phase 4d-2 R6) — and (b) the refs of every *live-lease* workspace
-//! `refs/workspaces/<id>/*`. The pass is
-//! crash-safe and race-safe via a candidate-set freeze (§6 safety argument):
-//! the set of deletion candidates is snapshotted *before* marking, so any object
-//! written after the snapshot is structurally excluded from this pass and can
-//! never be wrongly deleted.
+//! `refs/workspaces/<id>/*`.
+//!
+//! Crash-safety and the object-resurrection race are handled exactly as the
+//! cluster GC (`ledge-cluster::gc`): (1) freeze the candidate set BEFORE reading
+//! roots, so any ref committed before the (later) root read that points at a
+//! frozen candidate is seen by the mark; and (2) a **grace fence** — a candidate
+//! is swept only if it is unreachable AND older than `grace` (by file mtime).
+//! Together these close the window where a concurrent `git push` writes objects
+//! and updates a ref between the root snapshot and the candidate freeze: the
+//! freshly-written objects are younger than `grace`, so GC retains them and a
+//! later pass (with the ref now settled) keeps them by reachability.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ledge_core::{tenant_of_ref, ObjectId, RefStore, Result};
 use ledge_object_store::{graph, DiskObjectStore};
@@ -43,6 +49,11 @@ pub struct Gc {
     /// R Q4). `ArcSwap::store`d at the end of `run`; read by the manager's commit
     /// gate. The SAME `Arc` the server + manager hold.
     usage: Arc<UsageMap>,
+    /// Grace window: a candidate is swept only if it is unreachable AND its file
+    /// mtime is older than this. Fences the resurrection race (a just-written
+    /// object is younger than `grace`, so it is retained). `0` disables the fence
+    /// (immediate sweep) — used in tests that want deterministic reclaim.
+    grace: Duration,
 }
 
 /// Per-pass GC accounting (spec §4.3).
@@ -58,26 +69,18 @@ pub struct GcStats {
     pub reclaimed: usize,
     pub bytes_freed: u64,
     /// Candidates retained THIS pass solely because they are younger than the
-    /// grace window (distributed GC only; the single-node `Gc` has no grace
-    /// fence and always leaves this `0`). Observability so operators can see the
-    /// grace window's effect (spec §4.1).
+    /// grace window (unreachable but too new to sweep). Observability so operators
+    /// can see the grace fence's effect. `0` when the grace window is `0`.
     pub skipped_grace: usize,
 }
 
-/// Wall-clock milliseconds since the Unix epoch, used for lease-liveness checks.
-///
-/// GC tolerates clock skew here: a lease that is "live" at `now_ms` is treated
-/// as a root and its objects are kept. Over-keeping is always safe (objects are
-/// reclaimed on a later pass); under-keeping would be a correctness bug, so the
-/// liveness predicate is intentionally inclusive.
-fn now_ms() -> u64 {
-    // A pre-1970 clock yields `Err`; we map that to 0 rather than panicking so a
-    // skewed clock can never crash the unsupervised GC task. now_ms == 0 makes
-    // every lease appear live (conservative: GC never reclaims a live workspace's
-    // objects), which is the fail-safe direction.
+/// Wall-clock seconds since the Unix epoch (the sweep's grace anchor). A pre-1970
+/// clock maps to 0 (fail-safe: age computes tiny → objects are kept, never wrongly
+/// swept — over-keeping is always safe).
+fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
@@ -87,22 +90,45 @@ impl Gc {
         leases: Arc<LeaseStore>,
         objects: Arc<DiskObjectStore>,
         usage: Arc<UsageMap>,
+        grace: Duration,
     ) -> Self {
         Self {
             refs,
             leases,
             objects,
             usage,
+            grace,
         }
     }
 
-    /// Run one mark-and-sweep pass (spec §6). Implements the four steps exactly:
-    /// snapshot roots → freeze candidates → mark → sweep.
+    /// Run one mark-and-sweep pass at the current wall clock.
     #[tracing::instrument(skip(self))]
     pub async fn run(&self) -> Result<GcStats> {
+        self.run_at(now_unix_secs()).await
+    }
+
+    /// Run one mark-and-sweep pass anchored at `now_unix_secs` (the grace clock).
+    /// Taking the clock as a parameter — rather than reading the wall clock —
+    /// makes the grace fence deterministically testable.
+    ///
+    /// Ordering (matches the cluster GC): freeze candidates → read roots → mark →
+    /// grace-fenced sweep. Freezing BEFORE the root read ensures a ref committed
+    /// before the (later) root read, pointing at a frozen candidate, is seen by
+    /// the mark; the grace fence then retains any candidate younger than `grace`,
+    /// so a concurrent push's just-written objects are never swept.
+    pub async fn run_at(&self, now_unix_secs: u64) -> Result<GcStats> {
         // Monotonic timer for the pass duration (Instant is clock-skew-immune).
         let start = std::time::Instant::now();
-        // ── 1. Snapshot roots ────────────────────────────────────────────────
+
+        // ── 1. Freeze candidates FIRST ───────────────────────────────────────
+        // Snapshot every object that exists *now*. Anything written after this
+        // line is never a candidate this pass, and — because we read roots BELOW,
+        // after this freeze — any ref update that lands before the root read is
+        // observed by the mark for these frozen candidates.
+        let candidates = self.objects.list_all_ids().await?;
+        let scanned = candidates.len();
+
+        // ── 2. Snapshot roots (after the candidate freeze) ───────────────────
         // Durable refs are unconditional roots. Phase 4d-2 (R6): a real tenant's
         // durable refs live under refs/tenants/<t>/heads|tags/*, so we root EVERY
         // ref that is NOT a workspace ref — mirroring the cluster GC filter
@@ -120,19 +146,13 @@ impl Gc {
         // A *tombstoned or expired* lease is excluded by `live()`, so its
         // workspace refs are NOT roots even if those refs still physically
         // exist (the expiry sweeper removes them out of band — see §6 note).
-        let now = now_ms();
+        let now = now_unix_secs.saturating_mul(1000); // lease store is ms-based
         for lease in self.leases.live(now).await? {
             let prefix = format!("refs/workspaces/{}/", lease.id.to_hex());
             for (_name, entry) in self.refs.list(&prefix).await? {
                 roots.push(entry.target);
             }
         }
-
-        // ── 2. Freeze candidates ─────────────────────────────────────────────
-        // Snapshot of every object that exists *now*. Anything written after
-        // this line is never a candidate this pass (safety argument, §6).
-        let candidates = self.objects.list_all_ids().await?;
-        let scanned = candidates.len();
 
         // ── 3. Mark ──────────────────────────────────────────────────────────
         // Capture the root count before `reachable_from` consumes the Vec.
@@ -151,19 +171,38 @@ impl Gc {
         // candidate population) or stops — no id is revisited.
         let keep = self.close_under_delta_bases(reachable).await?;
 
-        // ── 4. Sweep ─────────────────────────────────────────────────────────
-        // Delete every candidate that is not in the keep-set. Deletes are
-        // idempotent; a crash mid-sweep is harmless — the next pass re-derives.
+        // ── 4. Grace-fenced sweep ────────────────────────────────────────────
+        // Delete each candidate that is unreachable AND older than `grace` (by
+        // file mtime). A younger unreachable candidate is RETAINED (skipped_grace)
+        // — this is what closes the resurrection race with a concurrent push.
+        // Deletes are idempotent; a crash mid-sweep is harmless (next pass
+        // re-derives). `grace == 0` disables the fence (immediate sweep).
+        let grace_secs = self.grace.as_secs();
         let mut reclaimed = 0usize;
         let mut bytes_freed = 0u64;
+        let mut skipped_grace = 0usize;
         for id in candidates {
             if keep.contains(&id) {
                 continue;
             }
-            // Stat the file *before* deleting to attribute freed bytes.
-            // A missing file (concurrent delete) contributes 0 bytes and the
-            // delete remains a no-op — both idempotent.
             let path = self.objects.object_path(&id);
+            // mtime as secs-since-epoch. Fail-safe on any error: treat as "now"
+            // (age 0 ⇒ kept); a missing/raced file has nothing to free ⇒ skip.
+            let mtime_secs = match tokio::fs::metadata(&path).await {
+                Ok(meta) => match meta.modified() {
+                    Ok(m) => m
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(now_unix_secs),
+                    Err(_) => now_unix_secs, // no mtime on this platform ⇒ keep
+                },
+                Err(_) => continue, // missing/raced file ⇒ nothing to free
+            };
+            // age = now − mtime, saturating so a future mtime (skew) ⇒ age 0 ⇒ kept.
+            if now_unix_secs.saturating_sub(mtime_secs) < grace_secs {
+                skipped_grace += 1;
+                continue;
+            }
             if let Ok(meta) = tokio::fs::metadata(&path).await {
                 bytes_freed += meta.len();
             }
@@ -212,9 +251,7 @@ impl Gc {
             reachable: reachable_count,
             reclaimed,
             bytes_freed,
-            // The single-node Gc has no grace fence: every unreachable candidate
-            // is swept immediately, so none is ever retained by grace.
-            skipped_grace: 0,
+            skipped_grace,
         };
 
         // Structured pass summary (spec §9): roots, candidates, reachable,
@@ -294,7 +331,15 @@ mod tests {
         let leases = Arc::new(LeaseStore::open(root.clone(), hlc.clone()).unwrap());
         let objects = Arc::new(DiskObjectStore::new(root.clone()).unwrap());
         let usage = Arc::new(UsageMap::default());
-        let gc = Gc::new(refs.clone(), leases.clone(), objects.clone(), usage.clone());
+        // grace = 0: the immediate-reclaim behavior these unit tests assert. The
+        // grace fence itself is covered by `grace_fence_retains_young_orphan`.
+        let gc = Gc::new(
+            refs.clone(),
+            leases.clone(),
+            objects.clone(),
+            usage.clone(),
+            Duration::from_secs(0),
+        );
         Harness {
             _dir: dir,
             hlc,
@@ -484,6 +529,47 @@ mod tests {
         assert!(!h.objects.exists(commit).await.unwrap());
         assert!(!h.objects.exists(tree).await.unwrap());
         assert!(!h.objects.exists(blob).await.unwrap());
+    }
+
+    /// The grace fence: a just-written UNREACHABLE object is RETAINED (not swept)
+    /// until it ages past `grace`. This is the guard against the resurrection race
+    /// where a concurrent push writes objects and updates a ref between GC's
+    /// candidate freeze and root read — the fresh objects are young, so GC keeps
+    /// them and a later pass keeps them by reachability.
+    #[tokio::test]
+    async fn grace_fence_retains_young_orphan() {
+        let h = setup();
+        // A GC with a 1h grace fence over the same stores as the harness.
+        let gc = Gc::new(
+            h.refs.clone(),
+            h.leases.clone(),
+            h.objects.clone(),
+            h.usage.clone(),
+            Duration::from_secs(3600),
+        );
+        let orphan = write_blob(&h.objects, b"just pushed, not yet referenced").await;
+        let now = now_unix_secs();
+
+        // At `now`, the orphan is young (age ~0 < grace) → retained by the fence.
+        let s1 = gc.run_at(now).await.unwrap();
+        assert!(
+            h.objects.exists(orphan).await.unwrap(),
+            "a just-written unreachable object must be retained by the grace fence"
+        );
+        assert_eq!(s1.reclaimed, 0, "nothing swept while within grace");
+        assert_eq!(
+            s1.skipped_grace, 1,
+            "the young orphan is counted as grace-retained"
+        );
+
+        // Advance the pass clock past the grace window → now old → swept.
+        let s2 = gc.run_at(now + 3600 + 60).await.unwrap();
+        assert!(
+            !h.objects.exists(orphan).await.unwrap(),
+            "past grace, the still-unreachable object is reclaimed"
+        );
+        assert_eq!(s2.reclaimed, 1);
+        assert_eq!(s2.skipped_grace, 0);
     }
 
     // 5 ───────────────────────────────────────────────────────────────────────

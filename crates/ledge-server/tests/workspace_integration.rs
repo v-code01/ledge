@@ -24,13 +24,17 @@ async fn start_server() -> (String, TempDir) {
     let hlc = Arc::new(HLC::new());
     let objects = Arc::new(DiskObjectStore::new(data_dir.path().to_path_buf()).unwrap());
     let refs = Arc::new(RefStoreImpl::open(data_dir.path().to_path_buf(), hlc.clone()).unwrap());
-    let (workspaces, leases, gc) = ledge_server::build_workspace_stack(
+    // grace = 0 so `release_then_gc_reclaims_discarded` sees deterministic
+    // immediate reclaim (the production stack uses a 1h grace fence; the fence
+    // itself is unit-tested in ledge-workspace::gc).
+    let (workspaces, leases, gc) = ledge_server::build_workspace_stack_graced(
         data_dir.path().to_path_buf(),
         objects.clone(),
         refs.clone(),
         hlc,
         ledge_workspace::QuotaLimits::default(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        std::time::Duration::ZERO,
     )
     .unwrap();
     let app = build_app(AppState {

@@ -37,6 +37,7 @@ fn ctx() -> (RpcCtx, TempDir) {
         leases,
         objects.clone(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        std::time::Duration::from_secs(0),
     ));
     let ctx = RpcCtx {
         objects,
@@ -77,6 +78,7 @@ fn two_tenant_ctxs() -> (RpcCtx, RpcCtx, TempDir) {
         leases,
         objects.clone(),
         std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        std::time::Duration::from_secs(0),
     ));
     let base = RpcCtx {
         objects,
