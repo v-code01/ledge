@@ -265,3 +265,108 @@ async fn clone_fetch_push_over_ssh() {
         "the SSH-pushed commit is durable on the server"
     );
 }
+
+/// Deepen an existing shallow clone over `ssh://`: `git clone --depth 1` then
+/// `git fetch --unshallow` must recover the full history (parity with HTTP).
+#[tokio::test]
+async fn shallow_clone_then_unshallow_over_ssh() {
+    let (http, ssh_port, _dd) = start().await;
+
+    let keydir = TempDir::new().unwrap();
+    let key = keydir.path().join("id_ed25519");
+    let kg = TokioCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()])
+        .output()
+        .await
+        .expect("ssh-keygen");
+    assert!(
+        kg.status.success(),
+        "ssh-keygen: {}",
+        String::from_utf8_lossy(&kg.stderr)
+    );
+    let ssh_cmd = format!(
+        "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes",
+        key.display()
+    );
+
+    // Seed an 8-commit repo over HTTP.
+    let src = TempDir::new().unwrap();
+    ok(
+        &git(&["init", "--initial-branch=main", "."], src.path(), None).await,
+        "init",
+    );
+    ok(
+        &git(&["config", "user.email", "t@l"], src.path(), None).await,
+        "email",
+    );
+    ok(
+        &git(&["config", "user.name", "t"], src.path(), None).await,
+        "name",
+    );
+    for i in 0..8 {
+        std::fs::write(src.path().join("f.txt"), format!("v{i}\n")).unwrap();
+        ok(&git(&["add", "."], src.path(), None).await, "add");
+        ok(
+            &git(&["commit", "-m", &format!("c{i}")], src.path(), None).await,
+            "commit",
+        );
+    }
+    let remote_http = format!("{http}/ssh-unshallow-repo");
+    ok(
+        &git(
+            &["push", &remote_http, "main:refs/heads/main"],
+            src.path(),
+            None,
+        )
+        .await,
+        "seed push",
+    );
+
+    // Shallow clone over SSH → exactly one commit, marked shallow.
+    let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/ssh-unshallow-repo");
+    let clone = TempDir::new().unwrap();
+    let cp = clone.path().join("c");
+    ok(
+        &git(
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--quiet",
+                &ssh_url,
+                cp.to_str().unwrap(),
+            ],
+            Path::new("/"),
+            Some(&ssh_cmd),
+        )
+        .await,
+        "ssh depth-1 clone",
+    );
+    let n1 = String::from_utf8(
+        git(&["rev-list", "--count", "HEAD"], &cp, None)
+            .await
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(n1, "1", "ssh shallow clone has one commit");
+    assert!(cp.join(".git/shallow").exists(), "ssh clone is shallow");
+
+    // Unshallow over SSH → full 8-commit history, no longer shallow.
+    let uns = git(&["fetch", "--unshallow", "origin"], &cp, Some(&ssh_cmd)).await;
+    ok(&uns, "ssh unshallow");
+    let nu = String::from_utf8(
+        git(&["rev-list", "--count", "HEAD"], &cp, None)
+            .await
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(nu, "8", "ssh unshallow recovers the full 8-commit history");
+    assert!(
+        !cp.join(".git/shallow").exists(),
+        "clone is no longer shallow after ssh --unshallow"
+    );
+}

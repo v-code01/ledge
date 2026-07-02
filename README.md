@@ -179,8 +179,8 @@ what is **not** ready — so you can decide where it fits:
 - **SSH transport does clone + fetch + push.** Shallow (`--depth N`) and partial
   (`--filter=blob:none` / `blob:limit=N`) clone are supported over HTTP and SSH.
   Deepening an existing shallow clone (`git fetch --unshallow` / `--depth N`)
-  works over HTTP. **No sparse / tree-filter clone**; deepen-with-shallow over
-  SSH, `--deepen N` relative depth, and LFS file locking are follow-ons. SSH auth is an authorized-keys allowlist where each key's **comment
+  works over **HTTP and SSH**. **No sparse / tree-filter clone**; `--deepen N`
+  relative depth and LFS file locking are follow-ons. SSH auth is an authorized-keys allowlist where each key's **comment
   is its tenant** (`ssh-ed25519 … acme` ⇒ tenant `acme`; no comment ⇒ root), and
   SSH access to a workspace is gated by tenant ownership — same isolation as HTTP.
   Empty/absent allowlist accepts any key as root (dev only).

@@ -1470,8 +1470,9 @@ where
     stream.write_all(&advert).await.map_err(LedgeError::Io)?;
     stream.flush().await.map_err(LedgeError::Io)?;
 
-    // 2. Read `want`s + optional `deepen N` / `filter <spec>` (terminated by flush).
+    // 2. Read `want`s + optional `shallow`/`deepen N`/`filter <spec>` (until flush).
     let mut wants: Vec<[u8; 20]> = Vec::new();
+    let mut client_shallow: Vec<[u8; 20]> = Vec::new();
     let mut depth: Option<usize> = None;
     let mut filter = BlobFilter::All;
     loop {
@@ -1485,6 +1486,10 @@ where
                 if let Some(rest) = s.strip_prefix("want ") {
                     if let Some(a) = parse_pkt_sha1(rest) {
                         wants.push(a);
+                    }
+                } else if let Some(rest) = s.strip_prefix("shallow ") {
+                    if let Some(a) = parse_pkt_sha1(rest) {
+                        client_shallow.push(a);
                     }
                 } else if let Some(rest) = t.strip_prefix("deepen ") {
                     depth = rest.trim().parse::<usize>().ok();
@@ -1514,15 +1519,41 @@ where
     // immediately, before negotiation — the protocol requires it right after the
     // deepen. v1 targets the `--depth N` clone (haves ignored for the pack).
     if let Some(d) = depth {
-        let empty = std::collections::HashSet::new();
-        let (pack_objects, shallow) =
-            collect_shallow(&objects, sha1_store, &wants, &empty, d).await;
-        for s in &shallow {
-            stream
-                .write_all(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()))
-                .await
-                .map_err(LedgeError::Io)?;
-        }
+        // Fresh shallow clone (`--depth N`) vs deepening an EXISTING shallow clone
+        // (`--unshallow` / `--depth N` with `shallow` boundary lines) — same split
+        // as the HTTP path; the latter also emits `unshallow` boundary moves.
+        let pack_objects = if client_shallow.is_empty() {
+            let empty = std::collections::HashSet::new();
+            let (pack_objects, shallow) =
+                collect_shallow(&objects, sha1_store, &wants, &empty, d).await;
+            for s in &shallow {
+                stream
+                    .write_all(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()))
+                    .await
+                    .map_err(LedgeError::Io)?;
+            }
+            pack_objects
+        } else {
+            let boundaries: std::collections::HashSet<[u8; 20]> =
+                client_shallow.iter().copied().collect();
+            let (pack_objects, new_shallow, unshallow) =
+                collect_deepen(&objects, sha1_store, &wants, &boundaries, d).await;
+            for s in &new_shallow {
+                stream
+                    .write_all(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()))
+                    .await
+                    .map_err(LedgeError::Io)?;
+            }
+            for u in &unshallow {
+                stream
+                    .write_all(&encode(
+                        format!("unshallow {}\n", hex::encode(u)).as_bytes(),
+                    ))
+                    .await
+                    .map_err(LedgeError::Io)?;
+            }
+            pack_objects
+        };
         stream
             .write_all(&encode_flush())
             .await
@@ -1542,7 +1573,12 @@ where
             }
         }
         let pack = encode_pack(&pack_objects);
-        record_upload_pack("shallow", "ssh", pack_objects.len());
+        let kind = if client_shallow.is_empty() {
+            "shallow"
+        } else {
+            "deepen"
+        };
+        record_upload_pack(kind, "ssh", pack_objects.len());
         stream
             .write_all(&encode(b"NAK\n"))
             .await
