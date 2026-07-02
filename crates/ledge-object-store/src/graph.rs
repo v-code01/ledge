@@ -57,6 +57,25 @@ pub fn commit_parent_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
     parents
 }
 
+/// Extract the tagged `object` SHA-1 from a git annotated-tag object body.
+///
+/// A tag body is a header block (`key SP value LF` lines) whose first line is
+/// `object <40-hex-sha1>` naming the object it tags (usually a commit), followed
+/// by `type`/`tag`/`tagger` lines, a blank line, then the message. Returns the
+/// tagged object's SHA-1 so a walker follows a tag through to what it references.
+pub fn tag_object_sha1(content: &[u8]) -> Option<[u8; 20]> {
+    let text = std::str::from_utf8(content).ok()?;
+    for line in text.lines() {
+        if line.is_empty() {
+            break; // end of header block
+        }
+        if let Some(rest) = line.strip_prefix("object ") {
+            return parse_hex_sha1(rest.trim());
+        }
+    }
+    None
+}
+
 /// Extract all child SHA-1s referenced by a git tree object body.
 ///
 /// A tree body is a packed sequence of entries:
@@ -129,11 +148,9 @@ pub fn tree_entries(content: &[u8]) -> Vec<(Vec<u8>, [u8; 20])> {
 /// or `git_type_of` failure on an enqueued id is likewise skipped defensively so
 /// a torn/partial object can never panic a GC pass.
 ///
-/// **Tag simplification (Phase 2a):** tag objects are treated as **leaves**.
-/// An annotated tag could point at a commit, but no current Ledge path writes
-/// annotated-tag objects, and Phase 1 only advertises `refs/heads/*` /
-/// `refs/tags/*` whose targets we created directly. When annotated tags are
-/// introduced, add a `4 => parse tagged object id` arm here.
+/// **Annotated tags** (type 4) are followed to the object they tag (`object
+/// <sha1>`), so a commit reachable only via an annotated tag ref is correctly
+/// marked reachable — GC must not sweep a tagged commit, and a clone must pack it.
 ///
 /// Termination: the object set is finite and content-addressed (immutable), and
 /// `visited` dedups, so the BFS reaches a fixpoint and is cycle-safe and
@@ -180,7 +197,8 @@ pub async fn reachable_from(
                 v
             }
             2 => tree_child_sha1s(&content), // tree → children
-            _ => Vec::new(),                 // blob / tag → leaf (see doc note)
+            4 => tag_object_sha1(&content).into_iter().collect(), // annotated tag → tagged object
+            _ => Vec::new(),                 // blob → leaf
         };
 
         for sha1 in child_sha1s {
@@ -282,6 +300,37 @@ mod tests {
 
         let expected: HashSet<ObjectId> = [commit_id, tree_id, blob_id].into_iter().collect();
         assert_eq!(reachable, expected, "closure must be commit + tree + blob");
+    }
+
+    #[tokio::test]
+    async fn reachable_from_annotated_tag_includes_tagged_commit_closure() {
+        let (store, _dir) = make_store();
+        let (commit_id, tree_id, blob_id) = build_graph(&store).await;
+        let commit_sha1 = store.sha1_of(commit_id).await.unwrap();
+        // An annotated tag object referencing the commit (as `refs/tags/v1` would).
+        let tag_body = format!(
+            "object {}\ntype commit\ntag v1\ntagger t <t@x> 0 +0000\n\nrelease\n",
+            hex::encode(commit_sha1)
+        );
+        let tag_id = store
+            .write_git_object(4, Bytes::from(tag_body.into_bytes()))
+            .await
+            .unwrap();
+
+        // Rooting at the TAG must reach the commit + its tree + blob — otherwise GC
+        // would sweep a commit held only by an annotated tag (data loss).
+        let reachable = reachable_from(&store, [tag_id]).await.unwrap();
+        for (id, what) in [
+            (tag_id, "tag"),
+            (commit_id, "commit"),
+            (tree_id, "tree"),
+            (blob_id, "blob"),
+        ] {
+            assert!(
+                reachable.contains(&id),
+                "closure of an annotated tag must include the {what}"
+            );
+        }
     }
 
     #[tokio::test]

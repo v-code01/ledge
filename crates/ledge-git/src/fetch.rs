@@ -2,7 +2,9 @@ use crate::pkt_line::{decode_line, encode, encode_flush, PktLine};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ledge_core::{LedgeError, ObjectId, ObjectStore, RefStore};
-use ledge_object_store::graph::{commit_parent_sha1s, commit_tree_sha1, tree_child_sha1s};
+use ledge_object_store::graph::{
+    commit_parent_sha1s, commit_tree_sha1, tag_object_sha1, tree_child_sha1s,
+};
 use ledge_object_store::DiskObjectStore;
 use std::sync::Arc;
 
@@ -353,6 +355,11 @@ async fn reachable_closure(
                     queue.push_back(child);
                 }
             }
+            4 => {
+                if let Some(tagged) = tag_object_sha1(&content) {
+                    queue.push_back(tagged);
+                }
+            }
             _ => {}
         }
     }
@@ -508,6 +515,11 @@ async fn collect_pack_objects(
                     queue.push_back(child);
                 }
             }
+            4 => {
+                if let Some(tagged) = tag_object_sha1(&content) {
+                    queue.push_back(tagged);
+                }
+            }
             _ => {}
         }
         pack_objects.push((git_type, content));
@@ -586,8 +598,17 @@ async fn collect_shallow(
         };
         let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
         roots.push(sha);
+        if ty == 4 {
+            // Annotated tag: peel to the tagged object and depth-walk THAT (so the
+            // tagged commit + its bounded history are included); the tag object
+            // itself is packed via `roots`.
+            if let Some(target) = tag_object_sha1(&content) {
+                q.push_back((target, d));
+            }
+            continue;
+        }
         if ty != 1 {
-            continue; // a non-commit want (tag/tree/blob): just closure-walk it
+            continue; // a non-commit want (tree/blob): just closure-walk it
         }
         let parents = commit_parent_sha1s(&content);
         let live_parents: Vec<[u8; 20]> = parents
