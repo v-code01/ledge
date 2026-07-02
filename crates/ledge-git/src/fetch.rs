@@ -414,9 +414,20 @@ async fn authorize_wants(
     if unadvertised.is_empty() {
         return Ok(None); // fast path: a plain clone/fetch of advertised tips
     }
-    // Only now (an explicit non-tip want) do we pay for the reachability walk.
+    // Only an explicit non-tip want pays for the reachability closure — and that
+    // walk is memoized per (segment, tip-set), so repeated lazy fetches reuse it.
     let tip_vec: Vec<[u8; 20]> = tips.into_iter().collect();
-    let authorized = reachable_closure(objects, sha1_store, &tip_vec).await;
+    let key = upload_pack_cache_key(segment, &tip_vec);
+    let cache = global_reachability_cache();
+    let authorized = match cache.get(&key) {
+        Some(c) => c,
+        None => {
+            let closure =
+                std::sync::Arc::new(reachable_closure(objects, sha1_store, &tip_vec).await);
+            cache.put(key, closure.clone());
+            closure
+        }
+    };
     Ok(unadvertised.into_iter().find(|w| !authorized.contains(w)))
 }
 
@@ -1058,6 +1069,87 @@ pub fn upload_pack_cache_key(segment: &str, wanted_sha1s: &[[u8; 20]]) -> [u8; 3
 pub fn global_upload_cache() -> &'static UploadPackCache {
     static C: std::sync::OnceLock<UploadPackCache> = std::sync::OnceLock::new();
     C.get_or_init(|| UploadPackCache::new(32, 256 * 1024 * 1024))
+}
+
+/// A bounded LRU of reachable-closure SETS, keyed by the same `(segment, tip-set)`
+/// hash as [`UploadPackCache`]. It memoizes `authorize_wants`' reachability walk so
+/// repeated partial-clone lazy `want` fetches reuse one graph traversal instead of
+/// re-walking the whole segment per request.
+///
+/// Correctness is free from content-addressing: a fixed tip-set has a fixed
+/// reachable closure *forever* (a new object requires a new commit ⇒ a new tip ⇒
+/// a new key; a removed ref ⇒ a different tip-set ⇒ a different key), so a cached
+/// closure can never over-authorize a stale/foreign object.
+pub struct ReachabilityCache {
+    inner: std::sync::Mutex<ReachInner>,
+    max_entries: usize,
+    max_shas: usize,
+}
+struct ReachInner {
+    map: std::collections::HashMap<[u8; 32], std::sync::Arc<std::collections::HashSet<[u8; 20]>>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    shas: usize,
+    hits: u64,
+    misses: u64,
+}
+impl ReachabilityCache {
+    pub fn new(max_entries: usize, max_shas: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ReachInner {
+                map: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                shas: 0,
+                hits: 0,
+                misses: 0,
+            }),
+            max_entries,
+            max_shas,
+        }
+    }
+    pub fn hits(&self) -> u64 {
+        self.inner.lock().unwrap().hits
+    }
+    pub fn misses(&self) -> u64 {
+        self.inner.lock().unwrap().misses
+    }
+    fn get(&self, key: &[u8; 32]) -> Option<std::sync::Arc<std::collections::HashSet<[u8; 20]>>> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(v) = g.map.get(key).cloned() {
+            g.hits += 1;
+            g.order.retain(|k| k != key);
+            g.order.push_front(*key);
+            Some(v)
+        } else {
+            g.misses += 1;
+            None
+        }
+    }
+    fn put(&self, key: [u8; 32], val: std::sync::Arc<std::collections::HashSet<[u8; 20]>>) {
+        let mut g = self.inner.lock().unwrap();
+        if g.map.contains_key(&key) {
+            return;
+        }
+        g.shas += val.len();
+        g.order.push_front(key);
+        g.map.insert(key, val);
+        while g.order.len() > self.max_entries || g.shas > self.max_shas {
+            match g.order.pop_back() {
+                Some(old) => {
+                    if let Some(v) = g.map.remove(&old) {
+                        g.shas -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Process-global reachability cache the upload-pack authorization path shares.
+/// Bounded to ~160 MB of sha1s (8M × 20 B) across at most 64 hot segments.
+pub fn global_reachability_cache() -> &'static ReachabilityCache {
+    static C: std::sync::OnceLock<ReachabilityCache> = std::sync::OnceLock::new();
+    C.get_or_init(|| ReachabilityCache::new(64, 8_000_000))
 }
 
 // ── Stream transport (the interactive git protocol over SSH / git://) ─────────
@@ -1734,6 +1826,63 @@ mod tests {
         assert!(
             !denied.windows(4).any(|w| w == b"PACK"),
             "no pack is sent for an unauthorized want"
+        );
+    }
+
+    #[test]
+    fn reachability_cache_memoizes_and_evicts() {
+        let c = ReachabilityCache::new(2, 1000);
+        let set = |n: u8| std::sync::Arc::new(std::collections::HashSet::from([[n; 20]]));
+        let (k1, k2, k3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+
+        assert!(c.get(&k1).is_none()); // miss
+        c.put(k1, set(1));
+        assert!(c.get(&k1).is_some()); // hit (and moves k1 to front)
+        assert_eq!((c.hits(), c.misses()), (1, 1));
+
+        // max_entries = 2: inserting k2 then k3 evicts the LRU (k1).
+        c.put(k2, set(2));
+        c.put(k3, set(3));
+        assert!(c.get(&k1).is_none(), "k1 is the LRU and was evicted");
+        assert!(c.get(&k2).is_some());
+        assert!(c.get(&k3).is_some());
+    }
+
+    #[tokio::test]
+    async fn authorize_wants_reuses_cached_closure() {
+        let (objects, _base, child) = base_child_history().await;
+        let store = objects.clone() as Arc<dyn ledge_core::ObjectStore>;
+        let refs = refs_advertising(&objects, child).await as Arc<dyn ledge_core::RefStore>;
+
+        // A reachable, UNADVERTISED blob (drives the closure walk / cache path).
+        let idx = objects.sha1_index().await;
+        let tree_sha1 =
+            commit_tree_sha1(&store.read(*idx.get(&child).unwrap()).await.unwrap()).unwrap();
+        let blob_sha1 =
+            tree_child_sha1s(&store.read(*idx.get(&tree_sha1).unwrap()).await.unwrap())[0];
+
+        // Two identical lazy fetches: the second must reuse the cached closure, so
+        // the global reachability cache records at least one more hit than before.
+        let before = global_reachability_cache().hits();
+        for _ in 0..2 {
+            let r = handle_upload_pack(
+                fetch_body(&[blob_sha1], &[], true),
+                store.clone(),
+                refs.clone(),
+                objects.as_ref(),
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                r.windows(4).any(|w| w == b"PACK"),
+                "a reachable lazy fetch is served"
+            );
+        }
+        assert!(
+            global_reachability_cache().hits() > before,
+            "the second identical lazy fetch reused the memoized closure"
         );
     }
 
