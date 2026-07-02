@@ -106,6 +106,33 @@ Latest run — **16 PASS / 0 FAIL**
    leader, the reachable majority agrees on one leader (no split-brain), heals and
    reconverges, and the committed log never regresses.
 
+## Longevity / memory soak (`soak/longevity.sh`) — R-3
+
+Drives one Ledge node under steady, production-shaped churn — create a short-TTL
+workspace, clone, commit, push, drop it; let the expiry sweeper + GC reclaim it —
+while sampling process RSS, then reports the steady-state trend (warmup skipped).
+
+```sh
+bash soak/longevity.sh                              # bounded default (600s)
+SOAK_SECONDS=$((3*24*3600)) bash soak/longevity.sh  # R-3 proper: multi-day
+```
+
+**What a BOUNDED run can and cannot tell you.** Per-workspace *in-memory* state is
+freed on reclaim — the lease map entry is removed on tombstone
+(`ledge-workspace/src/lease.rs`), and workspace refs are deleted from the ART on
+release (`manager.rs`), which shrinks copy-on-write. But the lease/ref **WALs are
+append-only and only compact at 64 MiB**. A run that never reaches that threshold
+(e.g. the ~2,675-workspace / 6-min baseline in `results/2026-07-02-longevity.txt`,
+which grew ~12% then would keep climbing) captures the **pre-compaction rising
+edge** — that growth is expected and is *not* a leak. So the bounded run is a
+harness + baseline with a runaway safety-net (fails only on >50% growth); it
+cannot by itself prove no-leak.
+
+**R-3 proper** is the same script run for days: it crosses the 64 MiB compaction
+threshold repeatedly, so a healthy process shows a **sawtooth** (grow → compact →
+grow), not monotonic growth. Pair it with a heap profiler (RSS ≠ live heap;
+allocator retention/fragmentation inflates RSS without a leak) on a real host.
+
 ## Honest limitations (the single-host ceiling)
 
 - **One physical host.** Real processes, real container network, real clean
