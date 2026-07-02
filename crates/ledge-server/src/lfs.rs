@@ -8,10 +8,12 @@
 //! so a corrupt/mismatched object can never be stored.
 //!
 //! v1 scope: the `basic` transfer adapter (the default) for the durable-repo
-//! path (`/<repo>/info/lfs/…`). Objects are content-addressed and shared
-//! (dedup); access requires auth but is not per-object ACL'd — same model as the
-//! git object store. Locking, the SSH-discovery shortcut, and per-tenant LFS
-//! namespaces are follow-ons.
+//! path (`/<repo>/info/lfs/…`). Objects are **scoped to the caller's tenant**
+//! (audit R-4): the store roots at `<data_dir>/lfs/<tenant-segment>/`, so a
+//! tenant can only read/write LFS objects it stored — a leaked/guessed oid from
+//! another tenant simply isn't present in the caller's namespace (404). The root
+//! tenant keeps the flat `<data_dir>/lfs/` layout. Locking and the SSH-discovery
+//! shortcut are follow-ons.
 
 use std::path::{Path, PathBuf};
 
@@ -33,10 +35,24 @@ pub struct LfsStore {
 }
 
 impl LfsStore {
+    /// Store for the root tenant (flat `<data_dir>/lfs/`).
     pub fn at(data_dir: &Path) -> Self {
-        Self {
-            root: data_dir.join("lfs"),
+        Self::for_segment(data_dir, "")
+    }
+
+    /// Store scoped to a tenant `segment` (a [`ledge_core::tenant_prefix`]: `""`
+    /// for root → flat `lfs/`; `"tenants/<id>/"` → an isolated `lfs/tenants/<id>/`
+    /// subtree). This confinement is what makes an LFS object readable only by the
+    /// tenant that stored it. Only `Normal` path components of `segment` are
+    /// appended, so a stray `..`/absolute component can never escape the lfs root.
+    pub fn for_segment(data_dir: &Path, segment: &str) -> Self {
+        let mut root = data_dir.join("lfs");
+        for comp in Path::new(segment).components() {
+            if let std::path::Component::Normal(c) = comp {
+                root = root.join(c);
+            }
         }
+        Self { root }
     }
 
     /// `<root>/<oid[0:2]>/<oid[2:4]>/<oid>` — two-level fanout to avoid huge dirs.
@@ -160,10 +176,13 @@ pub async fn lfs_batch(
     State(state): State<AppState>,
     AxPath(repo): AxPath<String>,
     headers: HeaderMap,
-    _principal: crate::auth::Principal,
+    principal: crate::auth::Principal,
     Json(req): Json<BatchRequest>,
 ) -> Response {
-    let store = LfsStore::at(&state.data_dir);
+    let store = LfsStore::for_segment(
+        &state.data_dir,
+        &ledge_core::tenant_prefix(&principal.tenant_id),
+    );
     let base = base_url(&headers, &repo);
     let download = req.operation == "download";
 
@@ -233,10 +252,13 @@ pub async fn lfs_batch(
 pub async fn lfs_upload(
     State(state): State<AppState>,
     AxPath((_repo, oid)): AxPath<(String, String)>,
-    _principal: crate::auth::Principal,
+    principal: crate::auth::Principal,
     body: Bytes,
 ) -> Response {
-    let store = LfsStore::at(&state.data_dir);
+    let store = LfsStore::for_segment(
+        &state.data_dir,
+        &ledge_core::tenant_prefix(&principal.tenant_id),
+    );
     match store.put(&oid, &body, None) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
@@ -250,9 +272,12 @@ pub async fn lfs_upload(
 pub async fn lfs_download(
     State(state): State<AppState>,
     AxPath((_repo, oid)): AxPath<(String, String)>,
-    _principal: crate::auth::Principal,
+    principal: crate::auth::Principal,
 ) -> Response {
-    let store = LfsStore::at(&state.data_dir);
+    let store = LfsStore::for_segment(
+        &state.data_dir,
+        &ledge_core::tenant_prefix(&principal.tenant_id),
+    );
     match store.get(&oid) {
         Some(bytes) => (
             StatusCode::OK,
@@ -286,5 +311,133 @@ mod tests {
         // malformed oid rejected
         assert!(!store.has("xyz"));
         assert!(store.get("nothex").is_none());
+    }
+
+    #[test]
+    fn segments_isolate_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"tenant A large file";
+        let oid = hex::encode(Sha256::digest(data));
+
+        // "acme" stores it; "globex" and root must NOT see it.
+        let acme = LfsStore::for_segment(dir.path(), &ledge_core::tenant_prefix("acme"));
+        acme.put(&oid, data, None).unwrap();
+        assert!(acme.has(&oid), "acme sees its own object");
+        assert_eq!(acme.get(&oid).unwrap(), data);
+
+        let globex = LfsStore::for_segment(dir.path(), &ledge_core::tenant_prefix("globex"));
+        assert!(!globex.has(&oid), "globex cannot see acme's object");
+        assert!(globex.get(&oid).is_none());
+        assert!(
+            !LfsStore::at(dir.path()).has(&oid),
+            "root namespace is separate from a tenant's"
+        );
+
+        // Root back-compat: `at` == `for_segment("")`, flat lfs/ layout.
+        let d2 = tempfile::tempdir().unwrap();
+        LfsStore::at(d2.path()).put(&oid, data, None).unwrap();
+        assert!(LfsStore::for_segment(d2.path(), "").has(&oid));
+    }
+
+    #[test]
+    fn segment_cannot_escape_lfs_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile segment with traversal/absolute parts still resolves inside lfs/.
+        let s = LfsStore::for_segment(dir.path(), "../../etc/");
+        assert!(
+            s.root.starts_with(dir.path().join("lfs")),
+            "segment must stay under lfs/, got {:?}",
+            s.root
+        );
+    }
+
+    // ── Handler-level cross-tenant isolation ─────────────────────────────────────
+    use crate::routes::AppState;
+
+    async fn test_state(data_dir: std::path::PathBuf) -> AppState {
+        use ledge_core::{ObjectStore, RefStore, HLC};
+        use std::sync::Arc;
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(data_dir.clone()).unwrap());
+        let hlc = Arc::new(HLC::new());
+        let refs =
+            Arc::new(ledge_ref_store::RefStoreImpl::open(data_dir.clone(), hlc.clone()).unwrap());
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            data_dir.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc,
+            ledge_workspace::QuotaLimits::default(),
+            Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
+        AppState {
+            objects: objects.clone() as Arc<dyn ObjectStore>,
+            objects_disk: objects,
+            refs: refs as Arc<dyn RefStore>,
+            workspaces,
+            leases,
+            gc,
+            default_ttl_secs: 3600,
+            data_dir,
+            raft_shards: None,
+            cluster_refs: None,
+            cluster_objects: None,
+            webhooks: None,
+            sync: None,
+            shard_map: None,
+            cluster_gc: None,
+            auth: crate::auth::AuthCtx::disabled(),
+            quota: crate::quota::QuotaCtx::disabled(),
+        }
+    }
+
+    fn principal_for(tenant: &str) -> crate::auth::Principal {
+        let mut p = crate::auth::Principal::root();
+        p.tenant_id = tenant.into();
+        p
+    }
+
+    #[tokio::test]
+    async fn handler_isolates_lfs_by_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf()).await;
+        let data = Bytes::from_static(b"acme secret asset");
+        let oid = hex::encode(Sha256::digest(&data));
+
+        // acme uploads the object.
+        let up = lfs_upload(
+            State(state.clone()),
+            AxPath(("repo".into(), oid.clone())),
+            principal_for("acme"),
+            data.clone(),
+        )
+        .await;
+        assert_eq!(up.status(), StatusCode::OK);
+
+        // globex, knowing the oid, cannot download it → 404 (cross-tenant read denied).
+        let dl_globex = lfs_download(
+            State(state.clone()),
+            AxPath(("repo".into(), oid.clone())),
+            principal_for("globex"),
+        )
+        .await;
+        assert_eq!(
+            dl_globex.status(),
+            StatusCode::NOT_FOUND,
+            "a foreign tenant must not read acme's LFS object"
+        );
+
+        // acme downloads its own → 200 with the exact bytes.
+        let dl_acme = lfs_download(
+            State(state.clone()),
+            AxPath(("repo".into(), oid.clone())),
+            principal_for("acme"),
+        )
+        .await;
+        assert_eq!(dl_acme.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(dl_acme.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&got[..], &data[..]);
     }
 }

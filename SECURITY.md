@@ -57,10 +57,11 @@ These are honest, documented gaps — not undisclosed bugs:
   segment is refused with `ERR ... not our ref` — the same response as a
   nonexistent object, so there is no existence oracle. Isolation therefore no
   longer rests on ObjectId unguessability for git reads.
-  - **Remaining gap (LFS):** the Git-LFS download path is not yet segment-scoped —
-    an authenticated caller who knows an LFS oid can fetch it regardless of tenant.
-    Namespacing LFS by segment is the open follow-on; until then, treat LFS
-    objects as shared across tenants of one instance.
+  - **Git-LFS is tenant-scoped too:** LFS objects are stored under a per-tenant
+    root (`<data_dir>/lfs/tenants/<id>/`; root stays flat), so a caller can only
+    read/write LFS objects it stored — a leaked/guessed oid from another tenant is
+    simply absent from the caller's namespace (404). Cross-tenant LFS dedup is
+    traded away for this confinement.
 - **`root` is a superuser namespace.** Do not issue root-tenant keys to
   untrusted clients.
 - **Webhook SSRF is guarded by default.** Webhook URLs are tenant-controlled, so
