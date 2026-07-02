@@ -676,6 +676,171 @@ async fn collect_shallow(
     (pack_objects, shallow)
 }
 
+/// The objects a shallow client already holds for a boundary commit `B`: `B`
+/// itself plus its FULL tree closure (the trees + blobs of B's snapshot), but NOT
+/// B's ancestors — a shallow client does not have those. Used to exclude what the
+/// client keeps when deepening.
+async fn boundary_held_set(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    idx: &std::collections::HashMap<[u8; 20], ObjectId>,
+    boundary: [u8; 20],
+) -> std::collections::HashSet<[u8; 20]> {
+    let mut held = std::collections::HashSet::new();
+    held.insert(boundary);
+    let Some(oid) = idx.get(&boundary).copied() else {
+        return held;
+    };
+    let Ok(content) = objects.read(oid).await else {
+        return held;
+    };
+    let Some(tree) = commit_tree_sha1(&content) else {
+        return held; // not a commit (or malformed): only the object itself is held
+    };
+    let mut q = std::collections::VecDeque::from([tree]);
+    while let Some(sha) = q.pop_front() {
+        if !held.insert(sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(&sha).copied() else {
+            continue;
+        };
+        let Ok(c) = objects.read(oid).await else {
+            continue;
+        };
+        if sha1_store.git_type_of(oid).await.unwrap_or(3) == 2 {
+            for ch in tree_child_sha1s(&c) {
+                q.push_back(ch);
+            }
+        }
+    }
+    held
+}
+
+/// Deepen an EXISTING shallow clone (`git fetch --deepen N` / `--unshallow`).
+///
+/// The client sends `shallow <B>` for its current boundary commits plus `deepen
+/// <depth>` (a huge depth for `--unshallow`). We walk the commit graph from the
+/// wants to `depth`, following parents THROUGH the old boundaries (unlike a fresh
+/// shallow clone), and pack every newly-included commit's snapshot MINUS what the
+/// client already holds (each boundary's own tree closure). Returns
+/// `(pack_objects, new_shallow, unshallow)`:
+/// - `new_shallow` — commits at the new depth limit that still have live parents
+///   (the client stays shallow there);
+/// - `unshallow` — old boundaries whose parents we are now sending, so they are no
+///   longer shallow (git requires an `unshallow <sha>` line for each).
+async fn collect_deepen(
+    objects: &Arc<dyn ObjectStore>,
+    sha1_store: &dyn Sha1Provider,
+    wanted_sha1s: &[[u8; 20]],
+    client_shallow: &std::collections::HashSet<[u8; 20]>,
+    depth: usize,
+) -> (Vec<(u8, Bytes)>, Vec<[u8; 20]>, Vec<[u8; 20]>) {
+    let idx = sha1_store.sha1_index().await;
+    let depth = depth.max(1);
+
+    // Phase 1: commit-graph BFS to `depth`, following parents PAST client
+    // boundaries. Record every included commit, the NEW shallow boundary, and the
+    // old boundaries we walk past (→ `unshallow`).
+    let mut commit_seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    let mut roots: Vec<[u8; 20]> = Vec::new();
+    let mut new_shallow: Vec<[u8; 20]> = Vec::new();
+    let mut unshallow: Vec<[u8; 20]> = Vec::new();
+    let mut q: std::collections::VecDeque<([u8; 20], usize)> =
+        wanted_sha1s.iter().map(|w| (*w, 1usize)).collect();
+    while let Some((sha, d)) = q.pop_front() {
+        if !commit_seen.insert(sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(&sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        roots.push(sha);
+        if ty == 4 {
+            if let Some(target) = tag_object_sha1(&content) {
+                q.push_back((target, d)); // peel a tag to its commit
+            }
+            continue;
+        }
+        if ty != 1 {
+            continue; // a non-commit want: closure-walked in phase 2
+        }
+        let parents: Vec<[u8; 20]> = commit_parent_sha1s(&content)
+            .into_iter()
+            .filter(|p| idx.contains_key(p))
+            .collect();
+        if d < depth {
+            for p in &parents {
+                q.push_back((*p, d + 1));
+            }
+            if client_shallow.contains(&sha) {
+                unshallow.push(sha); // its parents are being sent → no longer shallow
+            }
+        } else if !parents.is_empty() {
+            new_shallow.push(sha); // the new (still-shallow) boundary
+        }
+    }
+
+    // Phase 2: pack each included commit's snapshot, EXCLUDING what the client
+    // already holds (its boundary snapshots), so a deepen sends only the new
+    // ancestors' objects.
+    let mut seen: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    for b in client_shallow {
+        seen.extend(boundary_held_set(objects, sha1_store, idx.as_ref(), *b).await);
+    }
+    let mut pack_objects: Vec<(u8, Bytes)> = Vec::new();
+    let mut tq: std::collections::VecDeque<[u8; 20]> = std::collections::VecDeque::new();
+    for sha in &roots {
+        if !seen.insert(*sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        match ty {
+            1 => {
+                if let Some(tree) = commit_tree_sha1(&content) {
+                    tq.push_back(tree);
+                }
+            }
+            2 => {
+                for c in tree_child_sha1s(&content) {
+                    tq.push_back(c);
+                }
+            }
+            _ => {}
+        }
+        pack_objects.push((ty, content));
+    }
+    while let Some(sha) = tq.pop_front() {
+        if !seen.insert(sha) {
+            continue;
+        }
+        let Some(oid) = idx.get(&sha).copied() else {
+            continue;
+        };
+        let Ok(content) = objects.read(oid).await else {
+            continue;
+        };
+        let ty = sha1_store.git_type_of(oid).await.unwrap_or(3);
+        if ty == 2 {
+            for c in tree_child_sha1s(&content) {
+                tq.push_back(c);
+            }
+        }
+        pack_objects.push((ty, content));
+    }
+    (pack_objects, new_shallow, unshallow)
+}
+
 /// Build the NAK-framed upload-pack response for a wanted SHA-1 set (a full
 /// clone: no `have` negotiation, the entire reachable closure). Pure in the
 /// (want-set, store content) — the same wants over the same objects always yield
@@ -759,6 +924,7 @@ pub async fn handle_upload_pack(
     let mut cursor: &[u8] = &body;
     let mut wanted_sha1s: Vec<[u8; 20]> = Vec::new();
     let mut have_sha1s: Vec<[u8; 20]> = Vec::new();
+    let mut client_shallow: Vec<[u8; 20]> = Vec::new();
     let mut done = false;
     let mut depth: Option<usize> = None;
     let mut filter = BlobFilter::All;
@@ -788,6 +954,11 @@ pub async fn handle_upload_pack(
                     if let Some(a) = parse_sha1(rest) {
                         have_sha1s.push(a);
                     }
+                } else if let Some(rest) = s.strip_prefix("shallow ") {
+                    // The client's CURRENT shallow boundary (deepen-with-shallow).
+                    if let Some(a) = parse_sha1(rest) {
+                        client_shallow.push(a);
+                    }
                 } else if let Some(rest) = t.strip_prefix("deepen ") {
                     depth = rest.trim().parse::<usize>().ok();
                 } else if let Some(rest) = t.strip_prefix("filter ") {
@@ -816,20 +987,47 @@ pub async fn handle_upload_pack(
     //    pack. Bypasses the want-set cache (depth-specific). v1 targets the
     //    `--depth N` CLONE (no haves); shallow deepen-with-haves is a follow-on. ─
     if let Some(d) = depth {
-        let empty = std::collections::HashSet::new();
-        let (pack_objects, shallow) =
-            collect_shallow(&objects, sha1_store, &wanted_sha1s, &empty, d).await;
         let mut resp = Vec::new();
-        for s in &shallow {
-            resp.extend_from_slice(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()));
-        }
+        // `shallow`-info first (shallow + unshallow boundary lines), then flush.
+        // The no-`done` PROBE round gets ONLY that; the `done` round additionally
+        // gets NAK + the pack.
+        let pack_objects = if client_shallow.is_empty() {
+            // Fresh shallow clone (`--depth N`): a depth-bounded pack from scratch.
+            let empty = std::collections::HashSet::new();
+            let (pack_objects, shallow) =
+                collect_shallow(&objects, sha1_store, &wanted_sha1s, &empty, d).await;
+            for s in &shallow {
+                resp.extend_from_slice(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()));
+            }
+            pack_objects
+        } else {
+            // Deepen an EXISTING shallow clone (`--deepen N` / `--unshallow`): walk
+            // through the client's boundary, emit `shallow`/`unshallow` boundary
+            // moves, and pack only the newly-included ancestors.
+            let boundaries: std::collections::HashSet<[u8; 20]> =
+                client_shallow.iter().copied().collect();
+            let (pack_objects, new_shallow, unshallow) =
+                collect_deepen(&objects, sha1_store, &wanted_sha1s, &boundaries, d).await;
+            for s in &new_shallow {
+                resp.extend_from_slice(&encode(format!("shallow {}\n", hex::encode(s)).as_bytes()));
+            }
+            for u in &unshallow {
+                resp.extend_from_slice(&encode(
+                    format!("unshallow {}\n", hex::encode(u)).as_bytes(),
+                ));
+            }
+            pack_objects
+        };
         resp.extend_from_slice(&encode_flush()); // end of shallow-info
-                                                 // The no-`done` probe round gets ONLY the shallow-info; the `done` round
-                                                 // additionally gets NAK + the depth-bounded pack.
         if done {
             resp.extend_from_slice(&encode(b"NAK\n"));
             resp.extend_from_slice(&encode_pack(&pack_objects));
-            record_upload_pack("shallow", "http", pack_objects.len());
+            let kind = if client_shallow.is_empty() {
+                "shallow"
+            } else {
+                "deepen"
+            };
+            record_upload_pack(kind, "http", pack_objects.len());
         }
         return Ok(resp);
     }

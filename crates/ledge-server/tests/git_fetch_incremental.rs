@@ -273,6 +273,42 @@ async fn shallow_clone_bounds_history() {
         .trim()
         .to_string();
     assert_eq!(n3, "3", "depth-3 clone has exactly three commits");
+
+    // BOUNDED deepen: grow the depth-3 clone to an absolute depth of 6. It gains
+    // three commits but stays shallow (a new boundary is advertised).
+    let d6 = git(&["fetch", "--depth", "6", "origin", "main"], &c3p).await;
+    assert!(
+        d6.status.success(),
+        "bounded deepen: {}",
+        String::from_utf8_lossy(&d6.stderr)
+    );
+    let n6 = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c3p).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(n6, "6", "bounded deepen grows the clone to depth 6");
+    assert!(
+        c3p.join(".git/shallow").exists(),
+        "clone stays shallow after a bounded deepen"
+    );
+
+    // PROBE: `git fetch --unshallow` on the depth-1 clone must recover all 8
+    // commits and drop the shallow marker (deepen-with-existing-shallow).
+    let uns = git(&["fetch", "--unshallow", "origin"], &c1p).await;
+    assert!(
+        uns.status.success(),
+        "unshallow: {}",
+        String::from_utf8_lossy(&uns.stderr)
+    );
+    let nu = String::from_utf8(git(&["rev-list", "--count", "HEAD"], &c1p).await.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(nu, "8", "unshallow recovers the full 8-commit history");
+    assert!(
+        !c1p.join(".git/shallow").exists(),
+        "clone is no longer shallow after --unshallow"
+    );
 }
 
 #[tokio::test]
