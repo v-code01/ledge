@@ -102,25 +102,35 @@ fn encode_frame(entry: &AuthWalEntry) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Decode one frame at `pos`; `None` on truncation / CRC mismatch / decode error
-/// (caller truncates the file at the last valid boundary).
-fn decode_frame(data: &[u8], pos: usize) -> Option<(AuthWalEntry, usize)> {
+/// Outcome of decoding one frame: a torn tail (interrupted write, safe to
+/// truncate) is kept distinct from in-place corruption (a fully-present frame
+/// with a bad CRC), which must fail loud rather than silently drop every valid
+/// frame after it.
+enum FrameDecode {
+    Entry(AuthWalEntry, usize),
+    Incomplete,
+    Corrupt(String),
+}
+
+/// Decode one frame at `pos`.
+fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
     if pos + HEADER_LEN > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // header torn by an interrupted write
     }
     let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
     let payload_end = pos + HEADER_LEN + length;
     if payload_end > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // payload short — torn tail
     }
     let payload = &data[pos + HEADER_LEN..payload_end];
     if crc32fast::hash(payload) != crc_stored {
-        return None;
+        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
     }
-    let (entry, _): (AuthWalEntry, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
-    Some((entry, payload_end))
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
+        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+    }
 }
 
 /// Durable, WAL-backed API-key store with an in-memory index. `file` is `None`
@@ -152,6 +162,12 @@ impl AuthStore {
             .open(&path)
             .map_err(LedgeError::Io)?;
 
+        // Persist the (possibly just-created) file's directory entry so a new WAL
+        // is durable before its first acked append. Best-effort; once per open.
+        if let Ok(dir_file) = std::fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+
         let mut data = Vec::new();
         file.read_to_end(&mut data).map_err(LedgeError::Io)?;
 
@@ -160,12 +176,24 @@ impl AuthStore {
         let mut last_valid = 0usize;
         while pos < data.len() {
             match decode_frame(&data, pos) {
-                Some((entry, new_pos)) => {
+                FrameDecode::Entry(entry, new_pos) => {
                     all.push(entry);
                     last_valid = new_pos;
                     pos = new_pos;
                 }
-                None => break,
+                // Torn tail: interrupted final write — truncate the partial bytes.
+                FrameDecode::Incomplete => break,
+                // In-place corruption (bit-rot): fail loud rather than silently
+                // dropping every key record after this point (which could drop a
+                // revocation, letting a revoked key authenticate again).
+                FrameDecode::Corrupt(why) => {
+                    return Err(LedgeError::Corruption(format!(
+                        "auth WAL {}: {why}; {} record(s) recovered before it. \
+                         Refusing to truncate — restore from a backup.",
+                        path.display(),
+                        all.len()
+                    )));
+                }
             }
         }
         if last_valid < data.len() {
@@ -223,6 +251,10 @@ impl AuthStore {
         let mut guard = self.file.lock().await;
         if let Some(file) = guard.as_mut() {
             file.write_all(&frame).map_err(LedgeError::Io)?;
+            // fsync before returning: an acked key create — or, more importantly,
+            // a REVOCATION — must survive power loss. A lost revocation would let
+            // a revoked key authenticate again after a restart.
+            file.sync_data().map_err(LedgeError::Io)?;
         }
         Ok(())
     }
@@ -372,6 +404,13 @@ impl AuthStore {
 
     /// Compact the WAL to a single `Checkpoint` holding only non-revoked keys,
     /// then truncate. No-op if in-memory. Mirrors `LeaseStore::compact`.
+    ///
+    /// Crash-atomic: the checkpoint is written to a sibling temp, fsynced, then
+    /// atomically renamed over the live WAL (parent dir fsynced) and the handle
+    /// reopened at EOF. An in-place `seek(0)+write+set_len` would tear frame 0 on
+    /// a crash, and open() now fails loud on a torn frame — losing every key.
+    /// (The pre-lock snapshot race is deferred to the shared ledge-wal extraction,
+    /// same as LeaseStore::compact.)
     pub async fn compact(&self) -> Result<()> {
         let keys: Vec<ApiKeyRecord> = {
             let idx = self.index.read().unwrap();
@@ -380,12 +419,36 @@ impl AuthStore {
         let frame = encode_frame(&AuthWalEntry::Checkpoint { keys })?;
         {
             let mut guard = self.file.lock().await;
-            if let Some(file) = guard.as_mut() {
-                file.seek(SeekFrom::Start(0)).map_err(LedgeError::Io)?;
-                file.write_all(&frame).map_err(LedgeError::Io)?;
-                file.set_len(frame.len() as u64).map_err(LedgeError::Io)?;
-                file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-                file.flush().map_err(LedgeError::Io)?;
+            if guard.is_some() {
+                let tmp_path = {
+                    let mut p = self.path.clone().into_os_string();
+                    p.push(".compact");
+                    PathBuf::from(p)
+                };
+                {
+                    let mut tmp = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&tmp_path)
+                        .map_err(LedgeError::Io)?;
+                    tmp.write_all(&frame).map_err(LedgeError::Io)?;
+                    tmp.sync_all().map_err(LedgeError::Io)?;
+                }
+                std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
+                if let Some(dir) = self.path.parent() {
+                    if let Ok(dir_file) = std::fs::File::open(dir) {
+                        let _ = dir_file.sync_all();
+                    }
+                }
+                let mut new_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&self.path)
+                    .map_err(LedgeError::Io)?;
+                new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+                *guard = Some(new_file);
             }
         }
         // Drop revoked keys from the index post-compaction (they are gone on disk).
@@ -624,6 +687,33 @@ mod tests {
             store.list().len() >= 4,
             "expected >= 4 survivors, got {}",
             store.list().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_corruption_fails_loud_not_silent() {
+        // Bit-rot in an early frame must fail open, not silently drop the key
+        // records after it — a dropped revocation would let a revoked key back in.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth").join("wal");
+        {
+            let store = AuthStore::open(dir.path().to_path_buf(), hlc()).unwrap();
+            for _ in 0..5 {
+                store
+                    .mint("t", PrincipalKind::User, rw_scopes(), None, 0)
+                    .await
+                    .unwrap();
+            }
+        }
+        {
+            // Byte 9 is inside the first frame's payload (header is bytes 0..8).
+            let mut data = std::fs::read(&path).unwrap();
+            data[9] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+        assert!(
+            AuthStore::open(dir.path().to_path_buf(), hlc()).is_err(),
+            "mid-stream corruption must fail open, not silently drop key records"
         );
     }
 
