@@ -289,6 +289,11 @@ impl StateMachineStore {
 
     /// Atomically write `bytes` to `path` via a sibling temp file + rename, so a
     /// reader (or a crash) never observes a partially-written file.
+    ///
+    /// The temp is fsynced before the rename (durable content) and the parent
+    /// directory is fsynced after it (durable rename): POSIX does not guarantee a
+    /// rename persists until the directory entry is synced, and losing the rename
+    /// after the covered log prefix is purged would lose committed state.
     fn atomic_write(path: &Path, bytes: &[u8]) -> ledge_core::Result<()> {
         use std::io::Write;
         let tmp = path.with_extension("tmp");
@@ -299,6 +304,13 @@ impl StateMachineStore {
             f.sync_all().map_err(ledge_core::LedgeError::Io)?;
         }
         std::fs::rename(&tmp, path).map_err(ledge_core::LedgeError::Io)?;
+        // Best-effort directory fsync so the rename itself is durable — some
+        // filesystems reject an fsync on a directory fd, which is not a data loss.
+        if let Some(dir) = path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
         Ok(())
     }
 
