@@ -16,10 +16,11 @@
 //! write and the file is truncated back to the last valid frame boundary.
 //!
 //! # Checkpoint compaction
-//! `compact()` atomically overwrites the entire file with a single
-//! `Checkpoint` frame and then positions the write cursor at the end so
-//! subsequent `append()` calls land after the checkpoint.  On the next
-//! `open()` only entries at or after the last checkpoint are replayed.
+//! `compact()` writes a single `Checkpoint` frame to a sibling temp file,
+//! fsyncs it, and atomically `rename`s it over the live WAL (then fsyncs the
+//! directory), so a crash leaves either the intact old WAL or the intact new
+//! checkpoint — never a torn frame at offset 0.  On the next `open()` only
+//! entries at or after the last checkpoint are replayed.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -192,24 +193,77 @@ impl Wal {
     }
 
     /// Compact the WAL by replacing all existing content with a single
-    /// `Checkpoint` frame containing `leaves`, then positioning the cursor
-    /// at EOF ready for subsequent appends.
+    /// `Checkpoint` frame containing `leaves`, then positioning the write
+    /// cursor at EOF ready for subsequent appends.
     ///
-    /// This is an atomic overwrite: the file is seeked to offset 0, the
-    /// checkpoint frame is written, and the file is truncated to exactly
-    /// the checkpoint frame length.  Any entries appended after this call
-    /// will follow the checkpoint in the file.
+    /// # Crash atomicity
+    /// The checkpoint is written to a sibling temp file, fsynced, and then
+    /// atomically `rename`d over the live WAL; the parent directory is fsynced
+    /// so the rename itself is durable. A crash at any instant therefore
+    /// leaves *either* the intact old WAL (full history) *or* the intact new
+    /// checkpoint on disk — never a torn frame at offset 0.
+    ///
+    /// An in-place overwrite (`seek(0); write; set_len`) cannot offer this: a
+    /// crash after the header but before the payload lands corrupts frame 0,
+    /// whose failed CRC on the next `open` truncates the file to empty and
+    /// loses every ref. That is the bug this method exists to avoid.
+    ///
+    /// After the rename the pre-existing file descriptor refers to the now
+    /// unlinked old inode, so the handle is reopened against the live path and
+    /// seeked to EOF; subsequent `append`s land after the checkpoint.
     ///
     /// # Errors
     /// Propagates encode or I/O errors.
     pub async fn compact(&self, leaves: Vec<(String, RefEntry)>) -> Result<()> {
         let frame = encode_frame(&WalEntry::Checkpoint { leaves })?;
+
+        // Sibling temp path: append ".compact" to the full filename so we never
+        // clobber a real extension (wal → wal.compact), keeping it in the same
+        // directory as the WAL so the rename is a same-filesystem atomic op.
+        let tmp_path = {
+            let mut p = self.path.clone().into_os_string();
+            p.push(".compact");
+            PathBuf::from(p)
+        };
+
+        // Hold the WAL lock across the whole swap so no append can interleave
+        // between the rename and the handle reopen (which would write into the
+        // unlinked old inode and be silently lost).
         let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(0)).map_err(LedgeError::Io)?;
-        file.write_all(&frame).map_err(LedgeError::Io)?;
-        file.set_len(frame.len() as u64).map_err(LedgeError::Io)?;
-        file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-        file.flush().map_err(LedgeError::Io)
+
+        {
+            let mut tmp = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(LedgeError::Io)?;
+            tmp.write_all(&frame).map_err(LedgeError::Io)?;
+            // Durable before the rename publishes it.
+            tmp.sync_all().map_err(LedgeError::Io)?;
+        }
+
+        std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
+
+        // POSIX: a rename is not guaranteed persisted until the parent
+        // directory entry is fsynced. Best-effort — some platforms/filesystems
+        // reject fsync on a directory fd; a failure there does not lose data.
+        if let Some(dir) = self.path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+
+        // Reopen against the live (post-rename) inode; the old fd is stale.
+        let mut new_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(LedgeError::Io)?;
+        new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+        *file = new_file;
+        Ok(())
     }
 
     /// Return the current on-disk byte size of the WAL file.
@@ -342,6 +396,69 @@ mod tests {
             }
             _ => panic!("expected Delete"),
         }
+    }
+
+    #[tokio::test]
+    async fn compact_leaves_no_temp_file() {
+        // After a successful compaction the sibling temp must be renamed away,
+        // not left behind as garbage.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let (wal, _) = Wal::open(path.clone()).unwrap();
+        wal.append(&WalEntry::Update {
+            name: "refs/heads/main".to_string(),
+            entry: make_entry(1, 1),
+        })
+        .await
+        .unwrap();
+        wal.compact(vec![("refs/heads/main".to_string(), make_entry(1, 1))])
+            .await
+            .unwrap();
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".compact");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "temp file must not survive a successful compaction"
+        );
+        // The reopened handle must still accept appends that recover cleanly.
+        wal.append(&WalEntry::Update {
+            name: "refs/heads/after".to_string(),
+            entry: make_entry(2, 2),
+        })
+        .await
+        .unwrap();
+        drop(wal);
+        let (_, entries) = Wal::open(path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[0], WalEntry::Checkpoint { .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_compact_temp_does_not_corrupt_live_wal() {
+        // Models a crash mid-compaction: a partial ".compact" temp is left on
+        // disk while the live WAL is still the pre-compaction file. Recovery
+        // must read the intact live WAL and ignore the orphaned temp entirely —
+        // this is the invariant the atomic rename buys us (no total ref loss).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let (wal, _) = Wal::open(path.clone()).unwrap();
+        for i in 0u8..3 {
+            wal.append(&WalEntry::Update {
+                name: format!("refs/heads/b{i}"),
+                entry: make_entry(i, i as u64 + 1),
+            })
+            .await
+            .unwrap();
+        }
+        drop(wal);
+        // Simulate the interrupted temp write.
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".compact");
+        std::fs::write(&tmp, b"\xde\xad\xbe\xef partial checkpoint").unwrap();
+
+        let (_, entries) = Wal::open(path.clone()).unwrap();
+        assert_eq!(entries.len(), 3, "live WAL must survive intact");
+        assert!(entries.iter().all(|e| matches!(e, WalEntry::Update { .. })));
     }
 
     #[tokio::test]
