@@ -253,6 +253,15 @@ impl WalLogStore {
             .open(&path)
             .map_err(|e| StorageIOError::write_logs(&io_err(format!("open WAL: {e}"))))?;
 
+        // Persist the WAL's directory entry: create(true) may have just created
+        // the file, and a rename/create is not durable until the parent dir is
+        // fsynced. Without this a crash could lose a newly-created log file whose
+        // first entries were already fsynced and acked. Best-effort (dir fsync is
+        // rejected on some filesystems); once per open, negligible cost.
+        if let Ok(dir_file) = std::fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+
         // Read the whole file; Raft logs are bounded by purge + (future) snapshot
         // compaction, so a full in-memory read is acceptable.
         let mut data = Vec::new();

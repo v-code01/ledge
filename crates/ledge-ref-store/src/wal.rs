@@ -160,6 +160,18 @@ impl Wal {
             .open(&path)
             .map_err(LedgeError::Io)?;
 
+        // Persist the file's own directory entry: create(true) may have just
+        // created the file, and POSIX does not guarantee that a new dir entry is
+        // durable until the parent directory is fsynced. Without this, the first
+        // append's fsync makes the DATA durable while the file itself could still
+        // vanish on power loss, losing an acked write. Once per open — negligible.
+        // Best-effort: some filesystems reject an fsync on a directory fd.
+        if let Some(dir) = path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+
         // Read the entire file into memory.  WALs are typically small (tens of
         // MiB at most before compaction kicks in).
         let mut data = Vec::new();
