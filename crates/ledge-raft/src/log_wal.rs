@@ -14,11 +14,13 @@
 //! | length: u32 LE | crc32: u32 LE | bincode payload (length bytes) |
 //! ```
 //!
-//! On open the file is read sequentially; any frame whose length extends past
-//! EOF or whose CRC mismatches is treated as a torn tail write and the file is
-//! truncated back to the last valid frame boundary. The CRC/truncation
-//! invariants are therefore identical to the already-proven ref-store WAL
-//! (`truncated_tail_recovery` / `crc32_corruption_detected`). We do **not**
+//! On open the file is read sequentially. A frame whose length extends past EOF
+//! is a torn tail (interrupted final write): the file is truncated back to the
+//! last valid boundary and the prefix recovers. A frame that is fully present
+//! but fails its CRC is in-place corruption (bit-rot), not a torn write, so
+//! `open` fails loud rather than truncating — silently dropping it would discard
+//! every valid record after it, i.e. lose committed Raft entries. These
+//! torn-tail / corruption invariants match the ref-store WAL. We do **not**
 //! depend on `ledge-ref-store::wal::Wal` directly — its `WalEntry` enum is
 //! ref-store-specific; instead this module owns a tiny generic frame codec with
 //! the same layout. (A shared `ledge-wal` crate is a deliberate Phase 3.1
@@ -98,29 +100,41 @@ fn encode_frame<T: Serialize>(rec: &T) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
-/// Attempt to decode one frame of type `T` from `data` starting at `pos`.
+/// Outcome of trying to decode one frame at `pos`.
 ///
-/// Returns `Some((rec, next_pos))` on success, `None` on any error (truncated
-/// header, truncated payload, CRC mismatch, decode error) — the caller truncates
-/// the backing file to the last valid boundary when `None` is returned.
-fn decode_frame<T: DeserializeOwned>(data: &[u8], pos: usize) -> Option<(T, usize)> {
+/// `Incomplete` vs `Corrupt` is what separates a benign torn-tail write from
+/// silent bit-rot: a torn write (interrupted append) is always short, so a frame
+/// that is *fully present* yet fails its CRC is in-place corruption. Silently
+/// dropping it would also discard every valid Raft record after it — for the
+/// authoritative log that means silently losing committed entries, a safety
+/// violation. So corruption must fail loud, not truncate.
+enum FrameDecode<T> {
+    Entry(T, usize),
+    Incomplete,
+    Corrupt(String),
+}
+
+/// Attempt to decode one frame of type `T` from `data` starting at `pos`.
+fn decode_frame<T: DeserializeOwned>(data: &[u8], pos: usize) -> FrameDecode<T> {
     if pos + HEADER_LEN > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // header torn by an interrupted write
     }
     // SAFETY: bounds checked above; the 4-byte slices make try_into infallible.
     let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
     let payload_end = pos + HEADER_LEN + length;
     if payload_end > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // payload short — torn tail
     }
     let payload = &data[pos + HEADER_LEN..payload_end];
     if crc32fast::hash(payload) != crc_stored {
-        return None;
+        // Full frame present, CRC fails → corruption, not an interrupted write.
+        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
     }
-    let (rec, _): (T, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
-    Some((rec, payload_end))
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((rec, _)) => FrameDecode::Entry(rec, payload_end),
+        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+    }
 }
 
 // ── Persisted record model ────────────────────────────────────────────────────
@@ -192,6 +206,9 @@ struct WalInner {
     committed: Option<LogId<u64>>,
     /// The WAL file, positioned at EOF for appends.
     file: std::fs::File,
+    /// Path to the WAL file, needed for the crash-atomic snapshot rewrite
+    /// (temp file + rename + reopen).
+    path: PathBuf,
 }
 
 impl WalInner {
@@ -254,12 +271,29 @@ impl WalLogStore {
         let mut recs: Vec<WalRec> = Vec::new();
         while pos < data.len() {
             match decode_frame::<WalRec>(&data, pos) {
-                Some((rec, new_pos)) => {
+                FrameDecode::Entry(rec, new_pos) => {
                     recs.push(rec);
                     last_valid = new_pos;
                     pos = new_pos;
                 }
-                None => break,
+                // Torn tail: the final append was interrupted. Stop and truncate
+                // the partial bytes below — openraft tolerates losing un-acked
+                // tail entries (they were never confirmed durable).
+                FrameDecode::Incomplete => break,
+                // A fully-written frame is corrupt (bit-rot). Refuse to open:
+                // silently truncating here would discard every valid record after
+                // it, which for the authoritative Raft log means silently dropping
+                // committed entries. Fail loud so the node recovers from a peer
+                // snapshot instead of serving a short, lossy log.
+                FrameDecode::Corrupt(why) => {
+                    return Err(StorageIOError::read_logs(&io_err(format!(
+                        "Raft log WAL {}: {why}; {} record(s) recovered before it. \
+                         Refusing to truncate — recover this node from a peer.",
+                        path.display(),
+                        recs.len()
+                    )))
+                    .into());
+                }
             }
         }
 
@@ -327,6 +361,7 @@ impl WalLogStore {
                 vote,
                 committed,
                 file,
+                path,
             })),
         })
     }
@@ -335,6 +370,16 @@ impl WalLogStore {
     /// state, discarding the historical record stream. Used for compaction; not
     /// yet wired to a size trigger (Phase 3 TODO — see module docs). Exposed for
     /// completeness and tested for correctness.
+    ///
+    /// # Crash atomicity
+    /// The snapshot is written to a sibling temp file, fsynced, then atomically
+    /// `rename`d over the live WAL (parent directory fsynced), so a crash leaves
+    /// either the intact old log or the intact new snapshot — never a torn frame
+    /// at offset 0. An in-place `seek(0); write; set_len` cannot offer this: a
+    /// crash after the header lands but before the payload does corrupts frame 0,
+    /// and on the next `open` that now fails loud, refusing to serve the log —
+    /// losing the entire Raft log for this node. After the rename the old fd
+    /// refers to the unlinked inode, so the handle is reopened at EOF.
     ///
     /// # Errors
     /// Propagates encode / I/O errors as `StorageError`.
@@ -357,26 +402,48 @@ impl WalLogStore {
             purged_bytes,
         };
         let frame = encode_frame(&rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
-        inner
-            .file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek 0: {e}"))))?;
-        inner
-            .file
-            .write_all(&frame)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("snapshot write: {e}"))))?;
-        inner
-            .file
-            .set_len(frame.len() as u64)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("snapshot set_len: {e}"))))?;
-        inner
-            .file
+
+        // Sibling temp path (append ".compact" to the full filename so we never
+        // clobber a real extension), in the same directory so the rename is a
+        // same-filesystem atomic op.
+        let tmp_path = {
+            let mut p = inner.path.clone().into_os_string();
+            p.push(".compact");
+            PathBuf::from(p)
+        };
+        {
+            let mut tmp = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|e| StorageIOError::write_logs(&io_err(format!("open temp: {e}"))))?;
+            tmp.write_all(&frame)
+                .map_err(|e| StorageIOError::write_logs(&io_err(format!("temp write: {e}"))))?;
+            tmp.sync_all()
+                .map_err(|e| StorageIOError::write_logs(&io_err(format!("temp fsync: {e}"))))?;
+        }
+        std::fs::rename(&tmp_path, &inner.path)
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("rename: {e}"))))?;
+        // POSIX: the rename is not durable until the parent directory is fsynced.
+        // Best-effort — some filesystems reject an fsync on a directory fd.
+        if let Some(dir) = inner.path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+        // The old fd now points at the unlinked pre-rename inode; reopen the live
+        // file and position at EOF so subsequent appends land after the snapshot.
+        let mut new_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&inner.path)
+            .map_err(|e| StorageIOError::write_logs(&io_err(format!("reopen: {e}"))))?;
+        new_file
             .seek(SeekFrom::End(0))
             .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek EOF: {e}"))))?;
-        inner
-            .file
-            .sync_data()
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("snapshot fsync: {e}"))))?;
+        inner.file = new_file;
         Ok(())
     }
 }
@@ -667,6 +734,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mid_stream_corruption_fails_loud_not_silent() {
+        // Bit-rot in an EARLY frame must not silently drop the committed records
+        // after it. Write several entries, flip a byte in the first, and require
+        // open() to error rather than return a truncated, lossy log.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft-log.wal");
+        {
+            let store = WalLogStore::open(dir.path().to_path_buf()).unwrap();
+            append_durable(&store, (1..=5).map(entry).collect()).await;
+        }
+        {
+            // Byte 9 is inside the first frame's payload (header is bytes 0..8).
+            let mut data = std::fs::read(&path).unwrap();
+            data[9] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+        assert!(
+            WalLogStore::open(dir.path().to_path_buf()).is_err(),
+            "mid-stream corruption must fail open, not silently drop committed records"
+        );
+    }
+
+    #[tokio::test]
     async fn rewrite_snapshot_compacts_and_replays() {
         let dir = tempdir().unwrap();
         let v = Vote::new(3, 1);
@@ -691,5 +781,45 @@ mod tests {
             got.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
             vec![3, 4, 5, 6]
         );
+    }
+
+    #[tokio::test]
+    async fn rewrite_snapshot_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft-log.wal");
+        let mut store = WalLogStore::open(dir.path().to_path_buf()).unwrap();
+        append_durable(&store, (1..=3).map(entry).collect()).await;
+        store.rewrite_snapshot().await.unwrap();
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".compact");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "temp file must not survive a successful rewrite"
+        );
+        // The reopened handle still appends + recovers cleanly.
+        append_durable(&store, vec![entry(4)]).await;
+        let got = store.try_get_log_entries(1..=4).await.unwrap();
+        assert_eq!(got.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_temp_does_not_corrupt_live_log() {
+        // Models a crash mid-rewrite: a partial ".compact" temp is left behind
+        // while the live WAL is still the pre-rewrite file. Recovery must read the
+        // intact live log and ignore the orphaned temp — the invariant the atomic
+        // rename buys (never a torn frame 0, never a lost log).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft-log.wal");
+        {
+            let store = WalLogStore::open(dir.path().to_path_buf()).unwrap();
+            append_durable(&store, (1..=3).map(entry).collect()).await;
+        }
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".compact");
+        std::fs::write(&tmp, b"\xde\xad\xbe\xef partial snapshot").unwrap();
+
+        let mut store = WalLogStore::open(dir.path().to_path_buf()).unwrap();
+        let got = store.try_get_log_entries(1..=3).await.unwrap();
+        assert_eq!(got.len(), 3, "live log must survive intact");
     }
 }
