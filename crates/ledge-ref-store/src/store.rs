@@ -121,6 +121,19 @@ impl RefStoreImpl {
                         root = art_delete(r, name.as_bytes(), 0);
                     }
                 }
+                WalEntry::Batch { updates } => {
+                    // Atomic multi-ref commit: apply every update in order. The
+                    // frame is present in full or not at all (length+CRC guard),
+                    // so this never applies a partial batch.
+                    for (name, ref_entry) in updates {
+                        root = Some(art_insert(
+                            root,
+                            name.as_bytes(),
+                            RefSlot::committed(ref_entry),
+                            0,
+                        ));
+                    }
+                }
             }
         }
 
@@ -742,19 +755,20 @@ impl RefStoreImpl {
                 .root
                 .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
             if Arc::ptr_eq(&prev, &current_arc) {
-                // One WAL frame per applied ref (the batch is logically one txn;
-                // recovery replays them in order to the same committed state).
-                for (name, entry) in &planned {
-                    if let Err(e) = self
-                        .wal
-                        .append(&WalEntry::Update {
-                            name: name.as_str().to_string(),
-                            entry: entry.clone(),
-                        })
-                        .await
-                    {
-                        warn!("commit_batch WAL append failed for {name:?}: {e:?}");
-                    }
+                // The batch was published to the store in one atomic CoW swap, so
+                // it must recover all-or-nothing. Persist it as a SINGLE WAL frame
+                // (not one frame per ref): a crash mid-write drops the whole frame
+                // on the length+CRC check, never a partial prefix of the batch.
+                let updates: Vec<(String, RefEntry)> = planned
+                    .iter()
+                    .map(|(name, entry)| (name.as_str().to_string(), entry.clone()))
+                    .collect();
+                if let Err(e) = self.wal.append(&WalEntry::Batch { updates }).await {
+                    // Post-swap durability failure. See H2 in the ref-store audit:
+                    // the store is now ahead of the WAL. Surfacing this cleanly
+                    // needs a fallible return; for now it is logged, not swallowed
+                    // silently, and left for the fail-fast follow-up.
+                    warn!("commit_batch WAL append failed: {e:?}");
                 }
                 return Ok(planned.into_iter().map(|(_, e)| e).collect());
             }
@@ -1156,6 +1170,53 @@ mod tests {
                     });
                 assert_eq!(got.target, oid(((w * PER_WRITER + k) % 251) as u8));
             }
+        }
+    }
+
+    /// A multi-ref batch is published atomically in memory, so it must recover
+    /// atomically too. Persisting it as one WAL frame guarantees that: a torn
+    /// tail write drops the entire batch on the length+CRC check, never a partial
+    /// prefix. Seed a ref, commit a 3-ref batch, shear a few bytes off the WAL
+    /// tail, reopen — the seed survives and none of the batch leaks. (The old
+    /// one-frame-per-ref encoding would leave the first two refs and drop only
+    /// the third, a partial batch.)
+    #[tokio::test]
+    async fn torn_batch_frame_recovers_all_or_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.keep();
+        let wal_path = path.join("refs").join("wal");
+        {
+            let store = RefStoreImpl::open(path.clone(), Arc::new(HLC::new())).unwrap();
+            store
+                .update(&name("refs/heads/seed"), oid(9), None)
+                .await
+                .unwrap();
+            let ops = vec![
+                (name("refs/heads/a"), oid(1), None, 100u64),
+                (name("refs/heads/b"), oid(2), None, 101u64),
+                (name("refs/heads/c"), oid(3), None, 102u64),
+            ];
+            store.commit_batch(ops).await.unwrap();
+        }
+        // Shear the last few bytes → the trailing batch frame is now torn.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            let len = f.metadata().unwrap().len();
+            f.set_len(len - 4).unwrap();
+        }
+        let store = RefStoreImpl::open(path, Arc::new(HLC::new())).unwrap();
+        assert!(
+            store.get(&name("refs/heads/seed")).await.unwrap().is_some(),
+            "the pre-batch ref must survive the torn tail"
+        );
+        for r in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+            assert!(
+                store.get(&name(r)).await.unwrap().is_none(),
+                "torn batch must recover all-or-nothing: {r} leaked"
+            );
         }
     }
 

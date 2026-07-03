@@ -90,6 +90,14 @@ pub enum WalEntry {
     /// time of compaction.  On recovery, only entries at or after the last
     /// checkpoint are replayed.
     Checkpoint { leaves: Vec<(String, RefEntry)> },
+    /// An atomic multi-ref commit: all `updates` were published to the store in
+    /// a single CoW swap, so they must recover all-or-nothing. Persisting them
+    /// as one frame gives that guarantee for free — the frame's length+CRC guard
+    /// means a torn tail write drops the whole batch, never a partial prefix.
+    ///
+    /// Appended as the last variant so bincode's enum discriminants for the
+    /// pre-existing variants are unchanged and older WAL files still replay.
+    Batch { updates: Vec<(String, RefEntry)> },
 }
 
 /// Append-only WAL backed by a single flat file.
