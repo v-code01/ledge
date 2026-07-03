@@ -111,6 +111,11 @@ pub struct Wal {
     file: Mutex<std::fs::File>,
     /// Path to the WAL file on disk (used by `file_size_bytes`).
     pub path: PathBuf,
+    /// Test-only fault injection: when set, the next `append` returns an I/O
+    /// error without writing, so durability-failure paths can be exercised
+    /// deterministically. Compiled out of non-test builds.
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 impl Wal {
@@ -180,9 +185,20 @@ impl Wal {
             Wal {
                 file: Mutex::new(file),
                 path,
+                #[cfg(test)]
+                fail_next_append: std::sync::atomic::AtomicBool::new(false),
             },
             replay,
         ))
+    }
+
+    /// Test-only: arm a one-shot failure so the next `append` returns an I/O
+    /// error without writing. Used to drive `CommitBatchError::NotDurable` and
+    /// the swallow/propagate paths deterministically.
+    #[cfg(test)]
+    pub fn fail_next_append(&self) {
+        self.fail_next_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Append a single `WalEntry` to the WAL and fsync it before returning.
@@ -203,6 +219,15 @@ impl Wal {
     /// Propagates bincode encode errors as `LedgeError::Corruption` and OS
     /// write / sync errors as `LedgeError::Io`.
     pub async fn append(&self, entry: &WalEntry) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_append
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LedgeError::Io(std::io::Error::other(
+                "injected WAL append failure",
+            )));
+        }
         let frame = encode_frame(entry)?;
         let mut file = self.file.lock().await;
         file.write_all(&frame).map_err(LedgeError::Io)?;

@@ -179,6 +179,14 @@ impl RefStoreImpl {
             .await
     }
 
+    /// Test-only: arm a one-shot WAL append failure (delegates to the WAL) so
+    /// durability-failure paths — `CommitBatchError::NotDurable`, single-node
+    /// propagation — can be driven deterministically from any in-crate test.
+    #[cfg(test)]
+    pub(crate) fn fail_next_wal_append(&self) {
+        self.wal.fail_next_append();
+    }
+
     /// Replace the entire ref set with exact entries (target, hlc, version
     /// preserved). Used by Raft snapshot install — versions must NOT be reset.
     /// Rebuilds the ART atomically (`ArcSwap`) and writes a WAL `Checkpoint` of
@@ -326,6 +334,30 @@ pub enum AppliedOutcome {
     AbortedPrepared,
 }
 
+/// Why a [`RefStoreImpl::commit_batch`] did not return a clean, durable `Ok`.
+#[derive(Debug)]
+pub enum CommitBatchError {
+    /// One or more CAS/lock preconditions failed; NO ref advanced. Carries each
+    /// blocking `(name, current_committed)` pair (a `version == 0` sentinel means
+    /// the ref was absent for an update-with-`expected`).
+    Conflicts(Vec<(RefName, RefEntry)>),
+    /// The batch WAS published to the in-memory store (one atomic CoW swap) but
+    /// its WAL frame failed to persist, so it is not durable on this node.
+    ///
+    /// `applied` holds the new committed entries in input order; `source` is the
+    /// underlying I/O error. Two caller modes handle it differently:
+    /// - single-node (the ref-WAL is the only durability layer): propagate
+    ///   `source` and refuse to ack — the client must not believe a lost write
+    ///   succeeded;
+    /// - Raft-backed (the replicated log is authoritative and re-applies this
+    ///   entry on restart, rebuilding the materialized ref-WAL): surface the
+    ///   `applied` outcomes and log the failure — no data is lost.
+    NotDurable {
+        applied: Vec<RefEntry>,
+        source: LedgeError,
+    },
+}
+
 impl RefStoreImpl {
     /// Deterministically apply a pre-resolved op using the supplied `hlc`
     /// (no internal `hlc.tick()`).
@@ -396,10 +428,15 @@ impl RefStoreImpl {
                         .root
                         .compare_and_swap(&current_arc, Arc::clone(&new_root_arc));
                     if Arc::ptr_eq(&prev, &current_arc) {
-                        // WAL append; on I/O failure, log and still return the
-                        // logical outcome — the replicated apply must be
-                        // deterministic regardless of local disk transients
-                        // (Task 6 hardens durable-log fsync ordering).
+                        // apply_op is the REPLICATED path: it runs only on entries
+                        // already committed to the Raft log, which is authoritative
+                        // and re-applies this entry on restart to rebuild the
+                        // materialized ref-WAL. So a local WAL write failure loses
+                        // no data — log it and still return the deterministic
+                        // outcome (apply must be deterministic and total). This is
+                        // the same reasoning as CommitBatchError::NotDurable on the
+                        // Raft side; the single-node paths (update/delete/
+                        // commit_batch) instead surface the error to the caller.
                         if let Err(e) = self
                             .wal
                             .append(&WalEntry::Update {
@@ -659,17 +696,21 @@ impl RefStoreImpl {
     /// retries.
     ///
     /// # Returns
-    /// - `Ok(applied)`: `applied[i]` is the new committed entry for `ops[i]`.
-    /// - `Err(conflicts)`: `(name, current_committed)` for each failing ref; no
-    ///   ref advanced. An update-with-`expected` on an absent ref reports a
-    ///   `version == 0` sentinel current entry.
+    /// - `Ok(applied)`: `applied[i]` is the new committed entry for `ops[i]`,
+    ///   durably persisted.
+    /// - `Err(CommitBatchError::Conflicts)`: `(name, current_committed)` for each
+    ///   failing ref; no ref advanced. An update-with-`expected` on an absent ref
+    ///   reports a `version == 0` sentinel current entry.
+    /// - `Err(CommitBatchError::NotDurable)`: the batch was published in memory
+    ///   but its WAL write failed — see the type docs for how each caller mode
+    ///   handles it.
     ///
     /// # Complexity
     /// O(B·k) per attempt for B ops of key length k (B inserts on the CoW path).
     pub async fn commit_batch(
         &self,
         ops: Vec<(RefName, ObjectId, Option<ObjectId>, u64)>,
-    ) -> std::result::Result<Vec<RefEntry>, Vec<(RefName, RefEntry)>> {
+    ) -> std::result::Result<Vec<RefEntry>, CommitBatchError> {
         loop {
             let current_arc = self.root.load_full();
             let current_root = current_arc.as_ref();
@@ -735,7 +776,7 @@ impl RefStoreImpl {
 
             // All-or-nothing: any conflict ⇒ apply none.
             if !conflicts.is_empty() {
-                return Err(conflicts);
+                return Err(CommitBatchError::Conflicts(conflicts));
             }
 
             // Phase 2: build the new root by inserting every planned RefSlot.
@@ -763,14 +804,16 @@ impl RefStoreImpl {
                     .iter()
                     .map(|(name, entry)| (name.as_str().to_string(), entry.clone()))
                     .collect();
-                if let Err(e) = self.wal.append(&WalEntry::Batch { updates }).await {
-                    // Post-swap durability failure. See H2 in the ref-store audit:
-                    // the store is now ahead of the WAL. Surfacing this cleanly
-                    // needs a fallible return; for now it is logged, not swallowed
-                    // silently, and left for the fail-fast follow-up.
-                    warn!("commit_batch WAL append failed: {e:?}");
+                let applied: Vec<RefEntry> = planned.into_iter().map(|(_, e)| e).collect();
+                if let Err(source) = self.wal.append(&WalEntry::Batch { updates }).await {
+                    // The batch is already published in memory (CAS done) but its
+                    // WAL frame did not persist. Do NOT silently ack: hand the
+                    // applied entries AND the I/O error back so the caller decides
+                    // per its durability model (single-node: refuse the ack; Raft:
+                    // the log is authoritative and replays this entry on restart).
+                    return Err(CommitBatchError::NotDurable { applied, source });
                 }
-                return Ok(planned.into_iter().map(|(_, e)| e).collect());
+                return Ok(applied);
             }
             // CAS lost to a concurrent writer — restart full evaluation.
         }
@@ -1934,7 +1977,10 @@ mod tests {
                 (b.clone(), oid(3), Some(oid(9)), 100), // stale → conflict
             ])
             .await;
-        let conflicts = res.expect_err("one stale precondition aborts the batch");
+        let conflicts = match res.expect_err("one stale precondition aborts the batch") {
+            CommitBatchError::Conflicts(c) => c,
+            CommitBatchError::NotDurable { .. } => panic!("expected conflicts, not a WAL error"),
+        };
         assert!(
             conflicts
                 .iter()
@@ -1953,6 +1999,40 @@ mod tests {
             "b untouched"
         );
         assert_eq!(store.get(&a).await.unwrap().unwrap().version, 1);
+    }
+
+    /// A WAL write failure during commit_batch must NOT be swallowed: the batch
+    /// is published in memory (CAS done) but the store returns NotDurable, handing
+    /// back the applied entries (for a log-authoritative caller) and the I/O error
+    /// (so a single-node caller can refuse to ack).
+    #[tokio::test]
+    async fn commit_batch_wal_failure_reports_not_durable() {
+        let store = make_store();
+        store.fail_next_wal_append();
+        let res = store
+            .commit_batch(vec![
+                (name("refs/heads/x"), oid(1), None, 100),
+                (name("refs/heads/y"), oid(2), None, 101),
+            ])
+            .await;
+        match res {
+            Err(CommitBatchError::NotDurable { applied, source: _ }) => {
+                assert_eq!(applied.len(), 2, "applied entries handed back in order");
+                assert_eq!(applied[0].target, oid(1));
+                assert_eq!(applied[1].target, oid(2));
+            }
+            other => panic!("expected NotDurable, got {other:?}"),
+        }
+        // The in-memory CAS did publish — durability, not application, is what failed.
+        assert_eq!(
+            store
+                .get(&name("refs/heads/x"))
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            oid(1)
+        );
     }
 
     // ── commit_batch: a locked ref in the batch → conflict, none applied ──────

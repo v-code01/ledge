@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use ledge_core::{ObjectId, RefEntry, RefName, Result};
 
-use crate::store::RefStoreImpl;
+use crate::store::{CommitBatchError, RefStoreImpl};
 
 /// One ref to promote: durable name, target to install, CAS precondition
 /// (`None` ⇒ create-only / the ref must currently be absent).
@@ -97,13 +97,18 @@ impl AtomicCommit for LocalAtomicCommit {
             }
             // Any precondition failed ⇒ no ref advanced. `conflicts` carries the
             // failing `(name, current_committed)` pairs.
-            Err(conflicts) => {
+            Err(CommitBatchError::Conflicts(conflicts)) => {
                 let names: Vec<RefName> = conflicts.into_iter().map(|(name, _)| name).collect();
                 Ok(AtomicCommitResult::Aborted {
                     reason: format!("{} ref precondition(s) failed", names.len()),
                     conflicts: names,
                 })
             }
+            // The batch applied in memory but did not persist. On a single node
+            // the ref-WAL is the only durability layer, so refuse to ack the
+            // commit: propagate the I/O error rather than tell the client a write
+            // that can vanish on restart succeeded.
+            Err(CommitBatchError::NotDurable { source, .. }) => Err(source),
         }
     }
 }
@@ -167,5 +172,25 @@ mod tests {
         // Atomicity: neither ref advanced.
         assert_eq!(store.get(&a).await.unwrap().unwrap().target, oid(1));
         assert_eq!(store.get(&b).await.unwrap().unwrap().target, oid(2));
+    }
+
+    /// On a single node the ref-WAL is the only durability layer, so a WAL write
+    /// failure must surface as an error — never a false "Committed". The batch is
+    /// visible in memory, but the client is told the commit did not durably land.
+    #[tokio::test]
+    async fn local_atomic_commit_propagates_wal_failure() {
+        let dir = TempDir::new().unwrap();
+        let hlc = Arc::new(HLC::new());
+        let store = Arc::new(RefStoreImpl::open(dir.path().join("refs"), hlc).unwrap());
+        let lac = LocalAtomicCommit::new(store.clone());
+
+        store.fail_next_wal_append();
+        let res = lac
+            .commit_atomic(vec![(RefName::new("refs/heads/z").unwrap(), oid(5), None)])
+            .await;
+        assert!(
+            res.is_err(),
+            "a non-durable commit must not be acked as Committed"
+        );
     }
 }

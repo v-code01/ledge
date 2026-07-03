@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ledge_core::{RefEntry, RefName, TxnId, HLC};
-use ledge_ref_store::{AppliedOutcome, RefStoreImpl};
+use ledge_ref_store::{AppliedOutcome, CommitBatchError, RefStoreImpl};
 use ledge_workspace::id::WorkspaceId;
 use ledge_workspace::lease::{Lease, LeaseStore};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -479,12 +479,24 @@ impl StateMachineStore {
                 let outcomes = match refs.commit_batch(inputs).await {
                     // All applied: results are in input order, each a new committed entry.
                     Ok(applied) => applied.into_iter().map(BatchOutcome::Ok).collect(),
+                    // The batch applied in memory but its ref-WAL frame did not
+                    // persist. The Raft log is authoritative and re-applies this
+                    // committed entry on restart, rebuilding the ref-WAL, so no
+                    // data is lost — surface the applied outcomes and warn. (A
+                    // panic here would fail-stop the node for a self-healing fault.)
+                    Err(CommitBatchError::NotDurable { applied, source }) => {
+                        tracing::warn!(
+                            error = ?source,
+                            "ref-WAL batch write failed during apply; Raft log replay will rebuild it"
+                        );
+                        applied.into_iter().map(BatchOutcome::Ok).collect()
+                    }
                     // Atomic failure: NO ref advanced. `conflicts` lists only the
                     // refs whose CAS/lock blocked the batch; build a name→entry map
                     // and align every input op against it. A non-conflicting op
                     // still did not apply, so its outcome reports the current
                     // committed entry (or a version-0 sentinel if absent).
-                    Err(conflicts) => {
+                    Err(CommitBatchError::Conflicts(conflicts)) => {
                         use std::collections::HashMap;
                         let by_name: HashMap<String, RefEntry> = conflicts
                             .into_iter()
