@@ -68,25 +68,35 @@ fn encode_frame(entry: &LeaseWalEntry) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Attempt to decode one frame from `data` at `pos`. `None` on any
-/// truncation / CRC mismatch / decode error (caller truncates the file).
-fn decode_frame(data: &[u8], pos: usize) -> Option<(LeaseWalEntry, usize)> {
+/// Outcome of decoding one frame: a torn tail (interrupted write, safe to
+/// truncate) is kept distinct from in-place corruption (a fully-present frame
+/// with a bad CRC), which must fail loud rather than silently drop every valid
+/// frame after it.
+enum FrameDecode {
+    Entry(LeaseWalEntry, usize),
+    Incomplete,
+    Corrupt(String),
+}
+
+/// Attempt to decode one frame from `data` at `pos`.
+fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
     if pos + HEADER_LEN > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // header torn by an interrupted write
     }
     let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
     let payload_end = pos + HEADER_LEN + length;
     if payload_end > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // payload short — torn tail
     }
     let payload = &data[pos + HEADER_LEN..payload_end];
     if crc32fast::hash(payload) != crc_stored {
-        return None;
+        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
     }
-    let (entry, _): (LeaseWalEntry, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
-    Some((entry, payload_end))
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
+        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+    }
 }
 
 /// Durable, WAL-backed store of workspace leases with an in-memory live index.
@@ -117,6 +127,12 @@ impl LeaseStore {
             .open(&path)
             .map_err(LedgeError::Io)?;
 
+        // Persist the (possibly just-created) file's directory entry so a new WAL
+        // is durable before its first acked append. Best-effort; once per open.
+        if let Ok(dir_file) = std::fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+
         let mut data = Vec::new();
         file.read_to_end(&mut data).map_err(LedgeError::Io)?;
 
@@ -126,12 +142,23 @@ impl LeaseStore {
         let mut last_valid = 0usize;
         while pos < data.len() {
             match decode_frame(&data, pos) {
-                Some((entry, new_pos)) => {
+                FrameDecode::Entry(entry, new_pos) => {
                     all.push(entry);
                     last_valid = new_pos;
                     pos = new_pos;
                 }
-                None => break,
+                // Torn tail: interrupted final write — truncate the partial bytes.
+                FrameDecode::Incomplete => break,
+                // In-place corruption (bit-rot): failing loud beats silently
+                // discarding every valid lease record after this point.
+                FrameDecode::Corrupt(why) => {
+                    return Err(LedgeError::Corruption(format!(
+                        "lease WAL {}: {why}; {} record(s) recovered before it. \
+                         Refusing to truncate — restore from a backup.",
+                        path.display(),
+                        all.len()
+                    )));
+                }
             }
         }
         if last_valid < data.len() {
@@ -176,6 +203,9 @@ impl LeaseStore {
         {
             let mut file = self.file.lock().await;
             file.write_all(&frame).map_err(LedgeError::Io)?;
+            // fsync before returning: an acked lease must survive power loss, not
+            // just a process crash (write_all leaves the frame in the page cache).
+            file.sync_data().map_err(LedgeError::Io)?;
         }
         self.index.write().unwrap().insert(lease.id, lease);
         Ok(())
@@ -207,6 +237,9 @@ impl LeaseStore {
         {
             let mut file = self.file.lock().await;
             file.write_all(&frame).map_err(LedgeError::Io)?;
+            // fsync before returning: a tombstone that is acked but lost on power
+            // loss would resurrect a released lease on restart.
+            file.sync_data().map_err(LedgeError::Io)?;
         }
         self.index.write().unwrap().remove(&id);
         Ok(())
@@ -258,22 +291,58 @@ impl LeaseStore {
             .collect())
     }
 
-    /// Compact the WAL: overwrite it with a single `Checkpoint` frame holding
-    /// every live lease, then truncate to exactly that frame and seek to EOF
-    /// for subsequent appends. Mirrors `Wal::compact`. The live snapshot is
-    /// taken from the in-memory index (tombstoned ids are already absent).
+    /// Compact the WAL: replace it with a single `Checkpoint` frame holding every
+    /// live lease. The live snapshot is taken from the in-memory index
+    /// (tombstoned ids are already absent).
+    ///
+    /// Crash-atomic: the checkpoint is written to a sibling temp file, fsynced,
+    /// atomically renamed over the live WAL (parent dir fsynced), then the handle
+    /// is reopened at EOF. An in-place `seek(0)+write+set_len` would tear frame 0
+    /// on a crash, and open() now fails loud on a torn frame — losing every lease.
+    ///
+    /// NOTE: the checkpoint snapshot is still taken before the file lock, so a
+    /// concurrent `put`/`tombstone` racing this compaction can be lost (the
+    /// LeaseStore analogue of the ref-store compaction/append race). Closing that
+    /// belongs with the shared `ledge-wal` extraction that will de-duplicate the
+    /// five WAL copies; this fix removes the far more severe whole-file-loss risk.
     pub async fn compact(&self) -> Result<()> {
         let leases: Vec<Lease> = {
             let idx = self.index.read().unwrap();
             idx.values().cloned().collect()
         };
         let frame = encode_frame(&LeaseWalEntry::Checkpoint { leases })?;
+
+        let tmp_path = {
+            let mut p = self.path.clone().into_os_string();
+            p.push(".compact");
+            PathBuf::from(p)
+        };
         let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(0)).map_err(LedgeError::Io)?;
-        file.write_all(&frame).map_err(LedgeError::Io)?;
-        file.set_len(frame.len() as u64).map_err(LedgeError::Io)?;
-        file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-        file.flush().map_err(LedgeError::Io)
+        {
+            let mut tmp = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(LedgeError::Io)?;
+            tmp.write_all(&frame).map_err(LedgeError::Io)?;
+            tmp.sync_all().map_err(LedgeError::Io)?;
+        }
+        std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
+        if let Some(dir) = self.path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+        let mut new_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(LedgeError::Io)?;
+        new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+        *file = new_file;
+        Ok(())
     }
 
     /// Path to the backing WAL file. Useful for diagnostics and future
@@ -537,6 +606,34 @@ mod tests {
             }
         }
         assert!(surviving >= 4, "expected >= 4 survivors, got {surviving}");
+    }
+
+    #[tokio::test]
+    async fn mid_stream_corruption_fails_loud_not_silent() {
+        // Bit-rot in an early frame must fail open, not silently drop the leases
+        // after it (which would let GC reclaim live workspaces).
+        let h = hlc();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("leases").join("wal");
+        {
+            let store = LeaseStore::open(dir.path().to_path_buf(), h.clone()).unwrap();
+            for _ in 0..5 {
+                store
+                    .put(lease(WorkspaceId::generate(&h), now_ms() + 10_000))
+                    .await
+                    .unwrap();
+            }
+        }
+        {
+            // Byte 9 is inside the first frame's payload (header is bytes 0..8).
+            let mut data = std::fs::read(&path).unwrap();
+            data[9] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+        assert!(
+            LeaseStore::open(dir.path().to_path_buf(), h).is_err(),
+            "mid-stream corruption must fail open, not silently drop leases"
+        );
     }
 
     #[tokio::test]
