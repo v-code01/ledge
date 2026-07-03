@@ -215,7 +215,35 @@ impl Wal {
     /// # Errors
     /// Propagates encode or I/O errors.
     pub async fn compact(&self, leaves: Vec<(String, RefEntry)>) -> Result<()> {
-        let frame = encode_frame(&WalEntry::Checkpoint { leaves })?;
+        self.compact_with(move || leaves).await
+    }
+
+    /// Like [`compact`], but the checkpoint payload is produced by `snapshot`
+    /// **while the WAL lock is held**, closing a compaction/append race.
+    ///
+    /// Whole-file compaction discards every frame not in the checkpoint. If the
+    /// payload were snapshotted before the lock (as a plain `compact(leaves)`
+    /// caller must), a writer could `append` a new ref into that window and
+    /// have its frame erased by the replacement — the ref survives in memory
+    /// but is lost on the next `open()`. Taking the snapshot under the lock
+    /// removes the window: a writer whose `append` has not completed is blocked
+    /// behind this lock and lands *after* the new checkpoint, while a writer
+    /// that already appended has, by the store's append-after-publish ordering,
+    /// already made its ref visible to `snapshot`. Either way nothing is lost.
+    ///
+    /// `snapshot` runs synchronously under the lock (an O(refs) walk), briefly
+    /// stalling appends for its duration — acceptable since compaction is rare.
+    ///
+    /// # Errors
+    /// Propagates encode or I/O errors.
+    pub async fn compact_with<F>(&self, snapshot: F) -> Result<()>
+    where
+        F: FnOnce() -> Vec<(String, RefEntry)>,
+    {
+        // Hold the WAL lock across snapshot → write → rename → reopen so no
+        // append can interleave (see the race analysis above).
+        let mut file = self.file.lock().await;
+        let frame = encode_frame(&WalEntry::Checkpoint { leaves: snapshot() })?;
 
         // Sibling temp path: append ".compact" to the full filename so we never
         // clobber a real extension (wal → wal.compact), keeping it in the same
@@ -225,11 +253,6 @@ impl Wal {
             p.push(".compact");
             PathBuf::from(p)
         };
-
-        // Hold the WAL lock across the whole swap so no append can interleave
-        // between the rename and the handle reopen (which would write into the
-        // unlinked old inode and be silently lost).
-        let mut file = self.file.lock().await;
 
         {
             let mut tmp = std::fs::OpenOptions::new()
@@ -459,6 +482,56 @@ mod tests {
         let (_, entries) = Wal::open(path.clone()).unwrap();
         assert_eq!(entries.len(), 3, "live WAL must survive intact");
         assert!(entries.iter().all(|e| matches!(e, WalEntry::Update { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_with_snapshot_runs_under_wal_lock() {
+        // The whole compaction-race fix rests on one invariant: the closure that
+        // produces the checkpoint payload runs while the WAL lock is held, so no
+        // append can complete between the snapshot and the file replacement. Prove
+        // it deterministically — a concurrent append must NOT finish while the
+        // snapshot closure is executing. Regresses if compact_with is ever
+        // refactored to snapshot outside the lock.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Arc::new(Wal::open(path.clone()).unwrap().0);
+
+        let appended = Arc::new(AtomicBool::new(false));
+        let in_closure = Arc::new(tokio::sync::Notify::new());
+
+        let w2 = Arc::clone(&wal);
+        let appended2 = Arc::clone(&appended);
+        let in_closure2 = Arc::clone(&in_closure);
+        let compactor = tokio::spawn(async move {
+            w2.compact_with(move || {
+                // Lock is held here. Signal the test, then hold long enough that a
+                // concurrent append would surely complete if the lock were NOT held.
+                in_closure2.notify_one();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(
+                    !appended2.load(Ordering::SeqCst),
+                    "an append completed while the snapshot closure ran — the WAL \
+                     lock is not held across the snapshot"
+                );
+                Vec::new()
+            })
+            .await
+            .unwrap();
+        });
+
+        in_closure.notified().await;
+        // Must block behind the compaction lock until the closure returns.
+        wal.append(&WalEntry::Update {
+            name: "refs/x".to_string(),
+            entry: make_entry(1, 1),
+        })
+        .await
+        .unwrap();
+        appended.store(true, Ordering::SeqCst);
+        compactor.await.unwrap();
     }
 
     #[tokio::test]

@@ -150,15 +150,20 @@ impl RefStoreImpl {
     /// # Errors
     /// Propagates WAL encode or I/O errors.
     pub async fn compact_wal(&self) -> Result<()> {
-        // Take an O(1) snapshot of the current ART root.
-        let snap = self.snapshot();
-        // Collect all leaves from the snapshot for the checkpoint payload.
-        let leaves: Vec<(String, RefEntry)> = snap
-            .list("")
-            .into_iter()
-            .map(|(name, entry)| (name.as_str().to_string(), entry))
-            .collect();
-        self.wal.compact(leaves).await
+        // Snapshot the leaves UNDER the WAL lock (compact_with runs this closure
+        // while holding it). A concurrent update() publishes to the root before
+        // it appends, so any writer is either already visible to this snapshot
+        // or blocked to land after the new checkpoint — never erased by the
+        // whole-file replacement. See Wal::compact_with for the full analysis.
+        self.wal
+            .compact_with(|| {
+                let snap = self.snapshot();
+                snap.list("")
+                    .into_iter()
+                    .map(|(name, entry)| (name.as_str().to_string(), entry))
+                    .collect()
+            })
+            .await
     }
 
     /// Replace the entire ref set with exact entries (target, hlc, version
@@ -1088,6 +1093,70 @@ mod tests {
             );
         }
         assert_eq!(store.list("refs/tags/").await.unwrap().len(), 3);
+    }
+
+    /// Heavy-concurrency guard for the compaction path: sustained interleaved ref
+    /// creation across multiple concurrent compactors, then reopen from the WAL
+    /// alone — every acked ref must survive. This exercises `compact_wal` under
+    /// load (catching deadlocks, panics, or gross loss); the precise
+    /// snapshot/append race it addresses has a sub-microsecond window that this
+    /// test cannot reliably trigger, so the *correctness* of the fix rests on the
+    /// snapshot-under-lock invariant asserted deterministically in the WAL test
+    /// `compact_with_snapshot_runs_under_wal_lock`, not on this one failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_updates_survive_wal_compaction() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 60;
+        const COMPACTORS: usize = 4;
+        let dir = tempdir().unwrap();
+        let path = dir.keep();
+        let store = Arc::new(RefStoreImpl::open(path.clone(), Arc::new(HLC::new())).unwrap());
+
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let s = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                for k in 0..PER_WRITER {
+                    let nm = RefName::new(&format!("refs/heads/w{w}-{k:03}")).unwrap();
+                    s.update(&nm, oid(((w * PER_WRITER + k) % 251) as u8), None)
+                        .await
+                        .unwrap();
+                    // Yield so compactions interleave between creations.
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        let mut compactors = Vec::new();
+        for _ in 0..COMPACTORS {
+            let s = Arc::clone(&store);
+            compactors.push(tokio::spawn(async move {
+                // Loop compactions until the writers are (almost certainly) done.
+                for _ in 0..(PER_WRITER * 2) {
+                    s.compact_wal().await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        for c in compactors {
+            c.await.unwrap();
+        }
+
+        // Reopen from the WAL only — no in-memory state carries over.
+        drop(store);
+        let reopened = RefStoreImpl::open(path, Arc::new(HLC::new())).unwrap();
+        for w in 0..WRITERS {
+            for k in 0..PER_WRITER {
+                let nm = RefName::new(&format!("refs/heads/w{w}-{k:03}")).unwrap();
+                let got =
+                    reopened.get(&nm).await.unwrap().unwrap_or_else(|| {
+                        panic!("ref w{w}-{k:03} lost across compaction + reopen")
+                    });
+                assert_eq!(got.target, oid(((w * PER_WRITER + k) % 251) as u8));
+            }
+        }
     }
 
     // ── 2. version increments on each update ────────────────────────────────
