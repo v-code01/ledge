@@ -50,25 +50,35 @@ fn encode_frame(entry: &Record) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Decode one frame at `pos`; `None` on truncation / CRC mismatch / decode error
-/// (caller truncates the file at the last valid boundary).
-fn decode_frame(data: &[u8], pos: usize) -> Option<(Record, usize)> {
+/// Outcome of decoding one frame: a torn tail (interrupted write, safe to
+/// truncate) is kept distinct from in-place corruption (a fully-present frame
+/// with a bad CRC), which must fail loud rather than silently drop every valid
+/// frame after it.
+enum FrameDecode {
+    Entry(Record, usize),
+    Incomplete,
+    Corrupt(String),
+}
+
+/// Decode one frame at `pos`.
+fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
     if pos + HEADER_LEN > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // header torn by an interrupted write
     }
     let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
     let payload_end = pos + HEADER_LEN + length;
     if payload_end > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // payload short — torn tail
     }
     let payload = &data[pos + HEADER_LEN..payload_end];
     if crc32fast::hash(payload) != crc_stored {
-        return None;
+        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
     }
-    let (entry, _): (Record, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
-    Some((entry, payload_end))
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
+        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+    }
 }
 
 /// Durable, WAL-backed per-tenant webhook registry with an in-memory index.
@@ -101,6 +111,12 @@ impl WebhookStore {
             .open(&path)
             .map_err(LedgeError::Io)?;
 
+        // Persist the (possibly just-created) file's directory entry so a new WAL
+        // is durable before its first acked append. Best-effort; once per open.
+        if let Ok(dir_file) = std::fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+
         let mut data = Vec::new();
         file.read_to_end(&mut data).map_err(LedgeError::Io)?;
 
@@ -109,12 +125,23 @@ impl WebhookStore {
         let mut last_valid = 0usize;
         while pos < data.len() {
             match decode_frame(&data, pos) {
-                Some((entry, new_pos)) => {
+                FrameDecode::Entry(entry, new_pos) => {
                     all.push(entry);
                     last_valid = new_pos;
                     pos = new_pos;
                 }
-                None => break,
+                // Torn tail: interrupted final write — truncate the partial bytes.
+                FrameDecode::Incomplete => break,
+                // In-place corruption (bit-rot): fail loud rather than silently
+                // dropping every webhook record after this point.
+                FrameDecode::Corrupt(why) => {
+                    return Err(LedgeError::Corruption(format!(
+                        "webhook WAL {}: {why}; {} record(s) recovered before it. \
+                         Refusing to truncate — restore from a backup.",
+                        path.display(),
+                        all.len()
+                    )));
+                }
             }
         }
         if last_valid < data.len() {
@@ -170,6 +197,9 @@ impl WebhookStore {
         let mut guard = self.file.lock().unwrap();
         if let Some(file) = guard.as_mut() {
             file.write_all(&frame).map_err(LedgeError::Io)?;
+            // fsync before returning so an acked webhook mint/delete survives
+            // power loss, not just a process crash.
+            file.sync_data().map_err(LedgeError::Io)?;
         }
         Ok(())
     }
@@ -253,6 +283,12 @@ impl WebhookStore {
 
     /// Compact the WAL to a single `Checkpoint` holding the live index, then
     /// truncate. No-op if in-memory. Mirrors `AuthStore::compact`.
+    ///
+    /// Crash-atomic: temp file + fsync + atomic rename + dir fsync + handle
+    /// reopen, so a crash mid-rewrite leaves either the intact old log or the new
+    /// checkpoint — never a torn frame 0, which open() now rejects (losing every
+    /// webhook). The pre-lock snapshot race is deferred to the shared ledge-wal
+    /// extraction, as in AuthStore::compact.
     pub fn compact(&self) -> Result<()> {
         let webhooks: Vec<WebhookConfig> = {
             let idx = self.index.read().unwrap();
@@ -260,12 +296,36 @@ impl WebhookStore {
         };
         let frame = encode_frame(&Record::Checkpoint(webhooks))?;
         let mut guard = self.file.lock().unwrap();
-        if let Some(file) = guard.as_mut() {
-            file.seek(SeekFrom::Start(0)).map_err(LedgeError::Io)?;
-            file.write_all(&frame).map_err(LedgeError::Io)?;
-            file.set_len(frame.len() as u64).map_err(LedgeError::Io)?;
-            file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-            file.flush().map_err(LedgeError::Io)?;
+        if guard.is_some() {
+            let tmp_path = {
+                let mut p = self.path.clone().into_os_string();
+                p.push(".compact");
+                PathBuf::from(p)
+            };
+            {
+                let mut tmp = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .map_err(LedgeError::Io)?;
+                tmp.write_all(&frame).map_err(LedgeError::Io)?;
+                tmp.sync_all().map_err(LedgeError::Io)?;
+            }
+            std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
+            if let Some(dir) = self.path.parent() {
+                if let Ok(dir_file) = std::fs::File::open(dir) {
+                    let _ = dir_file.sync_all();
+                }
+            }
+            let mut new_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.path)
+                .map_err(LedgeError::Io)?;
+            new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+            *guard = Some(new_file);
         }
         Ok(())
     }
@@ -337,5 +397,31 @@ mod tests {
         }
         let s2 = WebhookStore::open(dir.path().to_path_buf(), hlc).unwrap();
         assert_eq!(s2.list("acme").len(), 1);
+    }
+
+    #[test]
+    fn mid_stream_corruption_fails_loud_not_silent() {
+        // Bit-rot in an early frame must fail open, not silently drop the webhook
+        // records after it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let hlc = std::sync::Arc::new(ledge_core::HLC::new());
+        let path = dir.path().join("webhooks").join("wal");
+        {
+            let s = WebhookStore::open(dir.path().to_path_buf(), hlc.clone()).unwrap();
+            for i in 0..5 {
+                s.register("acme", format!("http://sink{i}"), vec![], 100)
+                    .unwrap();
+            }
+        }
+        {
+            // Byte 9 is inside the first frame's payload (header is bytes 0..8).
+            let mut data = std::fs::read(&path).unwrap();
+            data[9] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+        assert!(
+            WebhookStore::open(dir.path().to_path_buf(), hlc).is_err(),
+            "mid-stream corruption must fail open, not silently drop webhooks"
+        );
     }
 }
