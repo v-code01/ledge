@@ -1057,6 +1057,39 @@ mod tests {
         assert_eq!(got, entry);
     }
 
+    /// A ref name that is a strict prefix of existing ones — used to panic in the
+    /// ART inner-node split (index out of bounds). Real scenario: tags v1.0.0 and
+    /// v1.0.1 exist (building a compressed inner prefix), then create v1.0.
+    #[tokio::test]
+    async fn update_ref_that_is_strict_prefix_of_existing() {
+        let store = make_store();
+        store
+            .update(&name("refs/tags/v1.0.0"), oid(1), None)
+            .await
+            .unwrap();
+        store
+            .update(&name("refs/tags/v1.0.1"), oid(2), None)
+            .await
+            .unwrap();
+        // This update used to panic; it must succeed and be independently readable.
+        store
+            .update(&name("refs/tags/v1.0"), oid(3), None)
+            .await
+            .unwrap();
+        for (n, o) in [
+            ("refs/tags/v1.0.0", 1),
+            ("refs/tags/v1.0.1", 2),
+            ("refs/tags/v1.0", 3),
+        ] {
+            assert_eq!(
+                store.get(&name(n)).await.unwrap().unwrap().target,
+                oid(o),
+                "{n} resolves to its own target"
+            );
+        }
+        assert_eq!(store.list("refs/tags/").await.unwrap().len(), 3);
+    }
+
     // ── 2. version increments on each update ────────────────────────────────
 
     #[tokio::test]

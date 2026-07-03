@@ -554,7 +554,15 @@ fn split_inner_node4(
 ) -> Arc<ArtNode> {
     let new_prefix = n.prefix[..cp].to_vec();
     let old_byte = n.prefix[cp];
-    let new_byte = key[depth + cp];
+    // A new key that terminates exactly at the split point (a strict prefix
+    // ending inside the compressed prefix) has no diverging byte → it goes under
+    // the null-byte child, matching art_lookup's exhausted-key convention. This
+    // guards the otherwise-out-of-bounds `key[depth + cp]`.
+    let new_byte = if depth + cp >= key.len() {
+        0x00
+    } else {
+        key[depth + cp]
+    };
 
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
@@ -583,7 +591,12 @@ fn split_inner_node16(
 ) -> Arc<ArtNode> {
     let new_prefix = n.prefix[..cp].to_vec();
     let old_byte = n.prefix[cp];
-    let new_byte = key[depth + cp];
+    // Exhausted-at-split-point key → null-byte child (see split_inner_node4).
+    let new_byte = if depth + cp >= key.len() {
+        0x00
+    } else {
+        key[depth + cp]
+    };
 
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
@@ -612,7 +625,12 @@ fn split_inner_node48(
 ) -> Arc<ArtNode> {
     let new_prefix = n.prefix[..cp].to_vec();
     let old_byte = n.prefix[cp];
-    let new_byte = key[depth + cp];
+    // Exhausted-at-split-point key → null-byte child (see split_inner_node4).
+    let new_byte = if depth + cp >= key.len() {
+        0x00
+    } else {
+        key[depth + cp]
+    };
 
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
@@ -641,7 +659,12 @@ fn split_inner_node256(
 ) -> Arc<ArtNode> {
     let new_prefix = n.prefix[..cp].to_vec();
     let old_byte = n.prefix[cp];
-    let new_byte = key[depth + cp];
+    // Exhausted-at-split-point key → null-byte child (see split_inner_node4).
+    let new_byte = if depth + cp >= key.len() {
+        0x00
+    } else {
+        key[depth + cp]
+    };
 
     let mut old_n = n.clone();
     old_n.prefix = n.prefix[cp + 1..].to_vec();
@@ -948,6 +971,39 @@ mod tests {
     fn lookup_missing_returns_none() {
         let root = art_insert(None, b"refs/heads/main", make_slot(2, 1), 0);
         assert_eq!(art_lookup(&root, b"refs/heads/other", 0), None);
+    }
+
+    #[test]
+    fn insert_key_exhausted_inside_compressed_prefix() {
+        // `main` + `master` build a Node4 with compressed prefix "refs/heads/ma".
+        // Inserting "refs/heads/m" — a strict prefix that terminates INSIDE that
+        // compressed prefix — must NOT panic; it belongs under the null-byte child.
+        // (Real analogue: tags v1.0.0 + v1.0.1, then create v1.0.)
+        let mut root = art_insert(None, b"refs/heads/main", make_slot(1, 10), 0);
+        root = art_insert(Some(root), b"refs/heads/master", make_slot(2, 20), 0);
+        root = art_insert(Some(root), b"refs/heads/m", make_slot(3, 30), 0);
+        // Each key resolves to ITS OWN slot (not a sibling's) — no lost/aliased ref.
+        assert_eq!(
+            art_lookup(&root, b"refs/heads/main", 0)
+                .unwrap()
+                .committed
+                .version,
+            10
+        );
+        assert_eq!(
+            art_lookup(&root, b"refs/heads/master", 0)
+                .unwrap()
+                .committed
+                .version,
+            20
+        );
+        assert_eq!(
+            art_lookup(&root, b"refs/heads/m", 0)
+                .unwrap()
+                .committed
+                .version,
+            30
+        );
     }
 
     #[test]
