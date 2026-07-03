@@ -11,9 +11,12 @@
 //! * `crc32`   – CRC-32 of the payload bytes (IEEE polynomial via crc32fast).
 //! * payload   – bincode-encoded `WalEntry` using the standard config.
 //!
-//! On open, the file is read sequentially.  Any frame whose length would
-//! extend beyond EOF or whose CRC does not match is treated as a partial
-//! write and the file is truncated back to the last valid frame boundary.
+//! On open, the file is read sequentially.  A frame whose declared length
+//! runs past EOF is a torn tail (an interrupted final write): the file is
+//! truncated back to the last valid boundary and the prefix recovers. A frame
+//! that is fully present but fails its CRC is in-place corruption (bit-rot),
+//! not a torn write, so `open` fails loudly rather than silently truncating —
+//! silently dropping it would also discard every valid frame that follows.
 //!
 //! # Checkpoint compaction
 //! `compact()` writes a single `Checkpoint` frame to a sibling temp file,
@@ -50,15 +53,26 @@ fn encode_frame(entry: &WalEntry) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Attempt to decode one frame from `data` starting at `pos`.
+/// Outcome of trying to decode one frame at `pos`.
 ///
-/// Returns `Some((entry, next_pos))` on success, `None` on any error
-/// (truncated header, truncated payload, CRC mismatch, decode error).
-/// The caller is responsible for truncating the backing file when `None`
-/// is returned mid-stream.
-fn decode_frame(data: &[u8], pos: usize) -> Option<(WalEntry, usize)> {
+/// The distinction between `Incomplete` and `Corrupt` is what lets recovery
+/// tell a benign torn-tail write apart from silent bit-rot:
+/// * `Incomplete` — there are not enough bytes for the frame the header claims,
+///   i.e. the last append was interrupted mid-write. Safe to truncate the tail.
+/// * `Corrupt` — a frame that is *fully present* on disk fails its CRC (or its
+///   payload will not decode). A torn write is always short, never full-length-
+///   with-bad-CRC, so this is in-place corruption. It must NOT be silently
+///   dropped: doing so would also discard every valid frame after it.
+enum FrameDecode {
+    Entry(WalEntry, usize),
+    Incomplete,
+    Corrupt(String),
+}
+
+/// Attempt to decode one frame from `data` starting at `pos`.
+fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
     if pos + HEADER_LEN > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // header torn by an interrupted write
     }
     // SAFETY: slice bounds checked above; try_into on exactly-4-byte slice is
     // infallible — the unwrap() below will never panic.
@@ -66,15 +80,18 @@ fn decode_frame(data: &[u8], pos: usize) -> Option<(WalEntry, usize)> {
     let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
     let payload_end = pos + HEADER_LEN + length;
     if payload_end > data.len() {
-        return None;
+        return FrameDecode::Incomplete; // payload short — torn tail
     }
     let payload = &data[pos + HEADER_LEN..payload_end];
     if crc32fast::hash(payload) != crc_stored {
-        return None;
+        // Full frame present, CRC fails → corruption, not an interrupted write.
+        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
     }
-    let (entry, _): (WalEntry, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
-    Some((entry, payload_end))
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
+        // CRC matched but the bytes will not decode — corrupt payload structure.
+        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+    }
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -155,12 +172,25 @@ impl Wal {
         let mut last_valid = 0usize;
         while pos < data.len() {
             match decode_frame(&data, pos) {
-                Some((entry, new_pos)) => {
+                FrameDecode::Entry(entry, new_pos) => {
                     all.push(entry);
                     last_valid = new_pos;
                     pos = new_pos;
                 }
-                None => break,
+                // Torn tail: the final append was interrupted. Stop and truncate
+                // the partial bytes below — no valid data is lost.
+                FrameDecode::Incomplete => break,
+                // A fully-written frame is corrupt (bit-rot). Refuse to open:
+                // silently truncating here would also discard every valid frame
+                // after this point, turning one flipped bit into wholesale loss.
+                FrameDecode::Corrupt(why) => {
+                    return Err(LedgeError::Corruption(format!(
+                        "WAL {}: {why}; {} frame(s) recovered before it. Refusing to \
+                         truncate — restore from a replica or backup.",
+                        path.display(),
+                        all.len()
+                    )));
+                }
             }
         }
 
@@ -578,6 +608,9 @@ mod tests {
 
     #[tokio::test]
     async fn crc32_corruption_detected() {
+        // A fully-written frame whose payload is corrupted (bit-rot) must be
+        // surfaced as an error, not silently dropped: silently discarding it
+        // would also discard every valid frame that follows.
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal");
         let (wal, _) = Wal::open(path.clone()).unwrap();
@@ -591,11 +624,74 @@ mod tests {
         {
             let mut data = std::fs::read(&path).unwrap();
             if data.len() > 10 {
-                data[9] ^= 0xFF;
+                data[9] ^= 0xFF; // flip a payload byte → CRC mismatch
             }
             std::fs::write(&path, &data).unwrap();
         }
-        let (_, entries) = Wal::open(path).unwrap();
-        assert!(entries.is_empty());
+        assert!(
+            Wal::open(path).is_err(),
+            "a corrupt full frame must fail open loudly, not recover as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_corruption_fails_loud_not_silent() {
+        // Regression for the bit-rot case: corrupting an EARLY frame must not
+        // silently discard the valid frames after it. Write several frames,
+        // flip a byte in the first, and require open() to error rather than
+        // return a truncated prefix.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let (wal, _) = Wal::open(path.clone()).unwrap();
+        for i in 0u8..5 {
+            wal.append(&WalEntry::Update {
+                name: format!("refs/heads/b{i}"),
+                entry: make_entry(i, i as u64 + 1),
+            })
+            .await
+            .unwrap();
+        }
+        drop(wal);
+        {
+            // Byte 9 is inside the FIRST frame's payload (header is bytes 0..8).
+            let mut data = std::fs::read(&path).unwrap();
+            data[9] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+        match Wal::open(path) {
+            Err(LedgeError::Corruption(_)) => {}
+            Err(other) => panic!("expected a Corruption error, got {other:?}"),
+            Ok(_) => panic!("mid-stream corruption must fail open, not recover a truncated prefix"),
+        }
+    }
+
+    #[tokio::test]
+    async fn torn_tail_after_valid_frames_still_recovers() {
+        // Contrast with corruption: a SHORT final frame (interrupted write) is a
+        // torn tail, not bit-rot, and must recover the valid prefix silently.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let (wal, _) = Wal::open(path.clone()).unwrap();
+        for i in 0u8..4 {
+            wal.append(&WalEntry::Update {
+                name: format!("refs/heads/b{i}"),
+                entry: make_entry(i, i as u64 + 1),
+            })
+            .await
+            .unwrap();
+        }
+        drop(wal);
+        {
+            // Shear a few bytes off the end → the last frame is now short.
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let len = f.metadata().unwrap().len();
+            f.set_len(len - 3).unwrap();
+        }
+        let (_, entries) = Wal::open(path).expect("a torn tail must recover, not error");
+        assert_eq!(
+            entries.len(),
+            3,
+            "the three intact frames survive the torn tail"
+        );
     }
 }
