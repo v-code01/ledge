@@ -185,19 +185,28 @@ impl Wal {
         ))
     }
 
-    /// Append a single `WalEntry` to the WAL.
+    /// Append a single `WalEntry` to the WAL and fsync it before returning.
     ///
-    /// The entry is encoded and written atomically from the OS perspective
-    /// (a single `write_all` call).  The OS may still buffer; callers that
-    /// need strict durability should call `fsync` themselves.
+    /// The frame is written with one `write_all` and then `sync_data`d, so a
+    /// return of `Ok(())` means the entry is on stable storage: it survives not
+    /// just a process crash but a power loss or kernel panic. This is the
+    /// property that lets the ref store ack a write only once it is durable —
+    /// without the fsync, `write_all` leaves the frame in the OS page cache and
+    /// an acked ref can vanish on power loss.
+    ///
+    /// `sync_data` (fdatasync) is used rather than `sync_all` (fsync): the frame
+    /// is appended at EOF so the file's size metadata does change, but on the
+    /// platforms we target fdatasync flushes the size along with the data, and
+    /// it avoids the extra inode-timestamp flush that full fsync forces.
     ///
     /// # Errors
-    /// Propagates bincode encode errors as `LedgeError::Corruption` and
-    /// OS write errors as `LedgeError::Io`.
+    /// Propagates bincode encode errors as `LedgeError::Corruption` and OS
+    /// write / sync errors as `LedgeError::Io`.
     pub async fn append(&self, entry: &WalEntry) -> Result<()> {
         let frame = encode_frame(entry)?;
         let mut file = self.file.lock().await;
-        file.write_all(&frame).map_err(LedgeError::Io)
+        file.write_all(&frame).map_err(LedgeError::Io)?;
+        file.sync_data().map_err(LedgeError::Io)
     }
 
     /// Compact the WAL by replacing all existing content with a single
