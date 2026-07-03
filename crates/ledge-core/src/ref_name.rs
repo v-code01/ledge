@@ -8,6 +8,12 @@ use crate::{LedgeError, Result};
 /// - Always starts with `refs/`.
 /// - Never contains `..` (prevents path-traversal attacks).
 /// - Never contains `//` (prevents ambiguous paths).
+/// - Never contains an ASCII control byte (`< 0x20` or `0x7F`). Git's own
+///   ref-format rules forbid these, and one of them — the NUL byte `0x00` — is
+///   reserved by the ref store's radix tree as the key-exhausted sentinel, so
+///   an embedded NUL would alias two distinct refs onto the same tree slot and
+///   silently lose one. Rejecting control bytes here enforces that invariant at
+///   the boundary.
 ///
 /// # Cloning
 /// Backed by `Arc<str>`, so `clone()` is an O(1) atomic reference-count
@@ -35,6 +41,15 @@ impl RefName {
         if s.contains("//") {
             return Err(LedgeError::InvalidRefName(format!(
                 "ref must not contain '//': {s:?}"
+            )));
+        }
+        // Reject ASCII control bytes. The NUL byte in particular is the radix
+        // tree's key-exhausted sentinel; an embedded NUL would collide two refs
+        // onto one slot and lose one. The rest (other C0 controls, DEL) are
+        // forbidden by git's ref-format rules and have no place in a ref path.
+        if let Some(bad) = s.bytes().find(|&b| b < 0x20 || b == 0x7f) {
+            return Err(LedgeError::InvalidRefName(format!(
+                "ref must not contain control byte {bad:#04x}: {s:?}"
             )));
         }
         Ok(Self(Arc::from(s)))
@@ -109,6 +124,21 @@ mod tests {
     fn rejects_double_slash() {
         assert!(RefName::new("refs/heads//main").is_err());
         assert!(RefName::new("refs//heads").is_err());
+    }
+
+    #[test]
+    fn rejects_nul_and_control_bytes() {
+        // A NUL would collide with the radix tree's key-exhausted sentinel and
+        // silently alias two refs — must be rejected at construction.
+        assert!(RefName::new("refs/heads/a\0b").is_err());
+        assert!(RefName::new("refs/heads/\0").is_err());
+        // Other C0 controls and DEL are git-forbidden too.
+        assert!(RefName::new("refs/heads/a\tb").is_err());
+        assert!(RefName::new("refs/heads/a\nb").is_err());
+        assert!(RefName::new("refs/heads/a\x7fb").is_err());
+        assert!(RefName::new("refs/heads/a\x1bb").is_err());
+        // Ordinary printable refs still pass.
+        assert!(RefName::new("refs/heads/feature-x.y_z").is_ok());
     }
 
     #[test]
