@@ -2280,6 +2280,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledge-wal"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "ledge-workspace"
 version = "0.1.0"
 dependencies = [
