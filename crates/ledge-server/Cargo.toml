@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 ledge-core         = { path = "../ledge-core" }
+ledge-wal          = { path = "../ledge-wal" }
 ledge-object-store = { path = "../ledge-object-store" }
 ledge-ref-store    = { path = "../ledge-ref-store" }
 ledge-git          = { path = "../ledge-git" }

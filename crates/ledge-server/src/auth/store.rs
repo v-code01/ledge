@@ -13,7 +13,6 @@
 //! token once; the store keeps only `BLAKE3(secret_bytes)`.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock, Weak};
 
@@ -25,9 +24,19 @@ use tokio::sync::Mutex;
 
 use super::principal::{Principal, PrincipalKind, Scopes};
 
-/// Byte size of the fixed frame header (length u32 + crc32 u32) — identical to
-/// the lease/ref WAL.
-const HEADER_LEN: usize = 8;
+/// Map a shared-WAL error into this crate's error, tagging corruption with the
+/// store name and the recovery hint. The auth store is security-relevant: a
+/// dropped revocation would let a revoked key authenticate again, so we fail
+/// loud rather than truncate.
+fn map_wal(e: ledge_wal::WalError) -> LedgeError {
+    match e {
+        ledge_wal::WalError::Io(io) => LedgeError::Io(io),
+        ledge_wal::WalError::Encode(s) => LedgeError::Corruption(format!("auth WAL: {s}")),
+        ledge_wal::WalError::Corruption(s) => LedgeError::Corruption(format!(
+            "auth WAL: {s}. Refusing to truncate — restore from a backup."
+        )),
+    }
+}
 
 /// A persisted API key. Only the BLAKE3 hash of the secret is stored.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -88,51 +97,6 @@ enum AuthWalEntry {
     Checkpoint { keys: Vec<ApiKeyRecord> },
 }
 
-/// Encode an `AuthWalEntry` into a complete on-disk frame (identical layout to
-/// the lease/ref WAL).
-fn encode_frame(entry: &AuthWalEntry) -> Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard())
-        .map_err(|e| LedgeError::Corruption(format!("auth WAL encode: {e}")))?;
-    let length = payload.len() as u32;
-    let crc = crc32fast::hash(&payload);
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-/// Outcome of decoding one frame: a torn tail (interrupted write, safe to
-/// truncate) is kept distinct from in-place corruption (a fully-present frame
-/// with a bad CRC), which must fail loud rather than silently drop every valid
-/// frame after it.
-enum FrameDecode {
-    Entry(AuthWalEntry, usize),
-    Incomplete,
-    Corrupt(String),
-}
-
-/// Decode one frame at `pos`.
-fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
-    if pos + HEADER_LEN > data.len() {
-        return FrameDecode::Incomplete; // header torn by an interrupted write
-    }
-    let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-    let payload_end = pos + HEADER_LEN + length;
-    if payload_end > data.len() {
-        return FrameDecode::Incomplete; // payload short — torn tail
-    }
-    let payload = &data[pos + HEADER_LEN..payload_end];
-    if crc32fast::hash(payload) != crc_stored {
-        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
-    }
-    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
-        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
-        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
-    }
-}
-
 /// Durable, WAL-backed API-key store with an in-memory index. `file` is `None`
 /// in [`in_memory`](Self::in_memory) mode (disabled/test): appends are no-ops.
 pub struct AuthStore {
@@ -154,52 +118,10 @@ impl AuthStore {
         let dir = data_dir.join("auth");
         std::fs::create_dir_all(&dir).map_err(LedgeError::Io)?;
         let path = dir.join("wal");
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(LedgeError::Io)?;
-
-        // Persist the (possibly just-created) file's directory entry so a new WAL
-        // is durable before its first acked append. Best-effort; once per open.
-        if let Ok(dir_file) = std::fs::File::open(&dir) {
-            let _ = dir_file.sync_all();
-        }
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).map_err(LedgeError::Io)?;
-
-        let mut all: Vec<AuthWalEntry> = Vec::new();
-        let mut pos = 0usize;
-        let mut last_valid = 0usize;
-        while pos < data.len() {
-            match decode_frame(&data, pos) {
-                FrameDecode::Entry(entry, new_pos) => {
-                    all.push(entry);
-                    last_valid = new_pos;
-                    pos = new_pos;
-                }
-                // Torn tail: interrupted final write — truncate the partial bytes.
-                FrameDecode::Incomplete => break,
-                // In-place corruption (bit-rot): fail loud rather than silently
-                // dropping every key record after this point (which could drop a
-                // revocation, letting a revoked key authenticate again).
-                FrameDecode::Corrupt(why) => {
-                    return Err(LedgeError::Corruption(format!(
-                        "auth WAL {}: {why}; {} record(s) recovered before it. \
-                         Refusing to truncate — restore from a backup.",
-                        path.display(),
-                        all.len()
-                    )));
-                }
-            }
-        }
-        if last_valid < data.len() {
-            file.set_len(last_valid as u64).map_err(LedgeError::Io)?;
-        }
-        file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+        // Shared primitive: opens (dir-fsync on create), replays frames, recovers
+        // a torn tail, and fails loud on in-place corruption (a dropped revoke
+        // would let a revoked key authenticate again).
+        let (file, all) = ledge_wal::open_replay::<AuthWalEntry>(&path).map_err(map_wal)?;
 
         let index = Self::rebuild_index(&all);
         Ok(AuthStore {
@@ -247,14 +169,11 @@ impl AuthStore {
 
     /// Append a frame to the WAL if persistent; no-op if in-memory.
     async fn append(&self, entry: &AuthWalEntry) -> Result<()> {
-        let frame = encode_frame(entry)?;
         let mut guard = self.file.lock().await;
         if let Some(file) = guard.as_mut() {
-            file.write_all(&frame).map_err(LedgeError::Io)?;
-            // fsync before returning: an acked key create — or, more importantly,
-            // a REVOCATION — must survive power loss. A lost revocation would let
-            // a revoked key authenticate again after a restart.
-            file.sync_data().map_err(LedgeError::Io)?;
+            // Durable (write + fsync) before returning: an acked key create — or,
+            // more importantly, a REVOCATION — must survive power loss.
+            ledge_wal::append_record(file, entry).map_err(map_wal)?;
         }
         Ok(())
     }
@@ -405,49 +324,22 @@ impl AuthStore {
     /// Compact the WAL to a single `Checkpoint` holding only non-revoked keys,
     /// then truncate. No-op if in-memory. Mirrors `LeaseStore::compact`.
     ///
-    /// Crash-atomic: the checkpoint is written to a sibling temp, fsynced, then
-    /// atomically renamed over the live WAL (parent dir fsynced) and the handle
-    /// reopened at EOF. An in-place `seek(0)+write+set_len` would tear frame 0 on
-    /// a crash, and open() now fails loud on a torn frame — losing every key.
-    /// (The pre-lock snapshot race is deferred to the shared ledge-wal extraction,
-    /// same as LeaseStore::compact.)
+    /// Crash-atomic via the shared `ledge_wal::write_checkpoint` (temp + fsync +
+    /// rename + dir fsync + reopen): a crash mid-rewrite leaves either the intact
+    /// old log or the new checkpoint, never a torn frame 0 (which open() now
+    /// rejects — losing every key). The pre-lock snapshot race is deferred to a
+    /// follow-up; see the module note on the ledge-wal extraction.
     pub async fn compact(&self) -> Result<()> {
         let keys: Vec<ApiKeyRecord> = {
             let idx = self.index.read().unwrap();
             idx.values().filter(|r| !r.revoked).cloned().collect()
         };
-        let frame = encode_frame(&AuthWalEntry::Checkpoint { keys })?;
         {
             let mut guard = self.file.lock().await;
             if guard.is_some() {
-                let tmp_path = {
-                    let mut p = self.path.clone().into_os_string();
-                    p.push(".compact");
-                    PathBuf::from(p)
-                };
-                {
-                    let mut tmp = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&tmp_path)
-                        .map_err(LedgeError::Io)?;
-                    tmp.write_all(&frame).map_err(LedgeError::Io)?;
-                    tmp.sync_all().map_err(LedgeError::Io)?;
-                }
-                std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
-                if let Some(dir) = self.path.parent() {
-                    if let Ok(dir_file) = std::fs::File::open(dir) {
-                        let _ = dir_file.sync_all();
-                    }
-                }
-                let mut new_file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&self.path)
-                    .map_err(LedgeError::Io)?;
-                new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+                let new_file =
+                    ledge_wal::write_checkpoint(&self.path, &AuthWalEntry::Checkpoint { keys })
+                        .map_err(map_wal)?;
                 *guard = Some(new_file);
             }
         }
