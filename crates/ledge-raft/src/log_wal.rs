@@ -69,7 +69,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,59 +81,23 @@ use tokio::sync::Mutex;
 
 use crate::type_config::TypeConfig;
 
-// ── Frame codec (same layout as ledge-ref-store::wal, generic over payload) ───
+// ── WAL error mapping ─────────────────────────────────────────────────────────
+//
+// The framed WAL primitives (codec, fail-loud replay, crash-atomic compaction)
+// live in the shared `ledge-wal` crate. This module only maps `ledge_wal::WalError`
+// into openraft's `StorageError`, tagging each with read- vs write-logs subject.
 
-/// Byte size of the fixed frame header (length u32 LE + crc32 u32 LE).
-const HEADER_LEN: usize = 8;
-
-/// Encode a serializable payload `T` into a complete on-disk frame.
-fn encode_frame<T: Serialize>(rec: &T) -> Result<Vec<u8>, String> {
-    let payload = bincode::serde::encode_to_vec(rec, bincode::config::standard())
-        .map_err(|e| format!("WAL encode: {e}"))?;
-    let length = payload.len() as u32;
-    let crc = crc32fast::hash(&payload);
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+/// Map a shared-WAL error hit on the read path (replay / open) to a read-logs
+/// `StorageError`. Corruption here means bit-rot in the authoritative log —
+/// failing loud avoids silently serving a short log missing committed entries.
+fn wal_read_err(e: ledge_wal::WalError) -> StorageError<u64> {
+    StorageIOError::read_logs(&io_err(format!("raft log WAL: {e}"))).into()
 }
 
-/// Outcome of trying to decode one frame at `pos`.
-///
-/// `Incomplete` vs `Corrupt` is what separates a benign torn-tail write from
-/// silent bit-rot: a torn write (interrupted append) is always short, so a frame
-/// that is *fully present* yet fails its CRC is in-place corruption. Silently
-/// dropping it would also discard every valid Raft record after it — for the
-/// authoritative log that means silently losing committed entries, a safety
-/// violation. So corruption must fail loud, not truncate.
-enum FrameDecode<T> {
-    Entry(T, usize),
-    Incomplete,
-    Corrupt(String),
-}
-
-/// Attempt to decode one frame of type `T` from `data` starting at `pos`.
-fn decode_frame<T: DeserializeOwned>(data: &[u8], pos: usize) -> FrameDecode<T> {
-    if pos + HEADER_LEN > data.len() {
-        return FrameDecode::Incomplete; // header torn by an interrupted write
-    }
-    // SAFETY: bounds checked above; the 4-byte slices make try_into infallible.
-    let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-    let payload_end = pos + HEADER_LEN + length;
-    if payload_end > data.len() {
-        return FrameDecode::Incomplete; // payload short — torn tail
-    }
-    let payload = &data[pos + HEADER_LEN..payload_end];
-    if crc32fast::hash(payload) != crc_stored {
-        // Full frame present, CRC fails → corruption, not an interrupted write.
-        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
-    }
-    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
-        Ok((rec, _)) => FrameDecode::Entry(rec, payload_end),
-        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
-    }
+/// Map a shared-WAL error hit on the write path (append / checkpoint) to a
+/// write-logs `StorageError`.
+fn wal_write_err(e: ledge_wal::WalError) -> StorageError<u64> {
+    StorageIOError::write_logs(&io_err(format!("raft log WAL: {e}"))).into()
 }
 
 // ── Persisted record model ────────────────────────────────────────────────────
@@ -212,18 +175,10 @@ struct WalInner {
 }
 
 impl WalInner {
-    /// Encode + write a frame, then `fsync`, mapping all errors to a write
-    /// `StorageError`. This is the single durability primitive: it returns only
-    /// after the bytes are on stable storage.
+    /// Encode + write a frame, then `fsync`, via the shared durable-append
+    /// primitive. Returns only after the bytes are on stable storage.
     fn write_frame(&mut self, rec: &WalRec) -> Result<(), StorageError<u64>> {
-        let frame = encode_frame(rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
-        self.file
-            .write_all(&frame)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("WAL write: {e}"))))?;
-        self.file
-            .sync_data()
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("WAL fsync: {e}"))))?;
-        Ok(())
+        ledge_wal::append_record(&mut self.file, rec).map_err(wal_write_err)
     }
 }
 
@@ -245,76 +200,17 @@ impl WalLogStore {
         std::fs::create_dir_all(&dir)
             .map_err(|e| StorageIOError::write_logs(&io_err(format!("create WAL dir: {e}"))))?;
         let path = dir.join("raft-log.wal");
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("open WAL: {e}"))))?;
 
-        // Persist the WAL's directory entry: create(true) may have just created
-        // the file, and a rename/create is not durable until the parent dir is
-        // fsynced. Without this a crash could lose a newly-created log file whose
-        // first entries were already fsynced and acked. Best-effort (dir fsync is
-        // rejected on some filesystems); once per open, negligible cost.
-        if let Ok(dir_file) = std::fs::File::open(&dir) {
-            let _ = dir_file.sync_all();
-        }
-
-        // Read the whole file; Raft logs are bounded by purge + (future) snapshot
-        // compaction, so a full in-memory read is acceptable.
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .map_err(|e| StorageIOError::read_logs(&io_err(format!("read WAL: {e}"))))?;
+        // Shared primitive: opens (dir-fsync on create), replays frames, recovers
+        // a torn tail, and FAILS LOUD on in-place corruption — for the
+        // authoritative Raft log, silently dropping records after a bit-flip would
+        // lose committed entries. The file is returned positioned at EOF.
+        let (file, recs) = ledge_wal::open_replay::<WalRec>(&path).map_err(wal_read_err)?;
 
         let mut log: BTreeMap<u64, Entry<TypeConfig>> = BTreeMap::new();
         let mut last_purged: Option<LogId<u64>> = None;
         let mut vote: Option<Vote<u64>> = None;
         let mut committed: Option<LogId<u64>> = None;
-
-        let mut pos = 0usize;
-        let mut last_valid = 0usize;
-        // Collect records first so we can honor a Snapshot record (which discards
-        // everything logically prior) without re-reading the file.
-        let mut recs: Vec<WalRec> = Vec::new();
-        while pos < data.len() {
-            match decode_frame::<WalRec>(&data, pos) {
-                FrameDecode::Entry(rec, new_pos) => {
-                    recs.push(rec);
-                    last_valid = new_pos;
-                    pos = new_pos;
-                }
-                // Torn tail: the final append was interrupted. Stop and truncate
-                // the partial bytes below — openraft tolerates losing un-acked
-                // tail entries (they were never confirmed durable).
-                FrameDecode::Incomplete => break,
-                // A fully-written frame is corrupt (bit-rot). Refuse to open:
-                // silently truncating here would discard every valid record after
-                // it, which for the authoritative Raft log means silently dropping
-                // committed entries. Fail loud so the node recovers from a peer
-                // snapshot instead of serving a short, lossy log.
-                FrameDecode::Corrupt(why) => {
-                    return Err(StorageIOError::read_logs(&io_err(format!(
-                        "Raft log WAL {}: {why}; {} record(s) recovered before it. \
-                         Refusing to truncate — recover this node from a peer.",
-                        path.display(),
-                        recs.len()
-                    )))
-                    .into());
-                }
-            }
-        }
-
-        // Truncate any partial tail frame so the next append starts cleanly.
-        if last_valid < data.len() {
-            file.set_len(last_valid as u64).map_err(|e| {
-                StorageIOError::write_logs(&io_err(format!("truncate torn tail: {e}")))
-            })?;
-        }
-        // Position the write cursor at EOF.
-        file.seek(SeekFrom::End(0))
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek EOF: {e}"))))?;
 
         // Replay only from the last Snapshot onward (earlier records are folded
         // into that snapshot), mirroring the ref-store checkpoint semantics.
@@ -381,14 +277,10 @@ impl WalLogStore {
     /// completeness and tested for correctness.
     ///
     /// # Crash atomicity
-    /// The snapshot is written to a sibling temp file, fsynced, then atomically
-    /// `rename`d over the live WAL (parent directory fsynced), so a crash leaves
-    /// either the intact old log or the intact new snapshot — never a torn frame
-    /// at offset 0. An in-place `seek(0); write; set_len` cannot offer this: a
-    /// crash after the header lands but before the payload does corrupts frame 0,
-    /// and on the next `open` that now fails loud, refusing to serve the log —
-    /// losing the entire Raft log for this node. After the rename the old fd
-    /// refers to the unlinked inode, so the handle is reopened at EOF.
+    /// Delegates to the shared `ledge_wal::write_checkpoint` (temp + fsync +
+    /// rename + directory fsync + reopen at EOF), so a crash leaves either the
+    /// intact old log or the intact new snapshot — never a torn frame 0 (which
+    /// `open` now rejects, which would lose the entire Raft log for this node).
     ///
     /// # Errors
     /// Propagates encode / I/O errors as `StorageError`.
@@ -410,48 +302,7 @@ impl WalLogStore {
             committed_bytes,
             purged_bytes,
         };
-        let frame = encode_frame(&rec).map_err(|e| StorageIOError::write_logs(&io_err(e)))?;
-
-        // Sibling temp path (append ".compact" to the full filename so we never
-        // clobber a real extension), in the same directory so the rename is a
-        // same-filesystem atomic op.
-        let tmp_path = {
-            let mut p = inner.path.clone().into_os_string();
-            p.push(".compact");
-            PathBuf::from(p)
-        };
-        {
-            let mut tmp = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(|e| StorageIOError::write_logs(&io_err(format!("open temp: {e}"))))?;
-            tmp.write_all(&frame)
-                .map_err(|e| StorageIOError::write_logs(&io_err(format!("temp write: {e}"))))?;
-            tmp.sync_all()
-                .map_err(|e| StorageIOError::write_logs(&io_err(format!("temp fsync: {e}"))))?;
-        }
-        std::fs::rename(&tmp_path, &inner.path)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("rename: {e}"))))?;
-        // POSIX: the rename is not durable until the parent directory is fsynced.
-        // Best-effort — some filesystems reject an fsync on a directory fd.
-        if let Some(dir) = inner.path.parent() {
-            if let Ok(dir_file) = std::fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
-        }
-        // The old fd now points at the unlinked pre-rename inode; reopen the live
-        // file and position at EOF so subsequent appends land after the snapshot.
-        let mut new_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&inner.path)
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("reopen: {e}"))))?;
-        new_file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| StorageIOError::write_logs(&io_err(format!("seek EOF: {e}"))))?;
+        let new_file = ledge_wal::write_checkpoint(&inner.path, &rec).map_err(wal_write_err)?;
         inner.file = new_file;
         Ok(())
     }

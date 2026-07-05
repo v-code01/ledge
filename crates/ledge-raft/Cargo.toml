@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ledge-core = { path = "../ledge-core" }
+ledge-wal = { path = "../ledge-wal" }
 ledge-ref-store = { path = "../ledge-ref-store" }
 ledge-workspace = { path = "../ledge-workspace" }
 openraft = { workspace = true, features = ["serde", "storage-v2"] }

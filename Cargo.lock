@@ -2188,6 +2188,7 @@ dependencies = [
  "crc32fast",
  "ledge-core",
  "ledge-ref-store",
+ "ledge-wal",
  "ledge-workspace",
  "openraft",
  "serde",
