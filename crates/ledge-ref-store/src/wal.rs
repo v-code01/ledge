@@ -25,72 +25,24 @@
 //! checkpoint — never a torn frame at offset 0.  On the next `open()` only
 //! entries at or after the last checkpoint are replayed.
 
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use ledge_core::{LedgeError, RefEntry, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-// ── Frame layout ─────────────────────────────────────────────────────────────
-
-/// Byte size of the fixed frame header (length u32 + crc32 u32).
-const HEADER_LEN: usize = 8;
-
-/// Encode a `WalEntry` into a complete on-disk frame.
-///
-/// # Errors
-/// Returns `LedgeError::Corruption` if bincode serialization fails.
-fn encode_frame(entry: &WalEntry) -> Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard())
-        .map_err(|e| LedgeError::Corruption(format!("WAL encode: {e}")))?;
-    let length = payload.len() as u32;
-    let crc = crc32fast::hash(&payload);
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-/// Outcome of trying to decode one frame at `pos`.
-///
-/// The distinction between `Incomplete` and `Corrupt` is what lets recovery
-/// tell a benign torn-tail write apart from silent bit-rot:
-/// * `Incomplete` — there are not enough bytes for the frame the header claims,
-///   i.e. the last append was interrupted mid-write. Safe to truncate the tail.
-/// * `Corrupt` — a frame that is *fully present* on disk fails its CRC (or its
-///   payload will not decode). A torn write is always short, never full-length-
-///   with-bad-CRC, so this is in-place corruption. It must NOT be silently
-///   dropped: doing so would also discard every valid frame after it.
-enum FrameDecode {
-    Entry(WalEntry, usize),
-    Incomplete,
-    Corrupt(String),
-}
-
-/// Attempt to decode one frame from `data` starting at `pos`.
-fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
-    if pos + HEADER_LEN > data.len() {
-        return FrameDecode::Incomplete; // header torn by an interrupted write
-    }
-    // SAFETY: slice bounds checked above; try_into on exactly-4-byte slice is
-    // infallible — the unwrap() below will never panic.
-    let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-    let payload_end = pos + HEADER_LEN + length;
-    if payload_end > data.len() {
-        return FrameDecode::Incomplete; // payload short — torn tail
-    }
-    let payload = &data[pos + HEADER_LEN..payload_end];
-    if crc32fast::hash(payload) != crc_stored {
-        // Full frame present, CRC fails → corruption, not an interrupted write.
-        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
-    }
-    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
-        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
-        // CRC matched but the bytes will not decode — corrupt payload structure.
-        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
+// ── WAL error mapping ─────────────────────────────────────────────────────────
+//
+// The framed WAL primitives (codec, fail-loud replay, crash-atomic compaction)
+// live in the shared `ledge-wal` crate; this module maps its `WalError` into
+// `LedgeError`, preserving the offset/record-count detail on corruption.
+fn map_wal(e: ledge_wal::WalError) -> LedgeError {
+    match e {
+        ledge_wal::WalError::Io(io) => LedgeError::Io(io),
+        ledge_wal::WalError::Encode(s) => LedgeError::Corruption(format!("ref WAL: {s}")),
+        ledge_wal::WalError::Corruption(s) => LedgeError::Corruption(format!(
+            "ref WAL: {s}. Refusing to truncate — restore from a backup."
+        )),
     }
 }
 
@@ -151,67 +103,9 @@ impl Wal {
     /// # Errors
     /// Propagates any OS-level I/O error encountered while opening or reading.
     pub fn open(path: PathBuf) -> Result<(Self, Vec<WalEntry>)> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            // Do not truncate on open — we read existing entries and then append.
-            .truncate(false)
-            .open(&path)
-            .map_err(LedgeError::Io)?;
-
-        // Persist the file's own directory entry: create(true) may have just
-        // created the file, and POSIX does not guarantee that a new dir entry is
-        // durable until the parent directory is fsynced. Without this, the first
-        // append's fsync makes the DATA durable while the file itself could still
-        // vanish on power loss, losing an acked write. Once per open — negligible.
-        // Best-effort: some filesystems reject an fsync on a directory fd.
-        if let Some(dir) = path.parent() {
-            if let Ok(dir_file) = std::fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
-        }
-
-        // Read the entire file into memory.  WALs are typically small (tens of
-        // MiB at most before compaction kicks in).
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).map_err(LedgeError::Io)?;
-
-        // Decode all valid frames, tracking the byte offset of the last valid
-        // frame boundary so we can truncate any torn tail write.
-        let mut all: Vec<WalEntry> = Vec::new();
-        let mut pos = 0usize;
-        let mut last_valid = 0usize;
-        while pos < data.len() {
-            match decode_frame(&data, pos) {
-                FrameDecode::Entry(entry, new_pos) => {
-                    all.push(entry);
-                    last_valid = new_pos;
-                    pos = new_pos;
-                }
-                // Torn tail: the final append was interrupted. Stop and truncate
-                // the partial bytes below — no valid data is lost.
-                FrameDecode::Incomplete => break,
-                // A fully-written frame is corrupt (bit-rot). Refuse to open:
-                // silently truncating here would also discard every valid frame
-                // after this point, turning one flipped bit into wholesale loss.
-                FrameDecode::Corrupt(why) => {
-                    return Err(LedgeError::Corruption(format!(
-                        "WAL {}: {why}; {} frame(s) recovered before it. Refusing to \
-                         truncate — restore from a replica or backup.",
-                        path.display(),
-                        all.len()
-                    )));
-                }
-            }
-        }
-
-        // Truncate any partial tail frame so the next append starts cleanly.
-        if last_valid < data.len() {
-            file.set_len(last_valid as u64).map_err(LedgeError::Io)?;
-        }
-        // Position write cursor at EOF so appends land at the right offset.
-        file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+        // Shared primitive: opens (dir-fsync on create), replays frames, recovers
+        // a torn tail, fails loud on in-place corruption, returns the file at EOF.
+        let (file, all) = ledge_wal::open_replay::<WalEntry>(&path).map_err(map_wal)?;
 
         // Only replay from the last checkpoint onward.  Earlier entries have
         // already been incorporated into that checkpoint's snapshot.
@@ -245,17 +139,9 @@ impl Wal {
 
     /// Append a single `WalEntry` to the WAL and fsync it before returning.
     ///
-    /// The frame is written with one `write_all` and then `sync_data`d, so a
-    /// return of `Ok(())` means the entry is on stable storage: it survives not
-    /// just a process crash but a power loss or kernel panic. This is the
-    /// property that lets the ref store ack a write only once it is durable —
-    /// without the fsync, `write_all` leaves the frame in the OS page cache and
-    /// an acked ref can vanish on power loss.
-    ///
-    /// `sync_data` (fdatasync) is used rather than `sync_all` (fsync): the frame
-    /// is appended at EOF so the file's size metadata does change, but on the
-    /// platforms we target fdatasync flushes the size along with the data, and
-    /// it avoids the extra inode-timestamp flush that full fsync forces.
+    /// A return of `Ok(())` means the entry is on stable storage (via the shared
+    /// `ledge_wal::append_record`, which write + fsyncs), so an acked ref survives
+    /// a power loss, not just a process crash.
     ///
     /// # Errors
     /// Propagates bincode encode errors as `LedgeError::Corruption` and OS
@@ -270,10 +156,8 @@ impl Wal {
                 "injected WAL append failure",
             )));
         }
-        let frame = encode_frame(entry)?;
         let mut file = self.file.lock().await;
-        file.write_all(&frame).map_err(LedgeError::Io)?;
-        file.sync_data().map_err(LedgeError::Io)
+        ledge_wal::append_record(&mut file, entry).map_err(map_wal)
     }
 
     /// Compact the WAL by replacing all existing content with a single
@@ -324,52 +208,13 @@ impl Wal {
     where
         F: FnOnce() -> Vec<(String, RefEntry)>,
     {
-        // Hold the WAL lock across snapshot → write → rename → reopen so no
-        // append can interleave (see the race analysis above).
+        // Hold the WAL lock across the snapshot + checkpoint write so no append
+        // can interleave (see the race analysis above); snapshot() runs under the
+        // lock. write_checkpoint does the crash-atomic temp + fsync + rename + dir
+        // fsync + reopen and returns the fresh handle at EOF.
         let mut file = self.file.lock().await;
-        let frame = encode_frame(&WalEntry::Checkpoint { leaves: snapshot() })?;
-
-        // Sibling temp path: append ".compact" to the full filename so we never
-        // clobber a real extension (wal → wal.compact), keeping it in the same
-        // directory as the WAL so the rename is a same-filesystem atomic op.
-        let tmp_path = {
-            let mut p = self.path.clone().into_os_string();
-            p.push(".compact");
-            PathBuf::from(p)
-        };
-
-        {
-            let mut tmp = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(LedgeError::Io)?;
-            tmp.write_all(&frame).map_err(LedgeError::Io)?;
-            // Durable before the rename publishes it.
-            tmp.sync_all().map_err(LedgeError::Io)?;
-        }
-
-        std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
-
-        // POSIX: a rename is not guaranteed persisted until the parent
-        // directory entry is fsynced. Best-effort — some platforms/filesystems
-        // reject fsync on a directory fd; a failure there does not lose data.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(dir_file) = std::fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
-        }
-
-        // Reopen against the live (post-rename) inode; the old fd is stale.
-        let mut new_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&self.path)
-            .map_err(LedgeError::Io)?;
-        new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-        *file = new_file;
+        let checkpoint = WalEntry::Checkpoint { leaves: snapshot() };
+        *file = ledge_wal::write_checkpoint(&self.path, &checkpoint).map_err(map_wal)?;
         Ok(())
     }
 

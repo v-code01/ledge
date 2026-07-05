@@ -2207,6 +2207,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "ledge-core",
+ "ledge-wal",
  "proptest",
  "serde",
  "tempfile",

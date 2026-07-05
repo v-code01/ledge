@@ -9,6 +9,7 @@ authors.workspace     = true
 
 [dependencies]
 ledge-core    = { path = "../ledge-core" }
+ledge-wal     = { path = "../ledge-wal" }
 arc-swap.workspace    = true
 bincode.workspace     = true
 serde.workspace       = true
