@@ -9,6 +9,7 @@ authors.workspace      = true
 
 [dependencies]
 ledge-core         = { path = "../ledge-core" }
+ledge-wal          = { path = "../ledge-wal" }
 ledge-object-store = { path = "../ledge-object-store" }
 ledge-ref-store    = { path = "../ledge-ref-store" }
 arc-swap.workspace = true

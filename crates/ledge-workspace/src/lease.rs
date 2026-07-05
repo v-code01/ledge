@@ -11,7 +11,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock, Weak};
 
@@ -20,8 +19,17 @@ use tokio::sync::Mutex;
 
 use crate::id::WorkspaceId;
 
-/// Byte size of the fixed frame header (length u32 + crc32 u32).
-const HEADER_LEN: usize = 8;
+/// Map a shared-WAL error into this crate's error, tagging corruption with the
+/// store name and the fail-loud recovery hint.
+fn map_wal(e: ledge_wal::WalError) -> LedgeError {
+    match e {
+        ledge_wal::WalError::Io(io) => LedgeError::Io(io),
+        ledge_wal::WalError::Encode(s) => LedgeError::Corruption(format!("lease WAL: {s}")),
+        ledge_wal::WalError::Corruption(s) => LedgeError::Corruption(format!(
+            "lease WAL: {s}. Refusing to truncate — restore from a backup."
+        )),
+    }
+}
 
 /// A durable lease over a workspace's ref namespace.
 ///
@@ -55,50 +63,6 @@ enum LeaseWalEntry {
     Checkpoint { leases: Vec<Lease> },
 }
 
-/// Encode a `LeaseWalEntry` into a complete on-disk frame.
-fn encode_frame(entry: &LeaseWalEntry) -> Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard())
-        .map_err(|e| LedgeError::Corruption(format!("lease WAL encode: {e}")))?;
-    let length = payload.len() as u32;
-    let crc = crc32fast::hash(&payload);
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-/// Outcome of decoding one frame: a torn tail (interrupted write, safe to
-/// truncate) is kept distinct from in-place corruption (a fully-present frame
-/// with a bad CRC), which must fail loud rather than silently drop every valid
-/// frame after it.
-enum FrameDecode {
-    Entry(LeaseWalEntry, usize),
-    Incomplete,
-    Corrupt(String),
-}
-
-/// Attempt to decode one frame from `data` at `pos`.
-fn decode_frame(data: &[u8], pos: usize) -> FrameDecode {
-    if pos + HEADER_LEN > data.len() {
-        return FrameDecode::Incomplete; // header torn by an interrupted write
-    }
-    let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    let crc_stored = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-    let payload_end = pos + HEADER_LEN + length;
-    if payload_end > data.len() {
-        return FrameDecode::Incomplete; // payload short — torn tail
-    }
-    let payload = &data[pos + HEADER_LEN..payload_end];
-    if crc32fast::hash(payload) != crc_stored {
-        return FrameDecode::Corrupt(format!("CRC mismatch at byte {pos}"));
-    }
-    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
-        Ok((entry, _)) => FrameDecode::Entry(entry, payload_end),
-        Err(e) => FrameDecode::Corrupt(format!("payload decode error at byte {pos}: {e}")),
-    }
-}
-
 /// Durable, WAL-backed store of workspace leases with an in-memory live index.
 pub struct LeaseStore {
     /// Mutex-protected WAL file, always positioned at EOF for appends.
@@ -119,52 +83,9 @@ impl LeaseStore {
         std::fs::create_dir_all(&dir).map_err(LedgeError::Io)?;
         let path = dir.join("wal");
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(LedgeError::Io)?;
-
-        // Persist the (possibly just-created) file's directory entry so a new WAL
-        // is durable before its first acked append. Best-effort; once per open.
-        if let Ok(dir_file) = std::fs::File::open(&dir) {
-            let _ = dir_file.sync_all();
-        }
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).map_err(LedgeError::Io)?;
-
-        // Decode every valid frame, tracking the last valid boundary.
-        let mut all: Vec<LeaseWalEntry> = Vec::new();
-        let mut pos = 0usize;
-        let mut last_valid = 0usize;
-        while pos < data.len() {
-            match decode_frame(&data, pos) {
-                FrameDecode::Entry(entry, new_pos) => {
-                    all.push(entry);
-                    last_valid = new_pos;
-                    pos = new_pos;
-                }
-                // Torn tail: interrupted final write — truncate the partial bytes.
-                FrameDecode::Incomplete => break,
-                // In-place corruption (bit-rot): failing loud beats silently
-                // discarding every valid lease record after this point.
-                FrameDecode::Corrupt(why) => {
-                    return Err(LedgeError::Corruption(format!(
-                        "lease WAL {}: {why}; {} record(s) recovered before it. \
-                         Refusing to truncate — restore from a backup.",
-                        path.display(),
-                        all.len()
-                    )));
-                }
-            }
-        }
-        if last_valid < data.len() {
-            file.set_len(last_valid as u64).map_err(LedgeError::Io)?;
-        }
-        file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
+        // Shared primitive: opens (dir-fsync on create), replays frames, recovers
+        // a torn tail, and fails loud on in-place corruption.
+        let (file, all) = ledge_wal::open_replay::<LeaseWalEntry>(&path).map_err(map_wal)?;
 
         // Rebuild the index by applying replay entries in order. Unlike the ref
         // WAL we replay the *whole* file: Checkpoint clears the index, so any
@@ -199,13 +120,12 @@ impl LeaseStore {
 
     /// Append a `Put` frame and upsert the live index. Create-or-update.
     pub async fn put(&self, lease: Lease) -> Result<()> {
-        let frame = encode_frame(&LeaseWalEntry::Put(lease.clone()))?;
         {
             let mut file = self.file.lock().await;
-            file.write_all(&frame).map_err(LedgeError::Io)?;
-            // fsync before returning: an acked lease must survive power loss, not
-            // just a process crash (write_all leaves the frame in the page cache).
-            file.sync_data().map_err(LedgeError::Io)?;
+            // Durable (write + fsync) before returning so an acked lease survives
+            // power loss, not just a process crash.
+            ledge_wal::append_record(&mut file, &LeaseWalEntry::Put(lease.clone()))
+                .map_err(map_wal)?;
         }
         self.index.write().unwrap().insert(lease.id, lease);
         Ok(())
@@ -233,13 +153,12 @@ impl LeaseStore {
     ///
     /// Idempotent: tombstoning an absent id is a no-op write + no-op remove.
     pub async fn tombstone_with_hlc(&self, id: WorkspaceId, hlc: u64) -> Result<()> {
-        let frame = encode_frame(&LeaseWalEntry::Tombstone { id, hlc })?;
         {
             let mut file = self.file.lock().await;
-            file.write_all(&frame).map_err(LedgeError::Io)?;
-            // fsync before returning: a tombstone that is acked but lost on power
-            // loss would resurrect a released lease on restart.
-            file.sync_data().map_err(LedgeError::Io)?;
+            // Durable before returning: a tombstone lost on power loss would
+            // resurrect a released lease on restart.
+            ledge_wal::append_record(&mut file, &LeaseWalEntry::Tombstone { id, hlc })
+                .map_err(map_wal)?;
         }
         self.index.write().unwrap().remove(&id);
         Ok(())
@@ -295,53 +214,24 @@ impl LeaseStore {
     /// live lease. The live snapshot is taken from the in-memory index
     /// (tombstoned ids are already absent).
     ///
-    /// Crash-atomic: the checkpoint is written to a sibling temp file, fsynced,
-    /// atomically renamed over the live WAL (parent dir fsynced), then the handle
-    /// is reopened at EOF. An in-place `seek(0)+write+set_len` would tear frame 0
-    /// on a crash, and open() now fails loud on a torn frame — losing every lease.
+    /// Crash-atomic via the shared `ledge_wal::write_checkpoint` (temp + fsync +
+    /// rename + dir fsync + reopen): a crash mid-rewrite leaves either the intact
+    /// old log or the new checkpoint, never a torn frame 0 (which open() now
+    /// rejects — losing every lease).
     ///
     /// NOTE: the checkpoint snapshot is still taken before the file lock, so a
     /// concurrent `put`/`tombstone` racing this compaction can be lost (the
     /// LeaseStore analogue of the ref-store compaction/append race). Closing that
-    /// belongs with the shared `ledge-wal` extraction that will de-duplicate the
-    /// five WAL copies; this fix removes the far more severe whole-file-loss risk.
+    /// uniformly is the remaining follow-up on top of the ledge-wal extraction;
+    /// this path already removes the far more severe whole-file-loss risk.
     pub async fn compact(&self) -> Result<()> {
         let leases: Vec<Lease> = {
             let idx = self.index.read().unwrap();
             idx.values().cloned().collect()
         };
-        let frame = encode_frame(&LeaseWalEntry::Checkpoint { leases })?;
-
-        let tmp_path = {
-            let mut p = self.path.clone().into_os_string();
-            p.push(".compact");
-            PathBuf::from(p)
-        };
         let mut file = self.file.lock().await;
-        {
-            let mut tmp = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(LedgeError::Io)?;
-            tmp.write_all(&frame).map_err(LedgeError::Io)?;
-            tmp.sync_all().map_err(LedgeError::Io)?;
-        }
-        std::fs::rename(&tmp_path, &self.path).map_err(LedgeError::Io)?;
-        if let Some(dir) = self.path.parent() {
-            if let Ok(dir_file) = std::fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
-        }
-        let mut new_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&self.path)
-            .map_err(LedgeError::Io)?;
-        new_file.seek(SeekFrom::End(0)).map_err(LedgeError::Io)?;
-        *file = new_file;
+        *file = ledge_wal::write_checkpoint(&self.path, &LeaseWalEntry::Checkpoint { leases })
+            .map_err(map_wal)?;
         Ok(())
     }
 
