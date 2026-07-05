@@ -215,9 +215,8 @@ impl WebhookStore {
         if guard.is_some() {
             // Shared primitive: crash-atomic temp + fsync + rename + dir fsync +
             // reopen; returns the fresh handle at EOF.
-            let new_file =
-                ledge_wal::write_checkpoint(&self.path, &Record::Checkpoint(webhooks))
-                    .map_err(map_wal)?;
+            let new_file = ledge_wal::write_checkpoint(&self.path, &Record::Checkpoint(webhooks))
+                .map_err(map_wal)?;
             *guard = Some(new_file);
         }
         Ok(())
