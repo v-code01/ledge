@@ -404,25 +404,35 @@ impl StateMachineStore {
                 LedgeResp::TxnState(Some(TxnDecision::Pending))
             }
             LedgeOp::TxnDecide { txn_id, commit } => {
-                let decision = if *commit {
+                let requested = if *commit {
                     TxnDecision::Commit
                 } else {
                     TxnDecision::Abort
                 };
+                // MONOTONE commit point: the FIRST terminal decision wins and can
+                // never be overwritten. This is the load-bearing invariant behind
+                // presumed-abort safety (see ledge_cluster::TxnResolver): a slow or
+                // partitioned coordinator that writes Commit AFTER the resolver has
+                // already presumed-abort must observe the recorded Abort, not
+                // override it — otherwise phase 2 would commit still-locked refs
+                // while released ones stay old, splitting the txn across shards.
+                // The response returns the WINNING decision so the coordinator can
+                // honor it. (A missing record — recovery/duplicate — is created,
+                // starting Pending, so this same monotone step lands the decision.)
+                let mut actual = requested;
                 self.txn_records.rcu(|m| {
                     let mut m = (**m).clone();
-                    // Commit point. If the record is missing (recovery/duplicate),
-                    // create it with empty participants so the durable decision
-                    // still lands.
-                    m.entry(*txn_id)
-                        .and_modify(|r| r.decision = decision)
-                        .or_insert_with(|| TxnRecord {
-                            decision,
-                            participants: Vec::new(),
-                        });
+                    let entry = m.entry(*txn_id).or_insert_with(|| TxnRecord {
+                        decision: TxnDecision::Pending,
+                        participants: Vec::new(),
+                    });
+                    if entry.decision == TxnDecision::Pending {
+                        entry.decision = requested;
+                    }
+                    actual = entry.decision;
                     m
                 });
-                LedgeResp::TxnState(Some(decision))
+                LedgeResp::TxnState(Some(actual))
             }
             LedgeOp::TxnEnd { txn_id } => {
                 self.txn_records.rcu(|m| {
@@ -1369,6 +1379,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Abort))]);
+        assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Abort));
+    }
+
+    #[tokio::test]
+    async fn txn_decide_is_monotone_late_commit_cannot_override_abort() {
+        // Presumed-abort safety: once a terminal decision is recorded, a later
+        // TxnDecide must NOT override it. A slow/partitioned coordinator writing
+        // Commit after the resolver already presumed-abort would otherwise split
+        // the txn — committing still-locked refs while released ones stay old.
+        let mut sm = StateMachineStore::new_temp().await;
+        let txn = TxnId::from_bytes([7u8; 16]);
+        sm.apply([entry(
+            1,
+            1,
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![5],
+            },
+        )])
+        .await
+        .unwrap();
+        // Resolver presumes-abort → records Abort.
+        let r = sm
+            .apply([entry(
+                1,
+                2,
+                LedgeOp::TxnDecide {
+                    txn_id: txn,
+                    commit: false,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(r, vec![LedgeResp::TxnState(Some(TxnDecision::Abort))]);
+        // Slow coordinator resumes and tries to Commit. Monotone: stays Abort, and
+        // the response returns the WINNING decision so the coordinator honors it.
+        let r = sm
+            .apply([entry(
+                1,
+                3,
+                LedgeOp::TxnDecide {
+                    txn_id: txn,
+                    commit: true,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            vec![LedgeResp::TxnState(Some(TxnDecision::Abort))],
+            "a late Commit must not override the recorded Abort"
+        );
         assert_eq!(sm.txn_decision(txn), Some(TxnDecision::Abort));
     }
 

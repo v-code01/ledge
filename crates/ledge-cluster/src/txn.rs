@@ -23,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use ledge_core::{LedgeError, ObjectId, RefName, Result, TxnId};
-use ledge_raft::{BatchOutcome, LedgeOp, TxnDecision};
+use ledge_raft::{BatchOutcome, LedgeOp, LedgeResp, TxnDecision};
 
 pub use ledge_ref_store::{AtomicCommit, AtomicCommitResult, Mapping};
 
@@ -202,7 +202,17 @@ impl AtomicCommit for TxnCoordinator {
         }
 
         // 3. Decision (the commit point) on the coordinator shard.
-        self.store
+        //
+        // TxnDecide is MONOTONE: it returns the WINNING decision, which may not be
+        // ours. If this coordinator was in-doubt past the resolver TTL (a long GC
+        // pause, or a partition from the coord shard that delayed this very write),
+        // a resolver may have already presumed-abort and recorded Abort. Honor the
+        // recorded decision — committing against a durable Abort would roll forward
+        // the refs whose locks are still held while the resolver-released ones stay
+        // old, splitting the txn across shards. `commit` (not `all_yes`) therefore
+        // drives phase 2 and the result.
+        let decide_resp = self
+            .store
             .apply_txn_record_op(
                 coord_shard,
                 LedgeOp::TxnDecide {
@@ -211,6 +221,7 @@ impl AtomicCommit for TxnCoordinator {
                 },
             )
             .await?;
+        let commit = matches!(decide_resp, LedgeResp::TxnState(Some(TxnDecision::Commit)));
 
         // 4. Phase 2: roll forward (commit) or release (abort) every ref. Sending
         //    AbortPrepared to a never-locked ref is a harmless idempotent no-op,
@@ -218,7 +229,7 @@ impl AtomicCommit for TxnCoordinator {
         let mut committed = Vec::with_capacity(mappings.len());
         for (&shard, refs) in &by_shard {
             for (name, _, _) in refs {
-                if all_yes {
+                if commit {
                     let resp = self
                         .store
                         .op_on_shard(
@@ -252,18 +263,34 @@ impl AtomicCommit for TxnCoordinator {
             .apply_txn_record_op(coord_shard, LedgeOp::TxnEnd { txn_id })
             .await?;
 
-        if all_yes {
+        if commit {
             metrics::counter!(TXN_COMMITTED_TOTAL).increment(1);
             tracing::Span::current().record("decision", "commit");
         } else {
-            metrics::counter!(TXN_ABORTED_TOTAL, "reason" => "prepare_no").increment(1);
+            // Distinguish a prepare NO (our own abort) from a presumed-abort that
+            // a resolver decided while we were in-doubt: `all_yes && !commit` means
+            // the recorded decision overrode our intended commit.
+            let reason = if all_yes {
+                "presumed_abort"
+            } else {
+                "prepare_no"
+            };
+            metrics::counter!(TXN_ABORTED_TOTAL, "reason" => reason).increment(1);
             tracing::Span::current().record("decision", "abort");
         }
         // Wall time of the whole multi-shard 2PC (begin → end), spec §7.
         metrics::histogram!(TXN_DURATION).record(started.elapsed().as_secs_f64());
 
-        if all_yes {
+        if commit {
             Ok(AtomicCommitResult::Committed(committed))
+        } else if all_yes {
+            // All voted YES but the durable decision is Abort: a resolver
+            // presumed-abort this coordinator (it was in-doubt past the TTL) and
+            // released the locks. Report the honest terminal outcome.
+            Ok(AtomicCommitResult::Aborted {
+                reason: "presumed-abort by recovery (coordinator was in-doubt)".into(),
+                conflicts,
+            })
         } else {
             Ok(AtomicCommitResult::Aborted {
                 reason: "prepare vote NO".into(),
@@ -281,25 +308,41 @@ impl AtomicCommit for TxnCoordinator {
 ///   to the participant (safe because apply is idempotent — a duplicate is a
 ///   benign ack).
 /// - **`Abort` decision** ⇒ roll back: idempotently `AbortPrepared` (release).
-/// - **`Pending` / no record, past the TTL** ⇒ **PRESUMED ABORT**: `AbortPrepared`
-///   (release the no-wait lock).
+/// - **`Pending` / no record, past the TTL** ⇒ **PRESUMED ABORT**: record a
+///   durable terminal `Abort` on the coord shard FIRST, then `AbortPrepared`
+///   (release the no-wait lock). Recording before releasing is essential (see the
+///   invariant below).
 ///
-/// Once every participant lock for a txn is resolved, the resolver records an
-/// explicit `Abort` decision for presumed-abort txns (so a concurrent reader of
-/// the coordinator record sees a terminal decision, not a stale `Pending`) and
-/// then GCs the record with `TxnEnd`.
+/// The resolver GCs (`TxnEnd`) only the records it rolled FORWARD (a durable
+/// Commit whose phase 2 it just completed); it never GCs an `Abort` record.
 ///
 /// # Presumed-abort safety invariant (the load-bearing argument)
-/// The resolver NEVER rolls a txn forward unless the coordinator shard holds a
-/// durable `TxnDecide{Commit}` record. The `TxnDecide{Commit}` log entry is the
-/// SOLE authorization to commit, and the coordinator only sends `CommitPrepared`
-/// to any participant AFTER that entry is durable (spec §3.1). Therefore a txn
-/// whose coordinator died before reaching the commit point has, by construction,
-/// never told any participant to commit — so presuming abort (releasing every
-/// lock) can never contradict a commit that already happened. Presumed abort
-/// only ever RELEASES a lock; it never installs a staged value. The decision
-/// record is the single source of truth and it is monotone (Pending → terminal),
-/// so this is sound under crash + retry.
+/// The commit decision is the single source of truth, and it is **monotone**: the
+/// state machine's `TxnDecide` keeps the FIRST terminal decision and returns it,
+/// so a decision can never flip Abort → Commit. Three properties combine to make
+/// presumed-abort safe against a slow or partitioned (not merely crashed)
+/// coordinator that resumes after the resolver has acted:
+///
+/// 1. **Record before release.** Before releasing any presumed-abort lock, the
+///    resolver makes the terminal `Abort` durable on the coord shard. So the
+///    instant any lock of a txn is released, the decision is already terminally
+///    `Abort`.
+/// 2. **Monotone decision.** A coordinator resuming after that point writes
+///    `TxnDecide{Commit}`, observes the recorded `Abort`, and cannot override it.
+/// 3. **Coordinator honors the result.** `commit_atomic` uses the decision
+///    RETURNED by `TxnDecide` (not its own intended vote) to drive phase 2, so on
+///    an observed `Abort` it releases rather than committing.
+///
+/// Together these guarantee a txn can never end up with some shards committed and
+/// others released. The `Abort` tombstone is therefore never GC'd by the resolver
+/// (a GC-then-recreate would let a late `Commit` win); it is reclaimed by the
+/// coordinator's own `TxnEnd` when it resumes and honors the abort.
+///
+/// Residual: property (1) requires this node to host the coord shard. Where it
+/// does not, the resolver leaves the lock untouched (rather than release it
+/// without a durable decision) for the coord-shard host's resolver — safe, at the
+/// cost of a longer cross-node hold. Making `TxnDecide` forwardable would let any
+/// node record the decision and resolve such locks immediately (a follow-up).
 pub struct TxnResolver {
     store: Arc<ClusterRefStore>,
     /// A `Pending`/absent decision older than this is presumed-abort.
@@ -329,34 +372,55 @@ impl TxnResolver {
     /// resolved by a concurrent access or a prior pass is simply not seen again.
     pub async fn resolve_once(&self) -> Result<usize> {
         let mut resolved = 0usize;
-        // Track which (txn, coord_shard) pairs were presumed-abort so we can write
-        // a terminal Abort decision + GC the record after the lock sweep.
-        let mut presumed_abort: BTreeSet<(TxnId, u32)> = BTreeSet::new();
-        // Track every coord-shard-resolved txn whose record we should GC.
-        let mut to_end: BTreeSet<(TxnId, u32)> = BTreeSet::new();
+        // Records to GC after the sweep. The resolver GCs ONLY txns it rolled
+        // FORWARD (a durable Commit whose phase 2 we just completed). It never GCs
+        // an Abort record — a resolver-written Abort tombstone must survive so the
+        // monotone decision stays effective against a resurrecting coordinator (a
+        // GC-then-recreate would let its late Commit win and split the txn), and a
+        // coordinator's own explicit Abort is GC'd by that coordinator's TxnEnd, or
+        // left as a small harmless record if it died.
+        let mut to_gc: BTreeSet<(TxnId, u32)> = BTreeSet::new();
 
         for (shard, locks) in self.store.prepared_locks_by_shard().await? {
             for (name, intent) in locks {
-                let coord_shard = ShardId(intent.coord_shard);
-                let decision = self.read_decision(coord_shard, intent.txn_id).await?;
+                let coord = ShardId(intent.coord_shard);
+                let mut decision = self.read_decision(coord, intent.txn_id).await?;
 
-                let roll_forward = match decision {
-                    Some(TxnDecision::Commit) => true,
-                    Some(TxnDecision::Abort) => false,
-                    // No terminal decision: presumed-abort past the TTL. With a
-                    // ZERO TTL we always release; otherwise the lock's age gates
-                    // it. SAFETY: this only releases — never commits — so it can
-                    // never contradict a real commit (see the invariant above).
-                    None | Some(TxnDecision::Pending) => {
-                        if !self.lock_is_stale(&intent) {
-                            continue; // too fresh; leave for a later pass
-                        }
-                        presumed_abort.insert((intent.txn_id, intent.coord_shard));
-                        false
+                // No terminal decision yet: presumed-abort past the TTL.
+                if matches!(decision, None | Some(TxnDecision::Pending)) {
+                    if !self.lock_is_stale(&intent) {
+                        continue; // too fresh; a live coordinator may still decide
                     }
-                };
+                    // The terminal Abort MUST become durable BEFORE this lock is
+                    // released: otherwise a slow coordinator resuming mid-sweep could
+                    // (via the monotone TxnDecide) still decide Commit and roll
+                    // forward another of this txn's still-held locks, splitting it
+                    // across shards. Only the coord-shard host can record the
+                    // decision; where this node does NOT host it, we cannot make the
+                    // abort durable, so we must NOT release the lock (releasing
+                    // without a durable decision reopens the split window) — leave it
+                    // for the coord-shard host's resolver (safe; longer cross-node
+                    // hold).
+                    if !self.store.hosts_locally(coord) {
+                        continue;
+                    }
+                    self.store
+                        .apply_txn_record_op(
+                            coord,
+                            LedgeOp::TxnDecide {
+                                txn_id: intent.txn_id,
+                                commit: false,
+                            },
+                        )
+                        .await?;
+                    // Re-read the WINNING decision: a coordinator that reached its
+                    // commit point just before us wins (monotone), so we roll forward
+                    // instead of releasing.
+                    decision = self.read_decision(coord, intent.txn_id).await?;
+                }
 
-                let op = if roll_forward {
+                let commit = decision == Some(TxnDecision::Commit);
+                let op = if commit {
                     ClusterOp::CommitPrepared {
                         txn_id: intent.txn_id,
                         name: name.clone(),
@@ -369,38 +433,22 @@ impl TxnResolver {
                 };
                 self.store.op_on_shard(shard, op).await?;
                 resolved += 1;
-                // One prepared lock resolved by crash recovery (rolled forward on
-                // a Commit decision or released on presumed-abort), spec §7.
+                // One prepared lock resolved by crash recovery, spec §7.
                 metrics::counter!(TXN_RECOVERED_TOTAL).increment(1);
-                to_end.insert((intent.txn_id, intent.coord_shard));
+                // GC only rolled-forward (Commit) records; keep every Abort.
+                if commit {
+                    to_gc.insert((intent.txn_id, intent.coord_shard));
+                }
             }
         }
 
-        // Phase 3: finalize each resolved txn's coordinator record. For a
-        // presumed-abort txn, stamp a terminal Abort (monotone Pending → Abort) so
-        // a concurrent reader observes a decision, not a stale Pending. Then GC the
-        // record. Both ops only run where THIS node hosts the coord shard (the 4a
-        // placement guarantee); a non-local coord shard is left for the node that
-        // hosts it (best-effort, idempotent).
-        for (txn_id, coord_shard) in to_end {
+        for (txn_id, coord_shard) in to_gc {
             let coord = ShardId(coord_shard);
-            if !self.store.hosts_locally(coord) {
-                continue;
-            }
-            if presumed_abort.contains(&(txn_id, coord_shard)) {
+            if self.store.hosts_locally(coord) {
                 self.store
-                    .apply_txn_record_op(
-                        coord,
-                        LedgeOp::TxnDecide {
-                            txn_id,
-                            commit: false,
-                        },
-                    )
+                    .apply_txn_record_op(coord, LedgeOp::TxnEnd { txn_id })
                     .await?;
             }
-            self.store
-                .apply_txn_record_op(coord, LedgeOp::TxnEnd { txn_id })
-                .await?;
         }
 
         Ok(resolved)

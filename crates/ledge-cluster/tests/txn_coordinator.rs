@@ -497,6 +497,114 @@ async fn resolver_presumed_aborts_with_no_decision() {
     store1.update(&a, oid(1), None).await.unwrap();
 }
 
+/// Regression for the presumed-abort SPLIT-COMMIT race.
+///
+/// A coordinator prepares refs on two shards (both locked, all YES) but then
+/// stalls past the resolver TTL — e.g. a partition to the coord shard delaying
+/// its `TxnDecide`. A resolver presumes-abort: it releases both locks and records
+/// a durable `Abort`, which it must NOT GC. When the in-doubt coordinator resumes
+/// and writes `TxnDecide{commit:true}`, the MONOTONE decision returns `Abort`, so
+/// it cannot commit either ref. Before the fix, `TxnDecide` overwrote `Abort →
+/// Commit` (and the resolver GC'd the record so a fresh Commit was recreated), and
+/// phase 2 rolled forward whichever locks were still held — splitting the txn
+/// across shards and reporting `Committed` to the caller.
+#[tokio::test]
+async fn presumed_abort_then_late_commit_does_not_split() {
+    use ledge_cluster::forward::{ClusterOp, RefOpResponse};
+    use ledge_raft::{LedgeOp, LedgeResp, TxnDecision, TxnId};
+
+    let (cluster, _map, store1) = two_shard_cluster().await;
+    let (a, b) = cluster.two_names_on_distinct_shards();
+    let a_shard = cluster.router().shard_for(a.as_str());
+    let b_shard = cluster.router().shard_for(b.as_str());
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([77u8; 16]);
+
+    // 1. Begin (Pending) + prepare BOTH refs (locked, YES). The coordinator has all
+    //    YES votes but has NOT yet written its decision.
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![a_shard.0, b_shard.0],
+            },
+        )
+        .await
+        .unwrap();
+    for (name, shard) in [(&a, a_shard), (&b, b_shard)] {
+        let v = store1
+            .op_on_shard(
+                shard,
+                ClusterOp::Prepare {
+                    txn_id: txn,
+                    coord_shard: coord_shard.0,
+                    name: name.as_str().to_string(),
+                    target_bytes: *oid(7).as_bytes(),
+                    expected_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(v, RefOpResponse::Vote(true)));
+    }
+
+    // 2. Resolver presumes-abort (ZERO TTL): releases BOTH locks and records Abort.
+    let resolver = TxnResolver::new(store1.clone()).with_ttl(std::time::Duration::ZERO);
+    assert!(
+        resolver.resolve_once().await.unwrap() >= 2,
+        "both prepared locks must be presumed-abort"
+    );
+
+    // The Abort tombstone MUST survive (not be GC'd), so a resuming coordinator
+    // observes the abort rather than a blank slate it can re-decide as Commit.
+    let decision = store1
+        .op_on_shard(
+            coord_shard,
+            ClusterOp::TxnStatus {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        RefOpResponse::TxnDecisionResp(Some(TxnDecision::Abort)),
+        "presumed-abort must leave a durable Abort tombstone, not GC the record"
+    );
+
+    // 3. The in-doubt coordinator RESUMES and writes TxnDecide{commit:true}.
+    //    Monotone ⇒ the recorded Abort wins and is returned, so the coordinator
+    //    learns it must NOT commit.
+    let resp = store1
+        .apply_txn_record_op(
+            coord_shard,
+            LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp,
+        LedgeResp::TxnState(Some(TxnDecision::Abort)),
+        "a late Commit must be rejected by the monotone decision, returning Abort"
+    );
+
+    // 4. Neither ref advanced: no split. (The locks are gone, so even a buggy
+    //    phase-2 CommitPrepared could install no new value.)
+    assert!(
+        store1.get(&a).await.unwrap().is_none(),
+        "a must remain aborted (old/absent), never committed"
+    );
+    assert!(
+        store1.get(&b).await.unwrap().is_none(),
+        "b must remain aborted (old/absent), never committed"
+    );
+}
+
 /// Running the resolver TWICE on the same already-resolved (committed) txn is
 /// safe: the second pass is a no-op (it finds no lock to resolve) and the ref is
 /// unchanged. Proves resolver retry-safety on top of idempotent apply.
