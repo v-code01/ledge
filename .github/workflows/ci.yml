@@ -38,8 +38,16 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Everything except the cluster crate runs with default parallelism.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude ledge-cluster
+      # The ledge-cluster integration tests each spin up a multi-node Raft
+      # cluster. Running several at once on the 2-core runner starves their
+      # election timers into a livelock (observed: one test wedged ~22m until the
+      # job timeout). Serialize them (--test-threads=1) so only one cluster runs
+      # at a time — they pass reliably given CPU; the hang was pure starvation.
+      - name: Test (cluster, serialized)
+        run: cargo test -p ledge-cluster -- --test-threads=1
 
   docker:
     runs-on: ubuntu-latest
