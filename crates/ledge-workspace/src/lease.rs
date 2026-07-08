@@ -119,14 +119,18 @@ impl LeaseStore {
     }
 
     /// Append a `Put` frame and upsert the live index. Create-or-update.
+    ///
+    /// The WAL append and the index update happen under a single hold of the file
+    /// lock, so the on-disk frame and the in-memory entry move together with
+    /// respect to `compact` (which also snapshots the index under that lock).
+    /// Without this, a concurrent compaction could snapshot the index after the
+    /// frame was appended but before it was indexed, then erase the frame in the
+    /// whole-file replacement — losing an acked lease on the next reopen.
     pub async fn put(&self, lease: Lease) -> Result<()> {
-        {
-            let mut file = self.file.lock().await;
-            // Durable (write + fsync) before returning so an acked lease survives
-            // power loss, not just a process crash.
-            ledge_wal::append_record(&mut file, &LeaseWalEntry::Put(lease.clone()))
-                .map_err(map_wal)?;
-        }
+        let mut file = self.file.lock().await;
+        // Durable (write + fsync) before returning so an acked lease survives
+        // power loss, not just a process crash.
+        ledge_wal::append_record(&mut file, &LeaseWalEntry::Put(lease.clone())).map_err(map_wal)?;
         self.index.write().unwrap().insert(lease.id, lease);
         Ok(())
     }
@@ -153,13 +157,13 @@ impl LeaseStore {
     ///
     /// Idempotent: tombstoning an absent id is a no-op write + no-op remove.
     pub async fn tombstone_with_hlc(&self, id: WorkspaceId, hlc: u64) -> Result<()> {
-        {
-            let mut file = self.file.lock().await;
-            // Durable before returning: a tombstone lost on power loss would
-            // resurrect a released lease on restart.
-            ledge_wal::append_record(&mut file, &LeaseWalEntry::Tombstone { id, hlc })
-                .map_err(map_wal)?;
-        }
+        // Append + index removal under one file-lock hold, consistent with
+        // `put`/`compact` (see `put` for the compaction-race rationale).
+        let mut file = self.file.lock().await;
+        // Durable before returning: a tombstone lost on power loss would
+        // resurrect a released lease on restart.
+        ledge_wal::append_record(&mut file, &LeaseWalEntry::Tombstone { id, hlc })
+            .map_err(map_wal)?;
         self.index.write().unwrap().remove(&id);
         Ok(())
     }
@@ -219,17 +223,14 @@ impl LeaseStore {
     /// old log or the new checkpoint, never a torn frame 0 (which open() now
     /// rejects — losing every lease).
     ///
-    /// NOTE: the checkpoint snapshot is still taken before the file lock, so a
-    /// concurrent `put`/`tombstone` racing this compaction can be lost (the
-    /// LeaseStore analogue of the ref-store compaction/append race). Closing that
-    /// uniformly is the remaining follow-up on top of the ledge-wal extraction;
-    /// this path already removes the far more severe whole-file-loss risk.
+    /// The index snapshot is taken UNDER the file lock, and `put`/`tombstone`
+    /// update the index under that same lock, so the checkpoint payload always
+    /// matches the frames it replaces — a concurrent write is either fully
+    /// captured in the snapshot or lands as a fresh frame after the new
+    /// checkpoint, never erased. This closes the compaction/append race.
     pub async fn compact(&self) -> Result<()> {
-        let leases: Vec<Lease> = {
-            let idx = self.index.read().unwrap();
-            idx.values().cloned().collect()
-        };
         let mut file = self.file.lock().await;
+        let leases: Vec<Lease> = self.index.read().unwrap().values().cloned().collect();
         *file = ledge_wal::write_checkpoint(&self.path, &LeaseWalEntry::Checkpoint { leases })
             .map_err(map_wal)?;
         Ok(())
@@ -524,6 +525,65 @@ mod tests {
             LeaseStore::open(dir.path().to_path_buf(), h).is_err(),
             "mid-stream corruption must fail open, not silently drop leases"
         );
+    }
+
+    /// Compaction/append race guard: many concurrent `put`s against repeated
+    /// `compact`s, then reopen from the WAL alone — every acked lease must
+    /// survive. The fix (append + index update + checkpoint snapshot all under
+    /// one file-lock hold) makes a put either fully captured by a compaction's
+    /// snapshot or written as a fresh frame after it, never erased.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_survive_compaction() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 40;
+        const COMPACTORS: usize = 3;
+        let h = hlc();
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store = Arc::new(LeaseStore::open(path.clone(), h.clone()).unwrap());
+
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let s = Arc::clone(&store);
+            let hh = h.clone();
+            writers.push(tokio::spawn(async move {
+                let mut ids = Vec::new();
+                for _ in 0..PER_WRITER {
+                    let id = WorkspaceId::generate(&hh);
+                    s.put(lease(id, now_ms() + 10_000)).await.unwrap();
+                    ids.push(id);
+                    tokio::task::yield_now().await;
+                }
+                ids
+            }));
+        }
+        let mut compactors = Vec::new();
+        for _ in 0..COMPACTORS {
+            let s = Arc::clone(&store);
+            compactors.push(tokio::spawn(async move {
+                for _ in 0..(PER_WRITER * 2) {
+                    s.compact().await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        let mut all_ids = Vec::new();
+        for w in writers {
+            all_ids.extend(w.await.unwrap());
+        }
+        for c in compactors {
+            c.await.unwrap();
+        }
+
+        // Reopen from the WAL only — no in-memory state carries over.
+        drop(store);
+        let store = LeaseStore::open(path, h).unwrap();
+        for id in all_ids {
+            assert!(
+                store.get(id).await.unwrap().is_some(),
+                "lease {id:?} lost across compaction + reopen"
+            );
+        }
     }
 
     #[tokio::test]

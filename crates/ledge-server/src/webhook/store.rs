@@ -111,10 +111,12 @@ impl WebhookStore {
         index
     }
 
-    /// Append a frame to the WAL if persistent; no-op if in-memory. Durable
-    /// (write + fsync) before returning.
-    fn append(&self, entry: &Record) -> Result<()> {
-        let mut guard = self.file.lock().unwrap();
+    /// Durably append a frame under an already-held file guard; no-op if
+    /// in-memory. Taking the guard lets `register`/`delete` hold the file lock
+    /// across BOTH the append and the index update, keeping the on-disk frame and
+    /// the index entry consistent with a concurrent `compact` (which snapshots
+    /// the index under the same lock). Write + fsyncs before returning.
+    fn append_locked(guard: &mut Option<std::fs::File>, entry: &Record) -> Result<()> {
         if let Some(file) = guard.as_mut() {
             ledge_wal::append_record(file, entry).map_err(map_wal)?;
         }
@@ -147,7 +149,8 @@ impl WebhookStore {
             created_at_ms: now_ms,
             active: true,
         };
-        self.append(&Record::Upsert(cfg.clone()))?;
+        let mut guard = self.file.lock().unwrap();
+        Self::append_locked(&mut guard, &Record::Upsert(cfg.clone()))?;
         self.index.write().unwrap().insert(cfg.id, cfg.clone());
         Ok(cfg)
     }
@@ -167,15 +170,18 @@ impl WebhookStore {
     /// `Delete` frame and removes it from the index. Returns whether a webhook
     /// was removed (a foreign or absent id ⇒ `false`, no mutation).
     pub fn delete(&self, tenant: &str, id: WebhookId) -> Result<bool> {
+        // Hold the file lock across the ownership check, append, and index removal
+        // so the frame and index entry move together w.r.t. a concurrent compact.
+        let mut guard = self.file.lock().unwrap();
         {
-            // Ownership check under the read lock before any persistence.
+            // Ownership check before any persistence.
             let idx = self.index.read().unwrap();
             match idx.get(&id) {
                 Some(w) if w.tenant_id == tenant => {}
                 _ => return Ok(false),
             }
         }
-        self.append(&Record::Delete(id))?;
+        Self::append_locked(&mut guard, &Record::Delete(id))?;
         Ok(self.index.write().unwrap().remove(&id).is_some())
     }
 
@@ -204,15 +210,17 @@ impl WebhookStore {
     /// Crash-atomic: temp file + fsync + atomic rename + dir fsync + handle
     /// reopen, so a crash mid-rewrite leaves either the intact old log or the new
     /// checkpoint — never a torn frame 0, which open() now rejects (losing every
-    /// webhook). The pre-lock snapshot race is deferred to the shared ledge-wal
-    /// extraction, as in AuthStore::compact.
+    /// webhook).
+    ///
+    /// The index snapshot is taken UNDER the file lock, and `register`/`delete`
+    /// update the index under that same lock, so the checkpoint payload matches
+    /// the frames it replaces — a concurrent register/delete is either captured in
+    /// the snapshot or lands as a fresh frame after it, never erased.
     pub fn compact(&self) -> Result<()> {
-        let webhooks: Vec<WebhookConfig> = {
-            let idx = self.index.read().unwrap();
-            idx.values().cloned().collect()
-        };
         let mut guard = self.file.lock().unwrap();
         if guard.is_some() {
+            let webhooks: Vec<WebhookConfig> =
+                self.index.read().unwrap().values().cloned().collect();
             // Shared primitive: crash-atomic temp + fsync + rename + dir fsync +
             // reopen; returns the fresh handle at EOF.
             let new_file = ledge_wal::write_checkpoint(&self.path, &Record::Checkpoint(webhooks))
@@ -315,5 +323,64 @@ mod tests {
             WebhookStore::open(dir.path().to_path_buf(), hlc).is_err(),
             "mid-stream corruption must fail open, not silently drop webhooks"
         );
+    }
+
+    /// Compaction/append race guard: concurrent `register`s against repeated
+    /// `compact`s (real threads — the API is sync), then reopen — every
+    /// registered webhook must survive. The fix (append + index update +
+    /// checkpoint snapshot under one file-lock hold) means a register is either
+    /// captured in a compaction's snapshot or written as a fresh frame after it.
+    #[test]
+    fn concurrent_registers_survive_compaction() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        const WRITERS: usize = 6;
+        const PER_WRITER: usize = 30;
+        const COMPACTORS: usize = 3;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let hlc = Arc::new(ledge_core::HLC::new());
+        let store = Arc::new(WebhookStore::open(path.clone(), hlc.clone()).unwrap());
+
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let s = Arc::clone(&store);
+            writers.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..PER_WRITER {
+                    let w = s.register("acme", "http://sink".into(), vec![], 0).unwrap();
+                    ids.push(w.id);
+                    std::thread::yield_now();
+                }
+                ids
+            }));
+        }
+        let mut compactors = Vec::new();
+        for _ in 0..COMPACTORS {
+            let s = Arc::clone(&store);
+            compactors.push(std::thread::spawn(move || {
+                for _ in 0..(PER_WRITER * 2) {
+                    s.compact().unwrap();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        let mut all_ids = Vec::new();
+        for w in writers {
+            all_ids.extend(w.join().unwrap());
+        }
+        for c in compactors {
+            c.join().unwrap();
+        }
+
+        drop(store);
+        let store = WebhookStore::open(path, hlc).unwrap();
+        let present: HashSet<WebhookId> = store.list("acme").into_iter().map(|w| w.id).collect();
+        for id in all_ids {
+            assert!(
+                present.contains(&id),
+                "webhook {id:?} lost across compaction + reopen"
+            );
+        }
     }
 }

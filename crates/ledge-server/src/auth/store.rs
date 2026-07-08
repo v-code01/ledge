@@ -167,12 +167,15 @@ impl AuthStore {
         index
     }
 
-    /// Append a frame to the WAL if persistent; no-op if in-memory.
-    async fn append(&self, entry: &AuthWalEntry) -> Result<()> {
-        let mut guard = self.file.lock().await;
+    /// Durably append a frame under an already-held file guard; no-op if
+    /// in-memory. Taking the guard as a parameter (rather than locking here) lets
+    /// `put`/`revoke` hold the file lock across BOTH the append and the index
+    /// update, so the on-disk frame and the index entry stay consistent with a
+    /// concurrent `compact` (which snapshots the index under the same lock). An
+    /// acked key create — or, more importantly, a REVOCATION — must survive power
+    /// loss, so the append write + fsyncs before returning.
+    fn append_locked(guard: &mut Option<std::fs::File>, entry: &AuthWalEntry) -> Result<()> {
         if let Some(file) = guard.as_mut() {
-            // Durable (write + fsync) before returning: an acked key create — or,
-            // more importantly, a REVOCATION — must survive power loss.
             ledge_wal::append_record(file, entry).map_err(map_wal)?;
         }
         Ok(())
@@ -180,7 +183,8 @@ impl AuthStore {
 
     /// Append a `Put` frame and upsert the index. Create-or-update.
     pub async fn put(&self, rec: ApiKeyRecord) -> Result<()> {
-        self.append(&AuthWalEntry::Put(rec.clone())).await?;
+        let mut guard = self.file.lock().await;
+        Self::append_locked(&mut guard, &AuthWalEntry::Put(rec.clone()))?;
         self.index.write().unwrap().insert(rec.key_id.clone(), rec);
         Ok(())
     }
@@ -189,11 +193,14 @@ impl AuthStore {
     /// `true` if a key was present to revoke, `false` otherwise (idempotent).
     pub async fn revoke(&self, key_id: &str) -> Result<bool> {
         let hlc = self.hlc.tick();
-        self.append(&AuthWalEntry::Revoke {
-            key_id: key_id.to_string(),
-            hlc,
-        })
-        .await?;
+        let mut guard = self.file.lock().await;
+        Self::append_locked(
+            &mut guard,
+            &AuthWalEntry::Revoke {
+                key_id: key_id.to_string(),
+                hlc,
+            },
+        )?;
         let mut idx = self.index.write().unwrap();
         match idx.get_mut(key_id) {
             Some(r) => {
@@ -327,25 +334,33 @@ impl AuthStore {
     /// Crash-atomic via the shared `ledge_wal::write_checkpoint` (temp + fsync +
     /// rename + dir fsync + reopen): a crash mid-rewrite leaves either the intact
     /// old log or the new checkpoint, never a torn frame 0 (which open() now
-    /// rejects — losing every key). The pre-lock snapshot race is deferred to a
-    /// follow-up; see the module note on the ledge-wal extraction.
+    /// rejects — losing every key).
+    ///
+    /// The key snapshot and the post-compaction index cleanup both run UNDER the
+    /// file lock, and `put`/`revoke` update the index under that same lock, so the
+    /// checkpoint payload always matches the frames it replaces — a concurrent
+    /// mint or revoke is either captured in the snapshot or lands as a fresh frame
+    /// after the new checkpoint, never erased.
     pub async fn compact(&self) -> Result<()> {
-        let keys: Vec<ApiKeyRecord> = {
-            let idx = self.index.read().unwrap();
-            idx.values().filter(|r| !r.revoked).cloned().collect()
-        };
-        {
-            let mut guard = self.file.lock().await;
-            if guard.is_some() {
-                let new_file =
-                    ledge_wal::write_checkpoint(&self.path, &AuthWalEntry::Checkpoint { keys })
-                        .map_err(map_wal)?;
-                *guard = Some(new_file);
-            }
+        let mut guard = self.file.lock().await;
+        if guard.is_some() {
+            let keys: Vec<ApiKeyRecord> = self
+                .index
+                .read()
+                .unwrap()
+                .values()
+                .filter(|r| !r.revoked)
+                .cloned()
+                .collect();
+            let new_file =
+                ledge_wal::write_checkpoint(&self.path, &AuthWalEntry::Checkpoint { keys })
+                    .map_err(map_wal)?;
+            *guard = Some(new_file);
         }
-        // Drop revoked keys from the index post-compaction (they are gone on disk).
-        let mut idx = self.index.write().unwrap();
-        idx.retain(|_, r| !r.revoked);
+        // Drop revoked keys from the index (gone on disk after the checkpoint; a
+        // pure in-memory cleanup when not persistent). Under the file lock so the
+        // index matches the just-written checkpoint in persistent mode.
+        self.index.write().unwrap().retain(|_, r| !r.revoked);
         Ok(())
     }
 
@@ -607,6 +622,64 @@ mod tests {
             AuthStore::open(dir.path().to_path_buf(), hlc()).is_err(),
             "mid-stream corruption must fail open, not silently drop key records"
         );
+    }
+
+    /// Compaction/append race guard: concurrent `mint`s against repeated
+    /// `compact`s, then reopen — every minted key must still verify. The fix
+    /// (append + index update + checkpoint snapshot under one file-lock hold)
+    /// means a mint is either captured by a compaction's snapshot or written as a
+    /// fresh frame after it, never erased.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mints_survive_compaction() {
+        const WRITERS: usize = 6;
+        const PER_WRITER: usize = 30;
+        const COMPACTORS: usize = 3;
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store = Arc::new(AuthStore::open(path.clone(), hlc()).unwrap());
+
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let s = Arc::clone(&store);
+            writers.push(tokio::spawn(async move {
+                let mut tokens = Vec::new();
+                for _ in 0..PER_WRITER {
+                    let t = s
+                        .mint("t", PrincipalKind::User, rw_scopes(), None, 0)
+                        .await
+                        .unwrap();
+                    tokens.push(t);
+                    tokio::task::yield_now().await;
+                }
+                tokens
+            }));
+        }
+        let mut compactors = Vec::new();
+        for _ in 0..COMPACTORS {
+            let s = Arc::clone(&store);
+            compactors.push(tokio::spawn(async move {
+                for _ in 0..(PER_WRITER * 2) {
+                    s.compact().await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        let mut all_tokens = Vec::new();
+        for w in writers {
+            all_tokens.extend(w.await.unwrap());
+        }
+        for c in compactors {
+            c.await.unwrap();
+        }
+
+        drop(store);
+        let store = AuthStore::open(path, hlc()).unwrap();
+        for t in &all_tokens {
+            assert!(
+                store.verify(t, 0).is_some(),
+                "minted key lost across compaction + reopen"
+            );
+        }
     }
 
     #[tokio::test]
