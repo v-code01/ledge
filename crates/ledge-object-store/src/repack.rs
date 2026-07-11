@@ -132,6 +132,22 @@ pub async fn repack(store: &DiskObjectStore) -> ledge_core::Result<RepackStats> 
     }
     let new_pf = crate::git_pack_file::GitPackFile::open(&dir.join(format!("{name}.pack")))?;
     let new_ids = new_pf.oids();
+
+    // Completeness guard: the new pack MUST contain every object we set out to
+    // pack. A dropped object would be lost once its loose/old-pack source is
+    // deleted below, and the read-back loop cannot catch it (it only checks the
+    // objects that ARE present, never an absence). Fail here — before the swap —
+    // with every loose file and old pack still intact.
+    {
+        let packed: std::collections::HashSet<ObjectId> = new_ids.iter().copied().collect();
+        if let Some(missing) = all_ids.iter().find(|id| !packed.contains(id)) {
+            return Err(ledge_core::LedgeError::Corruption(format!(
+                "repack: object {} missing from the new pack; refusing to delete sources",
+                missing.to_hex()
+            )));
+        }
+    }
+
     store.swap_packs(vec![std::sync::Arc::new(new_pf)]); // register BEFORE any delete
 
     // verify every object reads back through the real (now pack-backed) path
