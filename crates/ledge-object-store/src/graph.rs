@@ -22,18 +22,39 @@ pub fn parse_hex_sha1(hex_str: &str) -> Option<[u8; 20]> {
     Some(arr)
 }
 
+/// Decode a 40-char ASCII-hex SHA-1 from raw header-value bytes, tolerating
+/// surrounding ASCII whitespace (e.g. a stray CR).
+///
+/// Byte-oriented so it never requires the enclosing object to be valid UTF-8:
+/// git commit/tag *messages* and author/tagger *names* may contain arbitrary
+/// bytes, but the structural `key SP <40-hex> LF` header lines the reachability
+/// walk cares about are pure ASCII. Requiring the whole object to be UTF-8 would
+/// make these parsers silently return nothing for such objects — dropping their
+/// tree/parent/tagged refs from the reachable set (GC data loss + broken clones).
+fn parse_hex_sha1_bytes(value: &[u8]) -> Option<[u8; 20]> {
+    let trimmed = value.trim_ascii();
+    if trimmed.len() != 40 {
+        return None;
+    }
+    let mut arr = [0u8; 20];
+    hex::decode_to_slice(trimmed, &mut arr).ok()?;
+    Some(arr)
+}
+
 /// Extract the `tree` SHA-1 from a git commit object body.
 ///
 /// A commit body is a header block of `key SP value LF` lines (the first line
 /// is always `tree <40-hex-sha1>`), a blank line, then the message.
 pub fn commit_tree_sha1(content: &[u8]) -> Option<[u8; 20]> {
-    let text = std::str::from_utf8(content).ok()?;
-    for line in text.lines() {
+    // Byte-oriented: scan header lines only, stopping at the blank line. Never
+    // requires UTF-8 (a non-UTF-8 message must not hide the tree — see
+    // parse_hex_sha1_bytes).
+    for line in content.split(|&b| b == b'\n') {
         if line.is_empty() {
             break; // end of header block
         }
-        if let Some(rest) = line.strip_prefix("tree ") {
-            return parse_hex_sha1(rest.trim());
+        if let Some(rest) = line.strip_prefix(b"tree ") {
+            return parse_hex_sha1_bytes(rest);
         }
     }
     None
@@ -42,15 +63,13 @@ pub fn commit_tree_sha1(content: &[u8]) -> Option<[u8; 20]> {
 /// Extract all `parent` SHA-1s from a git commit object body (0+ entries).
 pub fn commit_parent_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
     let mut parents = Vec::new();
-    if let Ok(text) = std::str::from_utf8(content) {
-        for line in text.lines() {
-            if line.is_empty() {
-                break; // end of header block
-            }
-            if let Some(rest) = line.strip_prefix("parent ") {
-                if let Some(sha1) = parse_hex_sha1(rest.trim()) {
-                    parents.push(sha1);
-                }
+    for line in content.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            break; // end of header block
+        }
+        if let Some(rest) = line.strip_prefix(b"parent ") {
+            if let Some(sha1) = parse_hex_sha1_bytes(rest) {
+                parents.push(sha1);
             }
         }
     }
@@ -64,13 +83,14 @@ pub fn commit_parent_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
 /// by `type`/`tag`/`tagger` lines, a blank line, then the message. Returns the
 /// tagged object's SHA-1 so a walker follows a tag through to what it references.
 pub fn tag_object_sha1(content: &[u8]) -> Option<[u8; 20]> {
-    let text = std::str::from_utf8(content).ok()?;
-    for line in text.lines() {
+    // Byte-oriented (see commit_tree_sha1): a tag's tagger name or message may
+    // contain arbitrary bytes, but the `object <40-hex>` line is ASCII.
+    for line in content.split(|&b| b == b'\n') {
         if line.is_empty() {
             break; // end of header block
         }
-        if let Some(rest) = line.strip_prefix("object ") {
-            return parse_hex_sha1(rest.trim());
+        if let Some(rest) = line.strip_prefix(b"object ") {
+            return parse_hex_sha1_bytes(rest);
         }
     }
     None
@@ -244,6 +264,46 @@ mod tests {
         let mut torn = tree.clone();
         torn.extend_from_slice(b"100644 b.txt\0\x01\x02"); // sha cut short
         assert_eq!(tree_entries(&torn).len(), 2);
+    }
+
+    /// Git commit/tag headers are followed by author/tagger names and a message
+    /// that may contain arbitrary (non-UTF-8) bytes. The reachability parsers must
+    /// still extract the ASCII `tree`/`parent`/`object` header lines — a UTF-8
+    /// requirement would silently drop them, so GC would delete the (reachable)
+    /// tree/parents and a clone would ship an incomplete pack.
+    #[test]
+    fn header_parsers_tolerate_non_utf8_message_and_names() {
+        let tree_hex = "00".repeat(20);
+        let parent_hex = "11".repeat(20);
+        let mut commit = Vec::new();
+        commit.extend_from_slice(format!("tree {tree_hex}\n").as_bytes());
+        commit.extend_from_slice(format!("parent {parent_hex}\n").as_bytes());
+        // Non-UTF-8 bytes in the author/committer names (git permits them).
+        commit.extend_from_slice(b"author N\xffme <n@x> 1 +0000\n");
+        commit.extend_from_slice(b"committer N\xffme <n@x> 1 +0000\n\n");
+        commit.extend_from_slice(b"message with raw bytes \xff\xfe and more\n");
+        assert_eq!(
+            commit_tree_sha1(&commit),
+            Some([0x00u8; 20]),
+            "tree must be found despite non-UTF-8 author/message"
+        );
+        assert_eq!(
+            commit_parent_sha1s(&commit),
+            vec![[0x11u8; 20]],
+            "parent must be found despite non-UTF-8 author/message"
+        );
+
+        let obj_hex = "22".repeat(20);
+        let mut tag = Vec::new();
+        tag.extend_from_slice(format!("object {obj_hex}\n").as_bytes());
+        tag.extend_from_slice(b"type commit\ntag v1\n");
+        tag.extend_from_slice(b"tagger N\xffme <n@x> 1 +0000\n\n");
+        tag.extend_from_slice(b"tag message \xff\n");
+        assert_eq!(
+            tag_object_sha1(&tag),
+            Some([0x22u8; 20]),
+            "tagged object must be found despite non-UTF-8 tagger/message"
+        );
     }
 
     fn make_store() -> (DiskObjectStore, tempfile::TempDir) {
