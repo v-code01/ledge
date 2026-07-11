@@ -146,6 +146,11 @@ impl ClusterGc {
         // ── 4. Mark ──────────────────────────────────────────────────────────
         let reachable: HashSet<ObjectId> = graph::reachable_from(&self.objects, roots).await?;
         let reachable_count = reachable.len();
+        // Close the keep-set under the delta-base relation: a reachable object
+        // stored as a delta needs its base kept too, even when the base is not
+        // itself ref-reachable — else the delta becomes unreadable (data loss).
+        // The single-node GC already does this; the cluster GC must match.
+        let keep = graph::close_under_delta_bases(&self.objects, reachable).await?;
 
         // ── 5. Grace-fenced sweep ────────────────────────────────────────────
         // Delete each candidate that is unreachable AND older than `grace`. A
@@ -157,7 +162,7 @@ impl ClusterGc {
         let mut bytes_freed = 0u64;
         let mut skipped_grace = 0usize;
         for id in candidates {
-            if reachable.contains(&id) {
+            if keep.contains(&id) {
                 continue;
             }
             let path = self.objects.object_path(&id);
@@ -369,6 +374,77 @@ mod tests {
         assert!(
             !objects.exists(orphan).await.unwrap(),
             "orphan gone after sweep"
+        );
+    }
+
+    /// Regression: the cluster GC must retain the base of a kept delta, exactly
+    /// like the single-node GC. `a` is delta-encoded against `base`; only `a` is
+    /// ref-reachable (via a tree → commit → durable ref), so `base` is reachable
+    /// ONLY through the delta-base relation. Before the delta-base-closure fix the
+    /// cluster GC swept `base` (unreachable) and left `a` unreadable — data loss.
+    #[tokio::test]
+    async fn cluster_gc_retains_base_of_a_kept_delta() {
+        use ledge_core::{RefName, RefStore};
+
+        let (_dir, _cluster, store1, objects, leases, _hlc) = gc_harness().await;
+
+        // `base` + an edited copy that deltifies small against it.
+        let base_content: Vec<u8> = (0..400)
+            .flat_map(|i| format!("l{i}\n").into_bytes())
+            .collect();
+        let edited: Vec<u8> = String::from_utf8(base_content.clone())
+            .unwrap()
+            .replace("l200\n", "EDIT\n")
+            .into_bytes();
+        let base = write_blob(&objects, &base_content).await;
+        let a = write_blob(&objects, &edited).await;
+        assert!(
+            objects.deltify(a, base).await.unwrap(),
+            "a is now a delta on base"
+        );
+
+        // Make ONLY `a` reachable: tree → a, commit → tree, durable ref → commit.
+        let a_sha1 = objects.sha1_of(a).await.unwrap();
+        let mut tree_body = Vec::new();
+        tree_body.extend_from_slice(b"100644 a.txt\0");
+        tree_body.extend_from_slice(&a_sha1);
+        let tree = objects
+            .write_git_object(2, Bytes::from(tree_body))
+            .await
+            .unwrap();
+        let tree_sha1 = objects.sha1_of(tree).await.unwrap();
+        let tree_hex: String = tree_sha1.iter().map(|b| format!("{b:02x}")).collect();
+        let commit_body =
+            format!("tree {tree_hex}\nauthor a <a@x> 1 +0000\ncommitter a <a@x> 1 +0000\n\nmsg\n");
+        let commit = objects
+            .write_git_object(1, Bytes::from(commit_body.into_bytes()))
+            .await
+            .unwrap();
+        store1
+            .update(&RefName::new("refs/heads/main").unwrap(), commit, None)
+            .await
+            .unwrap();
+
+        // Grace 0, clock far in the future so every unreachable candidate is
+        // sweepable — only the delta-base closure can save `base`.
+        let usage = Arc::new(UsageMap::default());
+        let gc = ClusterGc::new(
+            store1.clone(),
+            leases.clone(),
+            objects.clone(),
+            Duration::ZERO,
+            usage,
+        );
+        gc.run(4_000_000_000).await.unwrap();
+
+        assert!(
+            objects.exists(base).await.unwrap(),
+            "cluster GC MUST retain the delta base (a needs it)"
+        );
+        assert_eq!(
+            ObjectStore::read(&*objects, a).await.unwrap().as_ref(),
+            edited.as_slice(),
+            "a still resolves after GC"
         );
     }
 

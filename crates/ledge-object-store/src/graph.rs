@@ -234,6 +234,36 @@ pub async fn reachable_from(
     Ok(visited)
 }
 
+/// Expand `set` to its closure under the delta-base relation: for every id stored
+/// as a delta, transitively include its base.
+///
+/// A kept delta whose base is reclaimed becomes unreadable (the delta can no
+/// longer be reconstructed), so any GC keep-set must be closed under this
+/// relation before sweeping — objects are delta-encoded against bases chosen for
+/// size, and a base need not itself be ref-reachable. Both the single-node
+/// (`ledge-workspace`) and clustered (`ledge-cluster`) GC passes rely on this.
+///
+/// Header-only `delta_base_of` reads. Termination: each step either inserts a NEW
+/// id (the set grows monotonically, bounded by the finite on-disk object
+/// population) or stops; no id is enqueued onto the frontier twice.
+pub async fn close_under_delta_bases(
+    store: &DiskObjectStore,
+    set: HashSet<ObjectId>,
+) -> ledge_core::Result<HashSet<ObjectId>> {
+    let mut keep = set;
+    let mut frontier: Vec<ObjectId> = keep.iter().copied().collect();
+    while let Some(id) = frontier.pop() {
+        if let Some(base) = store.delta_base_of(id).await? {
+            // `insert` returns true only the first time `base` is seen, so a base
+            // is enqueued at most once even with diamond delta chains.
+            if keep.insert(base) {
+                frontier.push(base);
+            }
+        }
+    }
+    Ok(keep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

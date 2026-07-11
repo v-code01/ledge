@@ -166,10 +166,8 @@ impl Gc {
 
         // Close the keep-set under the delta-base relation: a kept delta's base
         // must be kept too, else the delta becomes unreadable (data loss). Task 3.
-        // Header-only `delta_base_of` walk; the closure terminates because every
-        // step either inserts a NEW id into `keep` (a finite set bounded by the
-        // candidate population) or stops — no id is revisited.
-        let keep = self.close_under_delta_bases(reachable).await?;
+        // Shared with the cluster GC (header-only `delta_base_of` walk).
+        let keep = graph::close_under_delta_bases(&self.objects, reachable).await?;
 
         // ── 4. Grace-fenced sweep ────────────────────────────────────────────
         // Delete each candidate that is unreachable AND older than `grace` (by
@@ -233,7 +231,7 @@ impl Gc {
             // Close under delta-bases: a base backing a kept delta is real on-disk
             // bytes GC retains for this tenant, so it must count toward the
             // tenant's measured usage (and is retained by the closure, Task 3).
-            let reachable = self.close_under_delta_bases(reachable).await?;
+            let reachable = graph::close_under_delta_bases(&self.objects, reachable).await?;
             let mut bytes = 0u64;
             let objects = reachable.len() as u64;
             for id in &reachable {
@@ -267,30 +265,6 @@ impl Gc {
         );
 
         Ok(stats)
-    }
-
-    /// Expand `set` to its closure under the delta-base relation: for every id in
-    /// the set that is stored as a delta, transitively include its base (Task 3,
-    /// delta retention). A kept delta whose base is reclaimed becomes unreadable —
-    /// the closure prevents that data loss.
-    ///
-    /// Complexity: O(|closure|) header-only reads (`delta_base_of` reads only the
-    /// 56-byte object header). Termination: each iteration either inserts a NEW id
-    /// (the `keep` set grows monotonically and is bounded by the finite on-disk
-    /// object population) or stops; no id is pushed onto the frontier twice.
-    async fn close_under_delta_bases(&self, set: HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
-        let mut keep = set;
-        let mut frontier: Vec<ObjectId> = keep.iter().copied().collect();
-        while let Some(id) = frontier.pop() {
-            if let Some(base) = self.objects.delta_base_of(id).await? {
-                // `insert` returns true only the first time `base` is seen, so a
-                // base is enqueued at most once even with diamond delta chains.
-                if keep.insert(base) {
-                    frontier.push(base);
-                }
-            }
-        }
-        Ok(keep)
     }
 }
 
