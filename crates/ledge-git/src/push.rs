@@ -17,6 +17,9 @@ use std::sync::Arc;
 
 use crate::fetch::Sha1Provider;
 use crate::pack_delta::{apply_delta, read_ofs_varint};
+use ledge_object_store::graph::{
+    commit_parent_sha1s, commit_tree_sha1, tag_object_sha1, tree_child_sha1s,
+};
 
 /// Hard cap on a single decompressed pack object — defends the receive-pack path
 /// against zlib decompression bombs in an untrusted pushed pack. 1 GiB is far
@@ -241,6 +244,10 @@ pub async fn handle_receive_pack(
         std::collections::HashMap::new();
 
     let pack_bytes = cursor;
+    // Every SHA-1 named by a pushed object (a commit's tree/parents, a tree's
+    // children, a tag's target). Each must be resolvable once the push is
+    // unpacked, or the ref would advance to a closure we cannot serve.
+    let mut referenced: Vec<[u8; 20]> = Vec::new();
     if !pack_bytes.is_empty() {
         let decoded = decode_pack_objects(pack_bytes, sha1_store).await?;
         for (kind_byte, content) in decoded {
@@ -254,6 +261,16 @@ pub async fn handle_receive_pack(
             use sha1::{Digest, Sha1};
             let sha1: [u8; 20] = Sha1::digest(&sha1_input).into();
 
+            match kind_byte {
+                1 => {
+                    referenced.extend(commit_tree_sha1(&content));
+                    referenced.extend(commit_parent_sha1s(&content));
+                }
+                2 => referenced.extend(tree_child_sha1s(&content)),
+                4 => referenced.extend(tag_object_sha1(&content)),
+                _ => {}
+            }
+
             // Persist the object together with its git type so the fetch path
             // can serve the correct typed SHA-1 and reconstruct a typed pack.
             let obj_bytes = Bytes::from(content);
@@ -262,11 +279,43 @@ pub async fn handle_receive_pack(
         }
     }
 
+    // ── Step 2b: connectivity check ────────────────────────────────────────
+    // A ref may only advance to a commit whose whole object closure we can
+    // serve. Anything a pushed object names must be either in this push or
+    // already in the store; an object that was already here is complete by
+    // induction (this same check gated its arrival), so we never walk further
+    // than the newly pushed objects. That keeps the cost proportional to the
+    // push, not to the repository.
+    //
+    // Without this, a client can push a commit whose tree names a blob it never
+    // sent. The ref advances, and every subsequent clone ships a pack with a
+    // missing object, because the fetch path silently skips objects it does not
+    // hold. One bad push and the repo is un-clonable for everyone.
+    //
+    // Objects from a rejected push stay in the store, unreferenced; GC reaps
+    // them. That is deliberate: a retry that supplies the rest then succeeds.
+    let mut missing: Option<[u8; 20]> = None;
+    if !referenced.is_empty() {
+        let index = sha1_store.sha1_index().await;
+        missing = referenced
+            .into_iter()
+            .find(|sha| !sha1_to_obj.contains_key(sha) && !index.contains_key(sha));
+    }
+
     // ── Step 3: execute ref commands ───────────────────────────────────────
     let null_sha1 = [0u8; 20];
     let mut ref_results: Vec<(String, Result<(), String>)> = Vec::new();
 
     for cmd in &commands {
+        // An incomplete closure fails the whole push: no ref may advance into it.
+        if let Some(sha) = missing {
+            ref_results.push((
+                cmd.ref_name.clone(),
+                Err(format!("missing necessary objects: {}", hex::encode(sha))),
+            ));
+            continue;
+        }
+
         // Translate the client ref to its stored (segment-prefixed) name. The
         // status line still reports the CLIENT name (`cmd.ref_name`) so git's
         // report-status matches exactly what the client pushed.
@@ -297,15 +346,18 @@ pub async fn handle_receive_pack(
             };
             ref_results.push((cmd.ref_name.clone(), result));
         } else if cmd.old_sha1 == null_sha1 {
-            // Create: new ref, expected = None.
-            let result = match sha1_to_obj.get(&cmd.new_sha1) {
-                Some(&new_id) => refs
+            // Create: new ref, expected = None. The target need not be in THIS
+            // push: `git push origin main:release` points a new ref at a commit
+            // the server already advertised, so the client sends an empty pack.
+            let result = match resolve_sha1_to_obj_id(&cmd.new_sha1, sha1_store, &sha1_to_obj).await
+            {
+                Some(new_id) => refs
                     .update(&ref_name, new_id, None)
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("{}", e)),
                 None => Err(format!(
-                    "object for {} not found in pack",
+                    "object for {} not found",
                     hex::encode(cmd.new_sha1)
                 )),
             };
@@ -324,8 +376,9 @@ pub async fn handle_receive_pack(
             // present value, which by construction always succeeds — so a push
             // built on a stale view silently overwrote whatever had landed in
             // between, and the clobbered commit was reported to no one.
-            let result = match sha1_to_obj.get(&cmd.new_sha1) {
-                Some(&new_id) => {
+            let result = match resolve_sha1_to_obj_id(&cmd.new_sha1, sha1_store, &sha1_to_obj).await
+            {
+                Some(new_id) => {
                     match resolve_sha1_to_obj_id(&cmd.old_sha1, sha1_store, &sha1_to_obj).await {
                         // A mismatch here surfaces as RefStore::Conflict → `ng`.
                         Some(old_id) => refs
@@ -342,7 +395,7 @@ pub async fn handle_receive_pack(
                     }
                 }
                 None => Err(format!(
-                    "object for {} not found in pack",
+                    "object for {} not found",
                     hex::encode(cmd.new_sha1)
                 )),
             };
@@ -1465,8 +1518,20 @@ mod tests {
         new: &[u8; 20],
         pack: &[u8],
     ) -> String {
+        push_ref(refs, objects, "refs/heads/main", old, new, pack).await
+    }
+
+    /// Run one receive-pack request against an arbitrary ref name.
+    async fn push_ref(
+        refs: &Arc<MemRefStore>,
+        objects: &Arc<MemObjectStore>,
+        name: &str,
+        old: &[u8; 20],
+        new: &[u8; 20],
+        pack: &[u8],
+    ) -> String {
         let mut body: Vec<u8> = Vec::new();
-        body.extend_from_slice(&pkt_ref_cmd(old, new, "refs/heads/main", None));
+        body.extend_from_slice(&pkt_ref_cmd(old, new, name, None));
         body.extend_from_slice(&encode_flush());
         body.extend_from_slice(pack);
         let resp = handle_receive_pack(
@@ -1478,6 +1543,15 @@ mod tests {
         .await
         .unwrap();
         String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// git SHA-1 over the canonical `"<kind> <len>\0" + body` image.
+    fn git_oid(kind: &str, body: &[u8]) -> [u8; 20] {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("{kind} {}\0", body.len()).as_bytes());
+        h.update(body);
+        h.finalize().into()
     }
 
     /// A push whose `old-sha1` is not where the ref actually points must be
@@ -1549,6 +1623,80 @@ mod tests {
         assert!(
             refs.get(&name).await.unwrap().is_none(),
             "the ref must be gone after a delete"
+        );
+    }
+
+    /// `git push origin main:release` points a NEW ref at a commit the server
+    /// already has. The client knows the server has it (it was advertised), so it
+    /// sends an EMPTY pack. Resolving new-sha1 only against the push's own pack
+    /// rejects that with "not found in pack", though the object is right there in
+    /// the store. Branching and tagging an existing commit are ordinary git
+    /// operations; they must work.
+    #[tokio::test]
+    async fn push_can_point_a_new_ref_at_an_object_the_server_already_has() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let (sha_a, pack_a) = blob_pack(b"already on the server");
+        let null = null_sha1();
+
+        assert!(push(&refs, &objects, &null, &sha_a, &pack_a)
+            .await
+            .contains("ok refs/heads/main"));
+
+        // Same object, new ref, no pack: the client has nothing to send.
+        let resp = push_ref(&refs, &objects, "refs/heads/release", &null, &sha_a, &[]).await;
+        assert!(
+            resp.contains("ok refs/heads/release"),
+            "pointing a new ref at an object the server already holds must succeed, got: {resp}"
+        );
+        let release = RefName::new("refs/heads/release").unwrap();
+        assert!(refs.get(&release).await.unwrap().is_some());
+    }
+
+    /// A ref may only advance to a commit whose object closure the server can
+    /// actually serve. Without a connectivity check, a client can push a commit
+    /// whose tree names a blob it never sent: the ref advances, and from then on
+    /// every clone of that repo yields a pack with a missing object (the fetch
+    /// path silently skips objects it does not hold). One bad push and the repo
+    /// is un-clonable for everyone.
+    #[tokio::test]
+    async fn push_with_an_incomplete_closure_is_rejected() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let name = RefName::new("refs/heads/main").unwrap();
+        let null = null_sha1();
+
+        // A blob that we deliberately do NOT put in the pack.
+        let missing_blob = Bytes::from_static(b"the blob the client never sent");
+        let missing_sha = git_oid("blob", &missing_blob);
+
+        // tree -> that blob.
+        let mut tree = b"100644 file\0".to_vec();
+        tree.extend_from_slice(&missing_sha);
+        let tree_sha = git_oid("tree", &tree);
+
+        // commit -> that tree.
+        let commit = format!(
+            "tree {}\nauthor a <a@x> 0 +0000\ncommitter a <a@x> 0 +0000\n\nmsg\n",
+            hex::encode(tree_sha)
+        )
+        .into_bytes();
+        let commit_sha = git_oid("commit", &commit);
+
+        // The pack carries the commit and the tree, but not the blob.
+        let pack = crate::fetch::encode_pack(&[
+            (2u8, Bytes::from(tree.clone())),
+            (1u8, Bytes::from(commit.clone())),
+        ]);
+
+        let resp = push(&refs, &objects, &null, &commit_sha, &pack).await;
+        assert!(
+            resp.contains("ng refs/heads/main"),
+            "a push whose closure is incomplete must be rejected, got: {resp}"
+        );
+        assert!(
+            refs.get(&name).await.unwrap().is_none(),
+            "the ref must NOT advance to a commit the server cannot fully serve"
         );
     }
 }
