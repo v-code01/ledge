@@ -287,7 +287,7 @@ pub async fn handle_receive_pack(
             let result = if cmd.old_sha1 == null_sha1 {
                 Err("cannot delete: old-sha1 is null".to_string())
             } else {
-                match resolve_sha1_to_obj_id(&cmd.old_sha1, refs.as_ref(), &sha1_to_obj).await {
+                match resolve_sha1_to_obj_id(&cmd.old_sha1, sha1_store, &sha1_to_obj).await {
                     Some(old_id) => refs
                         .delete(&ref_name, old_id)
                         .await
@@ -312,18 +312,35 @@ pub async fn handle_receive_pack(
             ref_results.push((cmd.ref_name.clone(), result));
         } else {
             // CAS update: old_sha1 non-null, new_sha1 non-null.
-            // Read the current ref to get its ObjectId; pass that as the CAS
-            // token to RefStore::update.  This provides server-side optimistic
-            // concurrency without needing a Sha1Provider in Phase 1.
+            //
+            // The CAS token is the CLIENT's `old_sha1` — its view of where the
+            // ref stood when it built this push. git's contract is "apply only
+            // if the ref is still there", and it is the only thing that stops two
+            // concurrent pushers from losing an update: whoever lands second must
+            // be told to fetch first.
+            //
+            // Reading the ref's CURRENT value and passing that back as the
+            // expectation (as this once did) is a compare-and-swap against the
+            // present value, which by construction always succeeds — so a push
+            // built on a stale view silently overwrote whatever had landed in
+            // between, and the clobbered commit was reported to no one.
             let result = match sha1_to_obj.get(&cmd.new_sha1) {
-                Some(&new_id) => match refs.get(&ref_name).await? {
-                    Some(entry) => refs
-                        .update(&ref_name, new_id, Some(entry.target))
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| format!("{}", e)),
-                    None => Err(format!("ref {} not found for CAS update", cmd.ref_name)),
-                },
+                Some(&new_id) => {
+                    match resolve_sha1_to_obj_id(&cmd.old_sha1, sha1_store, &sha1_to_obj).await {
+                        // A mismatch here surfaces as RefStore::Conflict → `ng`.
+                        Some(old_id) => refs
+                            .update(&ref_name, new_id, Some(old_id))
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("{}", e)),
+                        // We do not hold the object the client claims to be
+                        // building on. Never fall back to the ref's current value.
+                        None => Err(format!(
+                            "stale info: unknown old object {}",
+                            hex::encode(cmd.old_sha1)
+                        )),
+                    }
+                }
                 None => Err(format!(
                     "object for {} not found in pack",
                     hex::encode(cmd.new_sha1)
@@ -373,29 +390,26 @@ fn git_type_name(type_byte: u8) -> &'static str {
     }
 }
 
-/// Try to resolve a SHA-1 to an ObjectId.
+/// Resolve a git SHA-1 named by a ref command to its [`ObjectId`].
 ///
 /// Search order:
-/// 1. The `sha1_to_obj` map built from objects decoded in this push.
-/// 2. All refs currently in the ref store (for CAS validation of existing tips).
+/// 1. Objects decoded from THIS push (a `new-sha1` almost always lands here).
+/// 2. Objects already in the store, via the SHA-1 index. An `old-sha1` names the
+///    ref's current tip, which the client does NOT re-send in its pack, so this
+///    is the only way to resolve one — and a delete carries no pack at all.
+///
+/// `None` means the server does not hold the object. For an `old-sha1` that is
+/// "stale info": the caller must reject the command rather than fall back to
+/// whatever the ref happens to point at.
 async fn resolve_sha1_to_obj_id(
     sha1: &[u8; 20],
-    refs: &dyn RefStore,
+    sha1_store: &dyn Sha1Provider,
     sha1_to_obj: &std::collections::HashMap<[u8; 20], ObjectId>,
 ) -> Option<ObjectId> {
-    // Check pack-decoded objects first.
     if let Some(&id) = sha1_to_obj.get(sha1) {
         return Some(id);
     }
-    // Fall back to scanning refs (for CAS on existing tip).
-    // We cannot do SHA-1 lookup without a Sha1Provider here; the caller must
-    // supply the expected ObjectId via a different path if needed.
-    // For the CAS-failure test, the ref store returns Conflict when the
-    // expected ObjectId doesn't match — so we just try to find any ref entry
-    // with a plausible target.  In practice the caller (handle_receive_pack)
-    // should have the sha1_to_obj map populated for both old and new.
-    let _ = refs;
-    None
+    sha1_store.sha1_index().await.get(sha1).copied()
 }
 
 // ── Manual pack decoder (delta-resolving) ─────────────────────────────────────
@@ -849,6 +863,17 @@ mod tests {
         ) -> ledge_core::Result<ObjectId> {
             let hash = *blake3::hash(&content).as_bytes();
             let id = ObjectId::from_bytes(hash);
+            // Record the canonical git SHA-1 (`"<type> <len>\0" + content`), as
+            // `DiskObjectStore::write_git_object` does — it is what makes the
+            // object findable via `sha1_index`. A mock that skipped this made
+            // every stored object invisible to SHA-1 lookup, which is not how the
+            // real store behaves.
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(format!("{} {}\0", git_type_name(git_type), content.len()).as_bytes());
+            h.update(&content);
+            let sha1: [u8; 20] = h.finalize().into();
+            self.sha1s.lock().unwrap().insert(hash, sha1);
             self.objects.lock().unwrap().insert(hash, content);
             self.types.lock().unwrap().insert(hash, git_type);
             Ok(id)
@@ -1416,6 +1441,114 @@ mod tests {
             response_str.contains("ng refs/heads/main"),
             "expected ng for create-conflict, got: {}",
             response_str
+        );
+    }
+
+    /// git SHA-1 of a blob, and a single-blob pack carrying it.
+    fn blob_pack(content: &'static [u8]) -> ([u8; 20], Vec<u8>) {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("blob {}\0", content.len()).as_bytes());
+        h.update(content);
+        let sha1: [u8; 20] = h.finalize().into();
+        (
+            sha1,
+            crate::fetch::encode_pack(&[(3u8, Bytes::from_static(content))]),
+        )
+    }
+
+    /// Run one receive-pack request: `old → new` on `refs/heads/main`, plus `pack`.
+    async fn push(
+        refs: &Arc<MemRefStore>,
+        objects: &Arc<MemObjectStore>,
+        old: &[u8; 20],
+        new: &[u8; 20],
+        pack: &[u8],
+    ) -> String {
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pkt_ref_cmd(old, new, "refs/heads/main", None));
+        body.extend_from_slice(&encode_flush());
+        body.extend_from_slice(pack);
+        let resp = handle_receive_pack(
+            Bytes::from(body),
+            refs.clone() as Arc<dyn RefStore>,
+            objects.as_ref(),
+            "",
+        )
+        .await
+        .unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// A push whose `old-sha1` is not where the ref actually points must be
+    /// REJECTED. That is git's core concurrency contract: `old new ref` means
+    /// "apply only if the ref is still at `old`", and it is the only thing
+    /// standing between two concurrent pushers and a lost update.
+    ///
+    /// The update branch ignored the client's `old_sha1` and instead read the
+    /// ref's CURRENT value and passed that back as its own CAS token — a
+    /// compare-and-swap against the present value, which always succeeds. So a
+    /// client pushing from a stale view silently clobbered whatever landed in
+    /// between, and the overwritten commit was never reported to anyone.
+    #[tokio::test]
+    async fn push_from_a_stale_old_sha1_is_rejected_not_clobbered() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let name = RefName::new("refs/heads/main").unwrap();
+        let (sha_a, pack_a) = blob_pack(b"commit A");
+        let (sha_b, pack_b) = blob_pack(b"commit B");
+        let (sha_c, pack_c) = blob_pack(b"commit C");
+        let null = null_sha1();
+
+        // Client 1 creates main = A, then advances it A → B.
+        assert!(push(&refs, &objects, &null, &sha_a, &pack_a)
+            .await
+            .contains("ok refs/heads/main"));
+        assert!(push(&refs, &objects, &sha_a, &sha_b, &pack_b)
+            .await
+            .contains("ok refs/heads/main"));
+        let at_b = refs.get(&name).await.unwrap().unwrap().target;
+
+        // Client 2 still believes main is at A (it never saw B) and pushes A → C.
+        let resp = push(&refs, &objects, &sha_a, &sha_c, &pack_c).await;
+        assert!(
+            resp.contains("ng refs/heads/main"),
+            "a push from a stale old-sha1 must be rejected, got: {resp}"
+        );
+        assert_eq!(
+            refs.get(&name).await.unwrap().unwrap().target,
+            at_b,
+            "the ref must still point at B: C must not have clobbered it"
+        );
+    }
+
+    /// `git push --delete` sends the ref's current tip as `old-sha1`, a null
+    /// `new-sha1`, and NO pack. The old tip is already in the store, so resolving
+    /// it requires the SHA-1 index — which the resolver never consulted, so it
+    /// only ever found objects carried in the push's own pack. A delete therefore
+    /// always failed with "ref not found", even for a ref sitting right there.
+    #[tokio::test]
+    async fn push_can_delete_an_existing_ref() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let name = RefName::new("refs/heads/main").unwrap();
+        let (sha_a, pack_a) = blob_pack(b"commit to be deleted");
+        let null = null_sha1();
+
+        assert!(push(&refs, &objects, &null, &sha_a, &pack_a)
+            .await
+            .contains("ok refs/heads/main"));
+        assert!(refs.get(&name).await.unwrap().is_some());
+
+        // Delete: old = the current tip, new = null, empty pack.
+        let resp = push(&refs, &objects, &sha_a, &null, &[]).await;
+        assert!(
+            resp.contains("ok refs/heads/main"),
+            "deleting an existing ref must succeed, got: {resp}"
+        );
+        assert!(
+            refs.get(&name).await.unwrap().is_none(),
+            "the ref must be gone after a delete"
         );
     }
 }
