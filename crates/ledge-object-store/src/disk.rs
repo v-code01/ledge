@@ -35,6 +35,75 @@ fn marker_path(pack_path: &std::path::Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// fsync a file that has just been written, so its bytes are on stable storage
+/// before we take an action that depends on them (publishing a rename, or
+/// unlinking the only other copy of the data).
+fn fsync_file(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(LedgeError::Io)
+}
+
+/// fsync a directory, making a create/rename/unlink of one of its entries
+/// durable. A file's own fsync does NOT make its *name* durable — the parent
+/// directory entry needs its own barrier.
+fn fsync_dir(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(LedgeError::Io)
+}
+
+/// Validate a pack body fetched from the cold tier BEFORE it is published at the
+/// canonical `<name>.pack` path. Two independent checks:
+///
+/// - **Self-consistency**: a git pack starts with `"PACK"` and ends with the
+///   SHA-1 of every preceding byte. That catches truncation and bit-rot.
+/// - **Content-address**: our packs are named `blake3(pack bytes)` (see
+///   `repack`), so a 64-hex stem must equal the hash of what we downloaded. That
+///   additionally catches an *internally valid* pack served under the wrong key
+///   — a mixed-up prefix, or a stale body left at a reused name.
+///
+/// Packs written by the git-import path are named by their SHA-1 trailer instead
+/// (git's own convention), so the blake3 check is applied only to a 64-hex stem;
+/// those still get the trailer check.
+///
+/// This must run before the rename, not after: `ensure_pack_local` short-circuits
+/// on `pack_path.exists()`, so a bad body that reaches the canonical path poisons
+/// the pack permanently — later reads never re-fetch it, even once the cold tier
+/// is repaired.
+fn verify_pack_body(bytes: &[u8], pack_path: &std::path::Path) -> Result<()> {
+    let name = pack_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if bytes.len() < 32 || &bytes[0..4] != b"PACK" {
+        return Err(LedgeError::Corruption(format!(
+            "cold restore {name}: not a git pack (bad magic or too short)"
+        )));
+    }
+    let (body, trailer) = bytes.split_at(bytes.len() - 20);
+    let want: [u8; 20] = {
+        use sha1::{Digest, Sha1};
+        Sha1::digest(body).into()
+    };
+    if want != trailer {
+        return Err(LedgeError::Corruption(format!(
+            "cold restore {name}: pack trailer mismatch (truncated or corrupt body)"
+        )));
+    }
+    // `<blake3-hex>.pack` ⇒ the name IS the checksum of the whole body.
+    let stem = name.strip_suffix(".pack").unwrap_or(name);
+    if stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let got = blake3::hash(bytes).to_hex().to_string();
+        if got != stem {
+            return Err(LedgeError::Corruption(format!(
+                "cold restore {name}: body hashes to {got} (wrong object served for this key)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// zlib-compress `data`. Writing into a `Vec` sink never performs I/O, so the
 /// `expect`s below are unreachable; they document that infallibility.
 fn zlib_compress(data: &[u8]) -> Vec<u8> {
@@ -233,11 +302,22 @@ impl DiskObjectStore {
         }
         let key = std::fs::read_to_string(&marker).map_err(LedgeError::Io)?;
         let bytes = cold.get(key.trim()).await?;
-        // atomic-ish: tmp + rename so a partial download never surfaces as a
-        // valid-looking `.pack`.
+        // VERIFY BEFORE PUBLISHING. A body that fails here never reaches the
+        // canonical path, so the next read re-fetches it: a cold tier repaired
+        // from backup heals the node. Publish-then-discover-it's-bad would be
+        // permanent — the `pack_path.exists()` short-circuit above would keep
+        // serving the corrupt file forever.
+        verify_pack_body(&bytes, &pack_path)?;
+        // Atomic publish: write to tmp, fsync it (the rename must not be able to
+        // publish a name whose bytes aren't on disk yet), rename, then fsync the
+        // directory so the new name itself is durable.
         let tmp = pack_path.with_extension("pack.tmp");
         std::fs::write(&tmp, &bytes).map_err(LedgeError::Io)?;
+        fsync_file(&tmp)?;
         std::fs::rename(&tmp, &pack_path).map_err(LedgeError::Io)?;
+        if let Some(dir) = pack_path.parent() {
+            fsync_dir(dir)?;
+        }
         Ok(())
     }
 
@@ -293,7 +373,18 @@ impl DiskObjectStore {
                         .await?;
                     }
                 }
+                // DURABILITY BARRIER. The marker is the only pointer from this
+                // node to the body we are about to unlink, so it must be on
+                // stable storage — bytes AND directory entry — before the unlink.
+                // A crash in that window leaves `<H>.idx`/`<H>.lidx` with no body
+                // and no marker: `reload_packs` keys off `.pack`/`.pack.s3`, so
+                // the pack would not register at all and every object in it would
+                // read NotFound while the body sat safe in S3. (`recover_from_s3`
+                // now repairs a node that is already in that state, but the
+                // barrier is what stops us creating it.)
                 std::fs::write(&marker, key.as_bytes()).map_err(LedgeError::Io)?;
+                fsync_file(&marker)?;
+                fsync_dir(&dir)?;
                 std::fs::remove_file(&p).map_err(LedgeError::Io)?;
                 stats.packs_tiered += 1;
                 stats.bytes_uploaded += n;
@@ -317,9 +408,15 @@ impl DiskObjectStore {
     /// `packs/<H>.lidx` ⇒ `<H>` ⇒ local files `<H>.{idx,lidx}` + marker
     /// `<H>.pack.s3` (consistent with `tier_packs` and `reload_packs`).
     ///
-    /// Idempotent: a pack whose `.lidx` is already present locally is skipped, so
-    /// a second call after a successful recover returns `0`. The body itself is
-    /// NOT downloaded here — [`Self::ensure_pack_local`] restores it on first read.
+    /// Idempotent: a pack that is already fully usable locally — `.lidx` present
+    /// AND its body reachable (a local `.pack`, or a marker naming the S3 body) —
+    /// is skipped, so a second call after a successful recover returns `0`. The
+    /// body itself is NOT downloaded here — [`Self::ensure_pack_local`] restores
+    /// it on first read.
+    ///
+    /// This is also the REPAIR path for a node that crashed mid-`tier_packs`
+    /// (indexes on disk, body unlinked, marker not yet durable): such a pack is
+    /// not usable, so it is re-marked here rather than skipped.
     pub async fn recover_from_s3(&self) -> ledge_core::Result<usize> {
         let Some(cold) = self.cold.load_full() else {
             return Ok(0);
@@ -327,25 +424,58 @@ impl DiskObjectStore {
         let dir = self.pack_dir();
         std::fs::create_dir_all(&dir).map_err(LedgeError::Io)?;
         let keys = cold.list("packs/").await?;
+        let have: std::collections::HashSet<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut recovered = 0usize;
         for key in keys.iter().filter(|k| k.ends_with(".lidx")) {
             // key = "packs/<H>.lidx" ⇒ name = "<H>".
             let fname = key.strip_prefix("packs/").unwrap_or(key); // "<H>.lidx"
             let name = fname.trim_end_matches(".lidx"); // "<H>"
-                                                        // local lidx already present? skip (idempotent).
+
+            // A pack is USABLE locally iff its `.lidx` is present (GitPackFile
+            // opens from it) AND the body is reachable — either as a local
+            // `.pack` or via a `<H>.pack.s3` marker naming the S3 body.
+            //
+            // Keying the skip on `.lidx` alone (as this once did) makes DR
+            // decline to repair the tier_packs crash window: indexes on disk,
+            // body and marker both gone. That pack registers nowhere, so every
+            // object in it reads NotFound — and recovery refused to touch it
+            // because the `.lidx` was right there. Skip only what is fully
+            // usable; repair whatever is missing.
             let local_lidx = dir.join(format!("{name}.lidx"));
-            if local_lidx.exists() {
+            let local_idx = dir.join(format!("{name}.idx"));
+            let local_pack = dir.join(format!("{name}.pack"));
+            let marker = dir.join(format!("{name}.pack.s3"));
+            let body_reachable = local_pack.exists() || marker.exists();
+            if local_lidx.exists() && body_reachable {
                 continue;
             }
-            // pull lidx + idx (both must exist in S3 for a tiered pack).
-            let lidx = cold.get(&format!("packs/{name}.lidx")).await?;
-            std::fs::write(&local_lidx, &lidx).map_err(LedgeError::Io)?;
-            let idx = cold.get(&format!("packs/{name}.idx")).await?;
-            std::fs::write(dir.join(format!("{name}.idx")), &idx).map_err(LedgeError::Io)?;
-            // marker so reads restore the body on demand (points at the S3 body key).
-            let marker = dir.join(format!("{name}.pack.s3"));
-            std::fs::write(&marker, format!("packs/{name}.pack").as_bytes())
-                .map_err(LedgeError::Io)?;
+
+            // `tier_packs` uploads the body, verifies it, and only then uploads
+            // the indexes — so a `.lidx` in the cold tier implies a body beside
+            // it. A missing body here means the cold tier itself lost data; say
+            // so loudly rather than writing a marker that points at nothing.
+            let body_key = format!("packs/{name}.pack");
+            if !have.contains(body_key.as_str()) {
+                return Err(LedgeError::Corruption(format!(
+                    "cold tier holds {name}.lidx but no {name}.pack body; refusing to recover a pack whose body is gone"
+                )));
+            }
+
+            if !local_lidx.exists() {
+                let lidx = cold.get(&format!("packs/{name}.lidx")).await?;
+                std::fs::write(&local_lidx, &lidx).map_err(LedgeError::Io)?;
+            }
+            if !local_idx.exists() {
+                let idx = cold.get(&format!("packs/{name}.idx")).await?;
+                std::fs::write(&local_idx, &idx).map_err(LedgeError::Io)?;
+            }
+            if !body_reachable {
+                // The marker is the node's only pointer to the body: fsync it and
+                // its directory entry, same as `tier_packs` does.
+                std::fs::write(&marker, body_key.as_bytes()).map_err(LedgeError::Io)?;
+                fsync_file(&marker)?;
+                fsync_dir(&dir)?;
+            }
             recovered += 1;
         }
         self.reload_packs();
@@ -760,10 +890,18 @@ impl DiskObjectStore {
         // Pack tier: ask the first pack that carries the id. A pack whose record
         // for `id` is a REF_DELTA returns Some(base); a full object returns
         // Ok(None) — either way `pf.contains(id)` is the signal we found it.
-        for pf in self.packs.load().iter() {
-            if pf.contains(id) {
-                return pf.delta_base_of(id);
-            }
+        //
+        // `delta_base_of` reads the pack BODY (the delta header lives in the
+        // pack, not the `.lidx`), so a tiered pack must be restored first —
+        // exactly as `read_depth` does. Without this the GC keep-set closure
+        // (`graph::close_under_delta_bases`) fails with ENOENT on every tiered
+        // node, so GC can never complete and the disk grows without bound.
+        // Clone the Arc out of the ArcSwap guard so the guard isn't held across
+        // the await.
+        let hit = self.packs.load().iter().find(|pf| pf.contains(id)).cloned();
+        if let Some(pf) = hit {
+            self.ensure_pack_local(&pf).await?;
+            return pf.delta_base_of(id);
         }
         Ok(None)
     }
@@ -1766,6 +1904,186 @@ mod tests {
     async fn recover_noop_without_cold() {
         let (store, _d) = make_store();
         assert_eq!(store.recover_from_s3().await.unwrap(), 0);
+    }
+
+    /// Write two near-identical blobs so `write_git_pack`'s delta window stores
+    /// one as a delta of the other, repack, and return `(delta_id, base_id)` as
+    /// observed through the *local* pack. Panics if the pack has no delta.
+    async fn packed_delta_pair(store: &DiskObjectStore) -> (ObjectId, ObjectId) {
+        let base_c: Vec<u8> = (0..400)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let mut other_c = base_c.clone();
+        other_c.extend_from_slice(b"one more line\n");
+        let a = store
+            .write_git_object(3, Bytes::from(base_c))
+            .await
+            .unwrap();
+        let b = store
+            .write_git_object(3, Bytes::from(other_c))
+            .await
+            .unwrap();
+        crate::repack::repack(store).await.unwrap();
+        for id in [a, b] {
+            if let Some(base) = store.delta_base_of(id).await.unwrap() {
+                return (id, base);
+            }
+        }
+        panic!("expected the pack writer to deltify one of the two similar blobs");
+    }
+
+    /// `delta_base_of` must restore a tiered pack body, exactly as `read` does.
+    /// It doesn't — so once a node tiers its packs, every delta-base lookup
+    /// fails with ENOENT. That breaks GC: the keep-set closure over delta bases
+    /// (`graph::close_under_delta_bases`, used by both the workspace and cluster
+    /// GC) can no longer run, so GC errors out on every pass and the node's disk
+    /// grows without bound. `deltify` breaks the same way.
+    #[tokio::test]
+    async fn delta_base_of_restores_a_tiered_pack() {
+        let (store, _d) = make_store();
+        store.set_cold(Arc::new(crate::s3::S3Tier::in_memory("ledge")));
+        // Baseline: with the body local, the pack reports the delta's base.
+        let (delta_id, base_id) = packed_delta_pair(&store).await;
+
+        store.tier_packs().await.unwrap();
+
+        // Same call, same store — only the body moved to S3.
+        assert_eq!(
+            store.delta_base_of(delta_id).await.unwrap(),
+            Some(base_id),
+            "delta_base_of must restore the tiered body, not fail with ENOENT"
+        );
+        // The GC-critical consequence: the keep-set must still close over the
+        // base, or GC would delete a live delta's base.
+        let keep = crate::graph::close_under_delta_bases(
+            &store,
+            std::collections::HashSet::from([delta_id]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            keep.contains(&base_id),
+            "keep-set closes over the base of a delta in a tiered pack"
+        );
+    }
+
+    /// The crash window in `tier_packs`: writing the `.pack.s3` marker and
+    /// unlinking the body are two separate, unsynced metadata operations. A
+    /// crash between them leaves `<H>.idx` + `<H>.lidx` on disk with NO body and
+    /// NO marker. `reload_packs` keys off `.pack` / `.pack.s3`, so the pack does
+    /// not register at all and every object in it reads NotFound — while the
+    /// body sits safe in S3. `recover_from_s3` must repair that, but it keys its
+    /// idempotence skip on `.lidx` alone, so it declines to.
+    #[tokio::test]
+    async fn recover_repairs_a_pack_whose_marker_was_lost_mid_tier() {
+        let (store, _d) = make_store();
+        store.set_cold(Arc::new(crate::s3::S3Tier::in_memory("ledge")));
+        let c: Vec<u8> = (0..400)
+            .flat_map(|i| format!("recoverable {i}\n").into_bytes())
+            .collect();
+        let id = store
+            .write_git_object(3, Bytes::from(c.clone()))
+            .await
+            .unwrap();
+        crate::repack::repack(&store).await.unwrap();
+        store.tier_packs().await.unwrap();
+
+        // Simulate the crash: the body is already unlinked; the marker never
+        // reached the disk. The indexes survive (they were written earlier).
+        let mut markers = 0;
+        for e in std::fs::read_dir(store.pack_dir()).unwrap().flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".pack.s3"))
+            {
+                std::fs::remove_file(&p).unwrap();
+                markers += 1;
+            }
+        }
+        assert_eq!(markers, 1, "exactly one tiered pack to un-mark");
+        store.reload_packs();
+        assert!(
+            ObjectStore::read(&store, id).await.is_err(),
+            "precondition: the object is unreadable in the crashed state"
+        );
+
+        // DR must put the node back together from S3.
+        assert_eq!(
+            store.recover_from_s3().await.unwrap(),
+            1,
+            "recover repairs the pack whose marker was lost"
+        );
+        assert_eq!(
+            ObjectStore::read(&store, id).await.unwrap().as_ref(),
+            c.as_slice()
+        );
+        assert_eq!(
+            store.recover_from_s3().await.unwrap(),
+            0,
+            "and is idempotent once repaired"
+        );
+    }
+
+    /// A cold-tier body that comes back corrupt (bit-rot in transit or at rest,
+    /// or a body served under the wrong key) must never be published at the
+    /// canonical `<H>.pack` path. If it is, the store is poisoned permanently:
+    /// `ensure_pack_local` short-circuits on `pack_path.exists()`, so even after
+    /// the operator repairs the cold tier the node keeps reading the bad file.
+    #[tokio::test]
+    async fn a_corrupt_cold_body_is_never_published() {
+        let (store, _d) = make_store();
+        let tier = Arc::new(crate::s3::S3Tier::in_memory("ledge"));
+        store.set_cold(tier.clone());
+        let c: Vec<u8> = (0..400)
+            .flat_map(|i| format!("precious {i}\n").into_bytes())
+            .collect();
+        let id = store
+            .write_git_object(3, Bytes::from(c.clone()))
+            .await
+            .unwrap();
+        crate::repack::repack(&store).await.unwrap();
+        store.tier_packs().await.unwrap();
+
+        // The marker names the S3 key holding the body.
+        let marker = std::fs::read_dir(store.pack_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".pack.s3"))
+            })
+            .expect("a tiered pack has a marker");
+        let key = std::fs::read_to_string(&marker).unwrap();
+        let good = tier.get(key.trim()).await.unwrap();
+
+        // Rot one byte of the body in the cold tier (past the "PACK" magic).
+        let mut rotten = good.clone();
+        rotten[20] ^= 0xff;
+        tier.put(key.trim(), rotten).await.unwrap();
+
+        assert!(
+            ObjectStore::read(&store, id).await.is_err(),
+            "a corrupt cold body must be rejected, not served"
+        );
+        let pack_exists = std::fs::read_dir(store.pack_dir())
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "pack"));
+        assert!(
+            !pack_exists,
+            "the corrupt body must NOT be published at the canonical .pack path"
+        );
+
+        // The operator restores the cold tier from backup: the node must heal.
+        tier.put(key.trim(), good).await.unwrap();
+        assert_eq!(
+            ObjectStore::read(&store, id).await.unwrap().as_ref(),
+            c.as_slice(),
+            "a repaired cold tier heals the node (it was not poisoned)"
+        );
     }
 
     #[tokio::test]
