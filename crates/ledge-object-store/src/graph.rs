@@ -124,6 +124,45 @@ pub fn tree_child_sha1s(content: &[u8]) -> Vec<[u8; 20]> {
     children
 }
 
+/// The tree's children that must exist in THIS repository.
+///
+/// Same scan as [`tree_child_sha1s`], but skips **gitlinks** (mode `160000`): a
+/// submodule entry names a commit that lives in a *different* repository and is
+/// deliberately absent from this one. Git's own connectivity check makes exactly
+/// this exclusion, and a caller that enforces "everything a tree names must be
+/// present" (the push connectivity check) MUST use this, or it would reject
+/// every push of a repo that has a submodule.
+///
+/// A tree entry is `<mode-ascii> SP <name> NUL <20-byte-raw-sha1>`, so the mode
+/// runs from the start of the entry to the first space.
+pub fn tree_child_sha1s_in_repo(content: &[u8]) -> Vec<[u8; 20]> {
+    let mut children = Vec::new();
+    let mut pos = 0usize;
+    while pos < content.len() {
+        let nul = match content[pos..].iter().position(|&b| b == 0) {
+            Some(n) => pos + n,
+            None => break,
+        };
+        let sha1_start = nul + 1;
+        let sha1_end = sha1_start + 20;
+        if sha1_end > content.len() {
+            break;
+        }
+        let header = &content[pos..nul];
+        let mode = match header.iter().position(|&b| b == b' ') {
+            Some(sp) => &header[..sp],
+            None => header,
+        };
+        if mode != b"160000" {
+            let mut sha1 = [0u8; 20];
+            sha1.copy_from_slice(&content[sha1_start..sha1_end]);
+            children.push(sha1);
+        }
+        pos = sha1_end;
+    }
+    children
+}
+
 /// Extract `(name, child SHA-1)` pairs from a git tree object body.
 ///
 /// Same wire layout as [`tree_child_sha1s`] (`<mode> SP <name> NUL <sha1>`), but
@@ -272,6 +311,33 @@ mod tests {
     use ledge_core::ObjectId;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    /// A gitlink (mode 160000) names a commit in ANOTHER repository. The plain
+    /// child walk returns it (the GC walker just fails to resolve it and moves
+    /// on), but any caller that REQUIRES every child to be present — the push
+    /// connectivity check — must not see it, or every repo with a submodule
+    /// becomes unpushable.
+    #[test]
+    fn tree_child_sha1s_in_repo_skips_gitlinks() {
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 file\0");
+        tree.extend_from_slice(&[0x11u8; 20]);
+        tree.extend_from_slice(b"160000 vendor/lib\0"); // submodule
+        tree.extend_from_slice(&[0x22u8; 20]);
+        tree.extend_from_slice(b"40000 dir\0");
+        tree.extend_from_slice(&[0x33u8; 20]);
+
+        assert_eq!(
+            tree_child_sha1s(&tree),
+            vec![[0x11u8; 20], [0x22u8; 20], [0x33u8; 20]],
+            "the plain walk returns every entry"
+        );
+        assert_eq!(
+            tree_child_sha1s_in_repo(&tree),
+            vec![[0x11u8; 20], [0x33u8; 20]],
+            "the in-repo walk drops the gitlink"
+        );
+    }
 
     #[test]
     fn tree_entries_parses_names_and_shas() {

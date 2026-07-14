@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::fetch::Sha1Provider;
 use crate::pack_delta::{apply_delta, read_ofs_varint};
 use ledge_object_store::graph::{
-    commit_parent_sha1s, commit_tree_sha1, tag_object_sha1, tree_child_sha1s,
+    commit_parent_sha1s, commit_tree_sha1, tag_object_sha1, tree_child_sha1s_in_repo,
 };
 
 /// Hard cap on a single decompressed pack object — defends the receive-pack path
@@ -266,7 +266,9 @@ pub async fn handle_receive_pack(
                     referenced.extend(commit_tree_sha1(&content));
                     referenced.extend(commit_parent_sha1s(&content));
                 }
-                2 => referenced.extend(tree_child_sha1s(&content)),
+                // Gitlinks excluded: a submodule entry names a commit in ANOTHER
+                // repository, which is legitimately absent here.
+                2 => referenced.extend(tree_child_sha1s_in_repo(&content)),
                 4 => referenced.extend(tag_object_sha1(&content)),
                 _ => {}
             }
@@ -1698,5 +1700,51 @@ mod tests {
             refs.get(&name).await.unwrap().is_none(),
             "the ref must NOT advance to a commit the server cannot fully serve"
         );
+    }
+
+    /// A submodule (gitlink, mode 160000) names a commit that lives in ANOTHER
+    /// repository — it is deliberately absent here, and git's own connectivity
+    /// check excludes gitlinks for exactly that reason. A connectivity check that
+    /// demanded every tree entry be present would reject every push of every repo
+    /// that has a submodule.
+    #[tokio::test]
+    async fn push_with_a_submodule_gitlink_is_accepted() {
+        let objects = MemObjectStore::new();
+        let refs = MemRefStore::new();
+        let name = RefName::new("refs/heads/main").unwrap();
+        let null = null_sha1();
+
+        // A real blob we DO send.
+        let blob = Bytes::from_static(b"file contents");
+        let blob_sha = git_oid("blob", &blob);
+        // A submodule commit that lives in another repo and is NOT sent.
+        let submodule_sha = git_oid("commit", b"a commit in some other repository");
+
+        // tree = one ordinary file + one gitlink.
+        let mut tree = b"100644 file\0".to_vec();
+        tree.extend_from_slice(&blob_sha);
+        tree.extend_from_slice(b"160000 vendor/lib\0");
+        tree.extend_from_slice(&submodule_sha);
+        let tree_sha = git_oid("tree", &tree);
+
+        let commit = format!(
+            "tree {}\nauthor a <a@x> 0 +0000\ncommitter a <a@x> 0 +0000\n\nwith submodule\n",
+            hex::encode(tree_sha)
+        )
+        .into_bytes();
+        let commit_sha = git_oid("commit", &commit);
+
+        let pack = crate::fetch::encode_pack(&[
+            (3u8, blob.clone()),
+            (2u8, Bytes::from(tree.clone())),
+            (1u8, Bytes::from(commit.clone())),
+        ]);
+
+        let resp = push(&refs, &objects, &null, &commit_sha, &pack).await;
+        assert!(
+            resp.contains("ok refs/heads/main"),
+            "a push carrying a submodule gitlink must be accepted, got: {resp}"
+        );
+        assert!(refs.get(&name).await.unwrap().is_some());
     }
 }
