@@ -92,6 +92,35 @@ fn infra(msg: impl Into<String>) -> LedgeError {
     LedgeError::Unavailable(msg.into())
 }
 
+/// Deadline for one Raft client operation (a proposal, or a linearizable-read
+/// barrier).
+///
+/// Both `client_write` and `ensure_linearizable` resolve only once the entry is
+/// COMMITTED. A shard that cannot reach quorum — a partition, or too many dead
+/// replicas — therefore never resolves them at all: the future simply never
+/// completes. Without a deadline that hangs the caller forever. In the server
+/// that is a request handler pinned for eternity (no 503, no metric, no log); in
+/// CI it is a test binary that wedges until the job times out.
+///
+/// A shard that cannot make progress is exactly what `Unavailable` means, and
+/// `Unavailable` is retryable (→ HTTP 503). 30s is far above a healthy commit
+/// (sub-millisecond in-process, single-digit ms over a network) and far below any
+/// human or CI patience, so it fires only when the shard is genuinely stuck.
+const RAFT_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a Raft operation under [`RAFT_OP_TIMEOUT`], turning "never completes" into
+/// a retryable `Unavailable`. The inner future's own result is passed through
+/// untouched, so callers still see `ForwardToLeader` and friends.
+async fn with_deadline<T>(what: &str, fut: impl std::future::Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(RAFT_OP_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            infra(format!(
+                "{what}: no progress within {RAFT_OP_TIMEOUT:?} (shard cannot reach quorum)"
+            ))
+        })
+}
+
 /// Forwarder used when a store is built without placement (Phase-3 in-process
 /// harness / single-node). It is never invoked because every shard is locally
 /// hosted; if it ever is, that is a configuration bug → `Unavailable`.
@@ -306,6 +335,19 @@ impl ClusterRefStore {
         leader_handle(self.replicas(shard)?, shard).await
     }
 
+    /// Resolve `shard`'s leader and run the linearizable-read barrier on it, so a
+    /// subsequent read of that leader's applied state cannot observe a stale ref
+    /// set. Bounded by [`RAFT_OP_TIMEOUT`]: the barrier commits a blank entry, so
+    /// a shard that has lost quorum would otherwise leave the read hanging
+    /// forever rather than reporting itself unavailable.
+    async fn barrier(&self, shard: ShardId) -> Result<&ShardHandle> {
+        let leader = self.leader_of(shard).await?;
+        with_deadline("ensure_linearizable", leader.raft.ensure_linearizable())
+            .await?
+            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+        Ok(leader)
+    }
+
     /// This node's local replica of `shard` (for stale reads / local snapshot).
     fn local_handle(&self, shard: ShardId) -> Result<&ShardHandle> {
         self.replicas(shard)?
@@ -318,15 +360,18 @@ impl ClusterRefStore {
     /// `ForwardToLeader` and a mid-call leader change (spec §4 leader-failure).
     async fn client_write_routed(&self, shard: ShardId, op: LedgeOp) -> Result<LedgeResp> {
         let leader = self.leader_of(shard).await?;
-        match client_write_op(leader, op.clone()).await {
+        match with_deadline("raft client_write", client_write_op(leader, op.clone())).await? {
             Ok(resp) => Ok(resp),
             Err(e) if e.is_forward_to_leader() => {
                 // Leader moved between leader_of() and the call: re-resolve once
                 // (waiting for a fresh leader if needed) and retry.
                 let leader = self.leader_of(shard).await?;
-                client_write_op(leader, op)
-                    .await
-                    .map_err(|e| infra(format!("client_write after forward: {e}")))
+                with_deadline(
+                    "raft client_write (after forward)",
+                    client_write_op(leader, op),
+                )
+                .await?
+                .map_err(|e| infra(format!("client_write after forward: {e}")))
             }
             Err(e) => Err(infra(format!("raft client_write: {e}"))),
         }
@@ -338,12 +383,7 @@ impl ClusterRefStore {
     async fn read_refs(&self, shard: ShardId, prefix: &str) -> Result<Vec<(RefName, RefEntry)>> {
         match self.mode {
             ConsistencyMode::Linearizable => {
-                let leader = self.leader_of(shard).await?;
-                leader
-                    .raft
-                    .ensure_linearizable()
-                    .await
-                    .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                let leader = self.barrier(shard).await?;
                 Ok(leader.sm.applied_refs_with_prefix(prefix).await)
             }
             ConsistencyMode::Stale => {
@@ -387,12 +427,7 @@ impl RefStore for ClusterRefStore {
         }
         match self.mode {
             ConsistencyMode::Linearizable => {
-                let leader = self.leader_of(shard).await?;
-                leader
-                    .raft
-                    .ensure_linearizable()
-                    .await
-                    .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                let leader = self.barrier(shard).await?;
                 Ok(leader.sm.applied_ref(name.as_str()).await)
             }
             ConsistencyMode::Stale => {
@@ -576,12 +611,7 @@ impl ClusterRefStore {
         // Snapshot the shard ids first (avoid holding a borrow across `.await`).
         let shards: Vec<ShardId> = self.shards.keys().copied().collect();
         for shard in shards {
-            let leader = self.leader_of(shard).await?;
-            leader
-                .raft
-                .ensure_linearizable()
-                .await
-                .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+            let leader = self.barrier(shard).await?;
             let locks = leader.sm.prepared_locks();
             if !locks.is_empty() {
                 out.push((shard, locks));
@@ -623,12 +653,7 @@ impl ClusterRefStore {
         // Snapshot the shard ids first (avoid holding a borrow across `.await`).
         let shards: Vec<ShardId> = self.shards.keys().copied().collect();
         for shard in shards {
-            let leader = self.leader_of(shard).await?;
-            leader
-                .raft
-                .ensure_linearizable()
-                .await
-                .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+            let leader = self.barrier(shard).await?;
             let targets: Vec<ObjectId> = leader
                 .sm
                 .applied_ref_map()
@@ -745,12 +770,7 @@ impl ClusterRefStore {
                 // Linearizable single-ref read on the host (mirror RefStore::get).
                 let entry = match self.mode {
                     ConsistencyMode::Linearizable => {
-                        let leader = self.leader_of(shard).await?;
-                        leader
-                            .raft
-                            .ensure_linearizable()
-                            .await
-                            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                        let leader = self.barrier(shard).await?;
                         leader.sm.applied_ref(&name).await
                     }
                     ConsistencyMode::Stale => self.local_handle(shard)?.sm.applied_ref(&name).await,
@@ -832,12 +852,7 @@ impl ClusterRefStore {
                 // already routed to coord_shard). Linearizable read on the leader.
                 let entry = match self.mode {
                     ConsistencyMode::Linearizable => {
-                        let leader = self.leader_of(shard).await?;
-                        leader
-                            .raft
-                            .ensure_linearizable()
-                            .await
-                            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                        let leader = self.barrier(shard).await?;
                         leader.sm.txn_decision(txn_id)
                     }
                     ConsistencyMode::Stale => self.local_handle(shard)?.sm.txn_decision(txn_id),
@@ -918,6 +933,16 @@ impl ClusterLeaseStore {
         leader_handle(self.replicas(shard)?, shard).await
     }
 
+    /// Leader + linearizable-read barrier, bounded by [`RAFT_OP_TIMEOUT`]. See
+    /// [`ClusterRefStore::barrier`].
+    async fn barrier(&self, shard: ShardId) -> Result<&ShardHandle> {
+        let leader = self.leader_of(shard).await?;
+        with_deadline("ensure_linearizable", leader.raft.ensure_linearizable())
+            .await?
+            .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+        Ok(leader)
+    }
+
     fn local_handle(&self, shard: ShardId) -> Result<&ShardHandle> {
         self.replicas(shard)?
             .iter()
@@ -944,12 +969,7 @@ impl ClusterLeaseStore {
     async fn read_handle_for(&self, shard: ShardId) -> Result<&ShardHandle> {
         match self.mode {
             ConsistencyMode::Linearizable => {
-                let leader = self.leader_of(shard).await?;
-                leader
-                    .raft
-                    .ensure_linearizable()
-                    .await
-                    .map_err(|e| infra(format!("ensure_linearizable: {e}")))?;
+                let leader = self.barrier(shard).await?;
                 Ok(leader)
             }
             ConsistencyMode::Stale => self.local_handle(shard),
@@ -1018,6 +1038,32 @@ impl ClusterLeaseStore {
 mod tests {
     use super::*;
     use crate::router::ShardRouter;
+
+    /// A Raft op that never completes — the shape of `client_write` or
+    /// `ensure_linearizable` on a shard that has lost quorum — must surface as a
+    /// RETRYABLE `Unavailable`, not hang the caller. `start_paused` auto-advances
+    /// the clock once the runtime goes idle, so this asserts the deadline without
+    /// waiting 30 real seconds.
+    #[tokio::test(start_paused = true)]
+    async fn with_deadline_turns_a_stuck_raft_op_into_retryable_unavailable() {
+        let err = with_deadline("stuck op", std::future::pending::<()>())
+            .await
+            .expect_err("a never-completing raft op must not be reported as success");
+        assert!(
+            matches!(err, LedgeError::Unavailable(_)),
+            "a stuck shard must be retryable (Unavailable), got: {err:?}"
+        );
+    }
+
+    /// The deadline must be transparent to an op that DOES complete: the inner
+    /// result passes through untouched (so `ForwardToLeader` is still visible).
+    #[tokio::test(start_paused = true)]
+    async fn with_deadline_passes_a_completing_op_through() {
+        let ok = with_deadline("fast op", std::future::ready(7u8))
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
+    }
 
     /// Phase 4g: `swap_placement` atomically installs a new placement map that
     /// the getter immediately reflects (live reconfiguration). RED until the map
