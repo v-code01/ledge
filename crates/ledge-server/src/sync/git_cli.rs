@@ -30,18 +30,32 @@ fn with_auth(url: &str, auth: Option<&str>) -> String {
     }
 }
 
+/// Transports git is permitted to use for a caller-influenced URL. Excludes the
+/// command-executing transports — `ext::` (runs an arbitrary shell command) above
+/// all — so an upstream URL from an untrusted tenant (POST /sync/import) cannot
+/// turn a clone into code execution. `GIT_ALLOW_PROTOCOL` is an explicit
+/// allow-list: anything not named here is refused, and it overrides any ambient
+/// `protocol.*.allow` config, so the policy does not depend on the git version or
+/// the host's global gitconfig. `file` stays in so local-mirror clones and the
+/// test suite keep working; cross-host/internal-file SSRF is gated separately by
+/// the caller's `allowed_hosts`.
+const GIT_ALLOWED_PROTOCOLS: &str = "file:git:http:https:ssh";
+
+/// A `git` command pre-hardened for untrusted input: no terminal prompt (never
+/// block on credentials) and the transport allow-list pinned. Every git
+/// invocation in this module goes through here so neither guard can be forgotten.
+fn git_command() -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", GIT_ALLOWED_PROTOCOLS);
+    c
+}
+
 async fn run(args: &[&str], cwd: &Path, timeout: Duration, ctx: &str) -> Result<Vec<u8>> {
-    let out = tokio::time::timeout(
-        timeout,
-        Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
-    )
-    .await
-    .map_err(|_| LedgeError::Unavailable(format!("git {ctx}: timed out")))?
-    .map_err(|e| LedgeError::Unavailable(format!("git {ctx}: spawn failed: {e}")))?;
+    let out = tokio::time::timeout(timeout, git_command().args(args).current_dir(cwd).output())
+        .await
+        .map_err(|_| LedgeError::Unavailable(format!("git {ctx}: timed out")))?
+        .map_err(|e| LedgeError::Unavailable(format!("git {ctx}: spawn failed: {e}")))?;
     if !out.status.success() {
         return Err(err(ctx, &out.stderr));
     }
@@ -51,8 +65,17 @@ async fn run(args: &[&str], cwd: &Path, timeout: Duration, ctx: &str) -> Result<
 /// `git clone --bare --quiet <url> <dst>` (dst created by git).
 pub async fn clone_bare(url: &str, auth: Option<&str>, dst: &Path) -> Result<()> {
     let full = with_auth(url, auth);
+    // `--` terminates option parsing: a URL beginning with `-` reaches git as the
+    // repository positional, never as a flag (argument injection).
     run(
-        &["clone", "--bare", "--quiet", &full, dst.to_str().unwrap()],
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            "--",
+            &full,
+            dst.to_str().unwrap(),
+        ],
         Path::new("/"),
         Duration::from_secs(120),
         "clone",
@@ -278,15 +301,15 @@ pub async fn push(
     if force {
         args.push("--force".into());
     }
+    // `--` before the URL: the remote and refspecs are positionals, so a URL
+    // beginning with `-` can never be parsed as a push option.
+    args.push("--".into());
     args.push(full);
     args.extend(refspecs.iter().cloned());
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let out = tokio::time::timeout(
         Duration::from_secs(120),
-        Command::new("git")
-            .args(&argref)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
+        git_command().args(&argref).output(),
     )
     .await
     .map_err(|_| LedgeError::Unavailable("git push: timed out".into()))?
@@ -467,5 +490,54 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].reference, "refs/heads/main");
         assert_eq!(res[0].status, "ok", "summary={}", res[0].summary);
+    }
+
+    /// Git's `ext::` transport runs an arbitrary command. Modern git already
+    /// refuses `ext` by default, but that default is a moving target across git
+    /// versions and can be re-enabled by ambient `protocol.ext.allow` config, so
+    /// clone_bare pins `GIT_ALLOW_PROTOCOL` and does not depend on it. This is the
+    /// regression guard for that pin: the upstream URL comes from any
+    /// authenticated tenant (POST /sync/import), so a permissive transport policy
+    /// would be RCE on the server host.
+    #[tokio::test]
+    async fn clone_refuses_the_ext_transport() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("touched");
+        let dst = tmp.path().join("dst.git");
+        // ext:: runs `sh -c "<script>"`; the script would `touch <marker>` if the
+        // transport were permitted, whether or not the clone then succeeds.
+        let ext_url = format!("ext::sh -c \"touch {}\"", marker.display());
+
+        let res = clone_bare(&ext_url, None, &dst).await;
+
+        assert!(
+            !marker.exists(),
+            "the ext:: transport executed a command — protocol pin is not holding"
+        );
+        assert!(res.is_err(), "a clone over a forbidden transport must fail");
+    }
+
+    /// A URL beginning with `-` must reach git as a positional argument, never as
+    /// an option (argument injection). It is not exploitable through this exact
+    /// call today — git needs a separate repository argument the attacker cannot
+    /// supply — but the `--` separator makes that independent of the argv layout,
+    /// so a later change (an added directory arg, a reused URL position) cannot
+    /// reopen it. Regression guard for the `--`.
+    #[tokio::test]
+    async fn clone_treats_a_dashed_url_as_a_positional_not_an_option() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dst = tmp.path().join("dst.git");
+        // `--upload-pack=<cmd>` is the classic injection option. With `--` in
+        // place git treats this whole string as a (bogus) repository URL and
+        // fails to resolve it, rather than parsing it as a known flag.
+        let inject = "--upload-pack=touch /tmp/should-never-run".to_string();
+
+        let res = clone_bare(&inject, None, &dst).await;
+        assert!(res.is_err(), "a bogus dashed URL must fail cleanly");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            !msg.contains("unknown option") && !msg.contains("usage:"),
+            "the dashed URL was parsed as an option, not a positional: {msg}"
+        );
     }
 }
