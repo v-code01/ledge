@@ -46,6 +46,18 @@ pub async fn rpc(
     let method = ledge_rpc::method_name(&body);
     let span = tracing::info_span!("rpc", method);
 
+    // Authorization parity with REST. The auth middleware gates the admin-only
+    // operations by PATH (`/admin/*`), which cannot see inside a single binary
+    // `/rpc` body, so a privileged RPC method must be gated here. `runGc` is the
+    // wire twin of `POST /admin/gc` — a global mark-and-sweep and a full-store-scan
+    // DoS lever — so it requires the admin scope. Without this a non-admin tenant
+    // reaches through `/rpc` an operation REST reserves for admins.
+    if method == "runGc" && !principal.scopes.is_admin() {
+        metrics::record_rpc_request(method, start.elapsed());
+        warn!(method, "rpc forbidden: admin scope required");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     let ctx = RpcCtx {
         // RpcCtx needs the concrete DiskObjectStore (writeObject uses
         // write_git_object, not on the ObjectStore trait); refs is the dyn seam.
@@ -359,5 +371,121 @@ mod tests {
             }
             _ => panic!("globex must NOT see acme's workspace"),
         }
+    }
+
+    /// A capnp `runGc` request.
+    fn run_gc_req() -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        {
+            let mut root = msg.init_root::<request::Builder>();
+            root.set_run_gc(());
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg).unwrap();
+        buf
+    }
+
+    /// Build an auth-enabled state and return it plus a freshly minted token with
+    /// the given scopes.
+    async fn auth_state_with_token(
+        dir: &TempDir,
+        scopes: crate::auth::Scopes,
+    ) -> (AppState, String) {
+        use crate::auth::store::AuthStore;
+        use crate::auth::{AuthCtx, PrincipalKind};
+        let p = dir.path().to_path_buf();
+        let hlc = Arc::new(HLC::new());
+        let objects = Arc::new(ledge_object_store::DiskObjectStore::new(p.clone()).unwrap());
+        let refs = Arc::new(ledge_ref_store::RefStoreImpl::open(p.clone(), hlc.clone()).unwrap());
+        let (workspaces, leases, gc) = crate::build_workspace_stack(
+            p.clone(),
+            objects.clone(),
+            refs.clone(),
+            hlc.clone(),
+            ledge_workspace::QuotaLimits::default(),
+            std::sync::Arc::new(ledge_workspace::UsageMap::default()),
+        )
+        .unwrap();
+        let store = Arc::new(AuthStore::open(p.clone(), hlc).unwrap());
+        let token = store
+            .mint("acme", PrincipalKind::User, scopes, None, 0)
+            .await
+            .unwrap();
+        let auth = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
+        let state = AppState {
+            objects: objects.clone() as Arc<dyn ledge_core::ObjectStore>,
+            objects_disk: objects.clone(),
+            refs: refs.clone() as Arc<dyn ledge_core::RefStore>,
+            workspaces,
+            leases,
+            gc,
+            default_ttl_secs: 3600,
+            data_dir: p,
+            raft_shards: None,
+            cluster_refs: None,
+            cluster_objects: None,
+            webhooks: None,
+            sync: None,
+            shard_map: None,
+            cluster_gc: None,
+            auth,
+            quota: crate::quota::QuotaCtx::disabled(),
+        };
+        (state, token)
+    }
+
+    async fn post_rpc_as(app: axum::Router, token: &str, body: Vec<u8>) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc")
+                .header("content-type", CONTENT_TYPE)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// GC is an operator control surface. On REST it is admin-only: `/admin/gc`
+    /// returns 403 without the admin scope. The `runGc` RPC method is the SAME
+    /// operation, so a non-admin token must NOT be able to trigger a global
+    /// mark-and-sweep through `/rpc` — otherwise any authenticated tenant bypasses
+    /// the admin gate (and gains a full-store-scan DoS lever).
+    #[tokio::test]
+    async fn rpc_run_gc_requires_admin_scope() {
+        let read_write = crate::auth::Scopes {
+            read: true,
+            write: true,
+            admin: false,
+        };
+        let dir = TempDir::new().unwrap();
+        let (state, token) = auth_state_with_token(&dir, read_write).await;
+        let status = post_rpc_as(crate::build_app(state), &token, run_gc_req()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "runGc over /rpc must require the admin scope, matching /admin/gc"
+        );
+    }
+
+    /// The same request with an admin token succeeds — the gate rejects the scope,
+    /// not the method.
+    #[tokio::test]
+    async fn rpc_run_gc_is_allowed_for_admin() {
+        let dir = TempDir::new().unwrap();
+        let (state, token) = auth_state_with_token(&dir, crate::auth::Scopes::ALL).await;
+        let status = post_rpc_as(crate::build_app(state), &token, run_gc_req()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an admin token must still be able to run GC over /rpc"
+        );
     }
 }
