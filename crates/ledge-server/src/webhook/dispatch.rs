@@ -14,15 +14,32 @@ pub struct WebhookDispatcher {
     allow_private: bool,
 }
 
+/// Per-delivery timeout for a webhook POST.
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the reqwest client used for webhook delivery, optionally pinning `host`
+/// to a validated `addr` (closing the DNS-rebind window for a DNS-name target).
+///
+/// Redirects are NOT followed. The SSRF guard validates the ORIGINAL target only;
+/// a redirect target is never checked and the DNS pin does not cover it, so a
+/// webhook endpoint that answers `302 Location: http://169.254.169.254/…` would
+/// otherwise walk the delivery straight to an internal address — defeating the
+/// guard's whole purpose. A 3xx is treated as a (non-2xx) delivery failure.
+fn webhook_client(pin: Option<(&str, std::net::SocketAddr)>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addr)) = pin {
+        b = b.resolve(host, addr);
+    }
+    b.build().unwrap_or_default()
+}
+
 impl WebhookDispatcher {
     pub fn new(store: Arc<WebhookStore>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
         Self {
             store,
-            client,
+            client: webhook_client(None),
             allow_private: false,
         }
     }
@@ -78,13 +95,7 @@ async fn deliver(
         Some(addr) => reqwest::Url::parse(&wh.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
-            .and_then(|host| {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .resolve(&host, addr)
-                    .build()
-                    .ok()
-            })
+            .map(|host| webhook_client(Some((&host, addr))))
             .unwrap_or(client),
         None => client,
     };
@@ -135,5 +146,84 @@ mod tests {
             serde_json::json!({"event":"ref.committed"}),
         );
         assert_eq!(d.store().count(), 0);
+    }
+
+    /// Spawn a loopback HTTP server; return its base URL and a shutdown-safe task.
+    /// `handler` is an axum router.
+    async fn spawn(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// The SSRF guard validates only the ORIGINAL webhook URL. If the delivery
+    /// client followed HTTP redirects, a tenant webhook could point at their own
+    /// public server, answer `302 Location: http://<internal>/`, and walk the
+    /// delivery to an address the guard never saw — the exact SSRF pivot the guard
+    /// exists to prevent. This drives a real redirect and asserts the target is
+    /// never reached.
+    ///
+    /// Runs with `allow_private = true` so the guard is out of the way and the
+    /// ONLY thing that can stop the redirect is the client's redirect policy —
+    /// isolating exactly the behavior under test.
+    #[tokio::test]
+    async fn delivery_does_not_follow_redirects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Sentinel: flips a flag if it is ever hit (the "internal" target). It
+        // answers ANY method — a 307 redirect preserves POST, a 302 downgrades to
+        // GET, so the flag must trip regardless of which the client would use.
+        let hit = Arc::new(AtomicBool::new(false));
+        let hit2 = hit.clone();
+        let sentinel = axum::Router::new().route(
+            "/",
+            axum::routing::any(move || {
+                let h = hit2.clone();
+                async move {
+                    h.store(true, Ordering::SeqCst);
+                    "reached"
+                }
+            }),
+        );
+        let sentinel_url = spawn(sentinel).await;
+
+        // Redirector: 302s every request to the sentinel.
+        let target = format!("{sentinel_url}/");
+        let redirector = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let t = target.clone();
+                async move { axum::response::Redirect::temporary(&t) }
+            }),
+        );
+        let redir_url = spawn(redirector).await;
+
+        let wh = WebhookConfig {
+            id: crate::webhook::WebhookId([9u8; 16]),
+            tenant_id: "acme".into(),
+            url: format!("{redir_url}/"),
+            secret: [0u8; 32],
+            events: vec![],
+            created_at_ms: 0,
+            active: true,
+        };
+        // allow_private = true: the guard passes, so only the redirect policy is
+        // under test. pin = None ⇒ the delivery uses `webhook_client(None)`.
+        deliver(
+            webhook_client(None),
+            wh,
+            "ref.committed",
+            b"{}".to_vec(),
+            true,
+        )
+        .await;
+
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "SSRF: the delivery followed a redirect to the internal target"
+        );
     }
 }
