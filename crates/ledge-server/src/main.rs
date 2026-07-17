@@ -2,7 +2,7 @@ use clap::Parser;
 use ledge_core::HLC;
 use ledge_object_store::DiskObjectStore;
 use ledge_ref_store::RefStoreImpl;
-use ledge_server::{build_app, config::LedgeConfig, AppState};
+use ledge_server::{build_app_with_limit, config::LedgeConfig, AppState};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::info;
 
@@ -657,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = build_app(app_state);
+    let app = build_app_with_limit(app_state, cfg.server.max_body_bytes);
 
     // Dedicated plain-HTTP metrics/health listener on [metrics].addr (default
     // :9090) so Prometheus + health probes have a TLS-agnostic scrape port even

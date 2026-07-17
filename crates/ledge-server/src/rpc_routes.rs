@@ -488,4 +488,50 @@ mod tests {
             "an admin token must still be able to run GC over /rpc"
         );
     }
+
+    /// A writeObject larger than the framework's 2 MiB default must succeed under
+    /// the raised body ceiling: the whole point of the limit is that real pushes
+    /// (which exceed 2 MiB constantly) go through. `build_app` applies the 100 MiB
+    /// default, so a 3 MiB object stores and returns an objectId.
+    #[tokio::test]
+    async fn rpc_write_above_2mib_default_succeeds_under_raised_limit() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+        let content = vec![0x5au8; 3 * 1024 * 1024]; // 3 MiB > the 2 MiB framework default
+        let (status, out) = post_rpc(crate::build_app(state), write_object_req(&content)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a 3 MiB writeObject must be accepted"
+        );
+        let reader = serialize::read_message(&mut &out[..], ReaderOptions::new()).unwrap();
+        assert!(
+            matches!(
+                reader
+                    .get_root::<response::Reader>()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                response::Which::ObjectId(_)
+            ),
+            "the large write must round-trip to an objectId, not an error"
+        );
+    }
+
+    /// The ceiling is still a ceiling: a body over the configured limit is
+    /// rejected with 413, bounding the memory a single buffered request can
+    /// consume. Verified against a deliberately tiny limit so the test stays cheap.
+    #[tokio::test]
+    async fn rpc_body_over_configured_limit_is_413() {
+        let dir = TempDir::new().unwrap();
+        let state = state_over(&dir);
+        let app = crate::build_app_with_limit(state, 1024 * 1024); // 1 MiB ceiling
+        let content = vec![0u8; 2 * 1024 * 1024]; // 2 MiB > ceiling
+        let (status, _) = post_rpc(app, write_object_req(&content)).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body over the configured limit must be rejected, not buffered"
+        );
+    }
 }

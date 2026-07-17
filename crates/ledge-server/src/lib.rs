@@ -21,6 +21,7 @@ pub mod workspace_routes;
 pub use auth::{Principal, Scopes};
 pub use routes::AppState;
 
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
@@ -341,7 +342,21 @@ pub fn build_metrics_app() -> Router {
         .route("/healthz", axum::routing::get(routes::healthz))
 }
 
+/// Build the HTTP app with the default request-body ceiling
+/// ([`config::default_max_body_bytes`], 100 MiB) on the body-consuming routes.
+/// The server launch path uses [`build_app_with_limit`] to honor the configured
+/// `[server].max_body_bytes`.
 pub fn build_app(state: AppState) -> Router {
+    build_app_with_limit(state, crate::config::default_max_body_bytes())
+}
+
+/// Like [`build_app`], but with an explicit request-body ceiling (bytes) applied
+/// to the large-body routes: git push (default + workspace receive-pack), LFS
+/// upload, and the binary `/rpc` endpoint. Every other route keeps the framework
+/// default (2 MiB) — the small JSON control plane never needs more, and a tight
+/// default there bounds the memory a stray large POST can buffer.
+pub fn build_app_with_limit(state: AppState, max_body_bytes: usize) -> Router {
+    let big_body = DefaultBodyLimit::max(max_body_bytes);
     // The auth middleware needs its own clone of the state (`with_state` below
     // consumes `state` into the router's handler state).
     let auth_state = state.clone();
@@ -385,7 +400,7 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/admin/gc", axum::routing::post(workspace_routes::admin_gc))
         // ── Binary control plane (Cap'n Proto, spec §2) ────────────────────
-        .route("/rpc", axum::routing::post(rpc_routes::rpc))
+        .route("/rpc", axum::routing::post(rpc_routes::rpc).layer(big_body))
         .route(
             "/admin/snapshot",
             axum::routing::post(admin_routes::admin_snapshot),
@@ -444,21 +459,21 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route(
             "/ws/{id}/git-upload-pack",
-            axum::routing::post(routes::ws_upload_pack),
+            axum::routing::post(routes::ws_upload_pack).layer(big_body),
         )
         .route(
             "/ws/{id}/git-receive-pack",
-            axum::routing::post(routes::ws_receive_pack),
+            axum::routing::post(routes::ws_receive_pack).layer(big_body),
         )
         // ── Default repo git (segment = "") ────────────────────────────────
         .route("/{repo}/info/refs", axum::routing::get(routes::info_refs))
         .route(
             "/{repo}/git-upload-pack",
-            axum::routing::post(routes::upload_pack),
+            axum::routing::post(routes::upload_pack).layer(big_body),
         )
         .route(
             "/{repo}/git-receive-pack",
-            axum::routing::post(routes::receive_pack),
+            axum::routing::post(routes::receive_pack).layer(big_body),
         )
         // ── Git LFS (Batch API + basic transfer) for the durable repo ──────
         .route(
@@ -467,7 +482,9 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route(
             "/{repo}/info/lfs/objects/{oid}",
-            axum::routing::put(lfs::lfs_upload).get(lfs::lfs_download),
+            axum::routing::put(lfs::lfs_upload)
+                .get(lfs::lfs_download)
+                .layer(big_body),
         )
         .with_state(state)
         .layer(

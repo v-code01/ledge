@@ -60,6 +60,20 @@ impl Default for SshConfig {
 pub struct ServerConfig {
     pub addr: String,
     pub data_dir: String,
+    /// Maximum accepted request-body size, in bytes, for the body-consuming
+    /// routes (git receive-pack/upload-pack and the binary `/rpc` endpoint). The
+    /// body is buffered in full before dispatch, so this is also the per-request
+    /// memory ceiling for a push — hence bounded, not unlimited. Default 100 MiB:
+    /// large enough for the overwhelming majority of real pushes, small enough
+    /// that concurrent uploads stay memory-bounded. The small JSON control-plane
+    /// routes keep the framework's tight default.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+/// 100 MiB — the default git/RPC request-body ceiling (see [`ServerConfig::max_body_bytes`]).
+pub fn default_max_body_bytes() -> usize {
+    100 * 1024 * 1024
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
