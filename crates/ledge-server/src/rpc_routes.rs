@@ -26,6 +26,18 @@ use crate::{metrics, routes::AppState};
 /// Wire content type for capnp `/rpc` request and response bodies.
 const CONTENT_TYPE: &str = "application/x-ledge-capnp";
 
+/// Does this RPC method (the label from [`ledge_rpc::method_name`]) mutate state?
+/// Writes require the `write` scope; the read methods do not. `runGc` is excluded
+/// because it is separately admin-gated (a stronger requirement). An `unknown`
+/// (undecodable) label is not a write — it falls through to dispatch, which
+/// rejects it as malformed (400) before any store op runs.
+fn rpc_method_writes(method: &str) -> bool {
+    matches!(
+        method,
+        "writeObject" | "fork" | "commit" | "renew" | "release"
+    )
+}
+
 /// `POST /rpc` — decode one capnp `Request`, dispatch, return the `Response`.
 ///
 /// 4d-1: `principal` is the verified identity the auth middleware injected
@@ -55,6 +67,18 @@ pub async fn rpc(
     if method == "runGc" && !principal.scopes.is_admin() {
         metrics::record_rpc_request(method, start.elapsed());
         warn!(method, "rpc forbidden: admin scope required");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Per-method write gate — the middleware's write gate exempts `/rpc` because
+    // the read/write split lives inside the binary body, so it is enforced here.
+    // A `read`-only key may `readObject`/`getWorkspace`/`listWorkspaces` but must
+    // not `writeObject`/`fork`/`commit`/`renew`/`release`. `runGc` is already
+    // admin-gated above (admin implies write). A method that fails to decode is
+    // "unknown" and falls through to dispatch → 400, so it never mutates.
+    if rpc_method_writes(method) && !principal.scopes.can_write() {
+        metrics::record_rpc_request(method, start.elapsed());
+        warn!(method, "rpc forbidden: write scope required");
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -532,6 +556,37 @@ mod tests {
             status,
             StatusCode::PAYLOAD_TOO_LARGE,
             "a body over the configured limit must be rejected, not buffered"
+        );
+    }
+
+    /// The `/rpc` endpoint is exempt from the middleware write gate (the read/write
+    /// split lives inside the binary body), so the handler must enforce it
+    /// per-method. A read-only key may `readObject` but must not `writeObject` —
+    /// otherwise a read-only key writes objects through `/rpc`, the exact bypass
+    /// the REST write gate closes.
+    #[tokio::test]
+    async fn rpc_write_method_requires_write_scope() {
+        let read_only = crate::auth::Scopes {
+            read: true,
+            write: false,
+            admin: false,
+        };
+        let dir = TempDir::new().unwrap();
+        let (state, token) = auth_state_with_token(&dir, read_only).await;
+        let app = crate::build_app(state);
+
+        // writeObject is denied.
+        assert_eq!(
+            post_rpc_as(app.clone(), &token, write_object_req(b"nope")).await,
+            StatusCode::FORBIDDEN,
+            "a read-only key must not writeObject over /rpc"
+        );
+        // readObject is allowed (a read) — 200 with a business Response (the object
+        // is absent, so Response.error, but the request is authorized and dispatched).
+        assert_eq!(
+            post_rpc_as(app, &token, read_object_req(&[0u8; 32])).await,
+            StatusCode::OK,
+            "a read-only key may readObject over /rpc"
         );
     }
 }

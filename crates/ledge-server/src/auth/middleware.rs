@@ -36,6 +36,34 @@ fn classify(path: &str) -> Class {
     }
 }
 
+/// Does this CLIENT request mutate state (→ needs the `write` scope)?
+///
+/// The default is "a non-GET method writes", with the exceptions that are
+/// non-GET yet READ-ONLY and therefore must stay open to a read-only key:
+/// - `git-upload-pack` — a git *fetch* is a POST but reads nothing-but-serves.
+/// - the LFS `batch` negotiation — a POST that only returns transfer URLs; the
+///   actual object upload (a separate `PUT`) is where the write is gated.
+/// - `/rpc` — one endpoint multiplexes read and write methods inside the binary
+///   body, so it is classified per-method in the RPC handler (which gates
+///   `writeObject`/`fork`/`commit`/… on `can_write`), not here.
+///
+/// `info/refs` (ref advertisement, the fetch/push handshake) is a GET, so it is
+/// already a read by the default. A misclassification here fails safe only if it
+/// errs toward "write" (denies a read-only key) — erring toward "read" would let
+/// a read-only key mutate — so unknown non-GET methods default to write.
+fn is_client_write(method: &axum::http::Method, path: &str) -> bool {
+    if path.ends_with("/git-upload-pack")
+        || path.ends_with("/info/lfs/objects/batch")
+        || path == "/rpc"
+    {
+        return false;
+    }
+    !matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
+
 /// Wall-clock ms (for expiry checks). The store takes `now_ms` as a parameter so
 /// it stays deterministic; the middleware supplies the real clock.
 fn now_ms() -> u64 {
@@ -153,6 +181,22 @@ pub async fn auth_layer(State(state): State<AppState>, mut req: Request, next: N
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // ── Write gate (CLIENT mutating routes). ───────────────────────────────────
+    // A `read`-only key may fetch/list/read but must NOT push, fork, commit,
+    // register a webhook, or otherwise mutate. `admin` implies `write`, so an
+    // admin key passes. `/rpc` is exempt here and gated per-method in its handler
+    // (the read/write split is inside the binary body). Disabled mode and the
+    // Service principal (cluster secret) both hold ALL scopes, so neither is
+    // affected.
+    if class == Class::Client
+        && is_client_write(req.method(), &path)
+        && !principal.scopes.can_write()
+    {
+        metrics::record_auth_request("forbidden");
+        tracing::warn!(path = %path, principal = %principal.principal_id, "auth 403 (write scope required)");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     // ── Rate quota (Phase 4d-3): CLIENT requests only, post-principal (tenant
     //    known), pre-next.run. Enforced only when quotas enabled AND tenant != root
     //    (R Q7); root/disabled bypass via `enforced_for`. A deny is a 429. The
@@ -195,6 +239,13 @@ mod tests {
             admin: false,
         }
     }
+    fn rw_scopes() -> Scopes {
+        Scopes {
+            read: true,
+            write: true,
+            admin: false,
+        }
+    }
 
     /// A minimal router that mounts the middleware and echoes the extracted
     /// principal id (proves injection), reusing the workspace test AppState
@@ -214,10 +265,13 @@ mod tests {
         let mut state = crate::workspace_routes::test_state_for_auth(&dir);
         state.auth = ctx;
         Router::new()
-            .route("/workspaces", get(whoami))
+            .route("/workspaces", get(whoami).post(whoami))
             .route("/admin/gc", axum::routing::post(admin_only))
             .route("/healthz", get(public_ok))
             .route("/cluster/gc", axum::routing::post(whoami))
+            // Git write (push) and read (fetch) routes for the write-gate tests.
+            .route("/repo/git-receive-pack", axum::routing::post(whoami))
+            .route("/repo/git-upload-pack", axum::routing::post(whoami))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_layer,
@@ -281,6 +335,92 @@ mod tests {
         assert_eq!(
             status_of(app, "GET", "/workspaces", Some(("Bearer", &token))).await,
             StatusCode::OK
+        );
+    }
+
+    /// Build an enabled-auth app plus a token minted with `scopes`.
+    async fn app_and_token(scopes: Scopes) -> (Router, String) {
+        let store = Arc::new(AuthStore::in_memory(Arc::new(ledge_core::HLC::new())));
+        let token = store
+            .mint("acme", PrincipalKind::User, scopes, None, 0)
+            .await
+            .unwrap();
+        let ctx = AuthCtx {
+            enabled: true,
+            store,
+            cluster_secret: None,
+        };
+        (app_with(ctx).await, token)
+    }
+
+    /// A read-only key must be able to READ but must be denied every WRITE. This
+    /// is the whole point of a `read` scope: before this gate, `write` was minted
+    /// into keys but never checked, so a read-only key could push, fork, commit,
+    /// register webhooks — anything. `admin` implies `write`, so it is unaffected.
+    #[tokio::test]
+    async fn read_only_key_is_denied_writes_but_allowed_reads() {
+        let (app, tok) = app_and_token(ro_scopes()).await;
+        let auth = Some(("Bearer", tok.as_str()));
+
+        // Reads pass.
+        assert_eq!(
+            status_of(app.clone(), "GET", "/workspaces", auth).await,
+            StatusCode::OK,
+            "read-only key may list workspaces (GET)"
+        );
+        // A git fetch is a POST but a READ — must stay open.
+        assert_eq!(
+            status_of(app.clone(), "POST", "/repo/git-upload-pack", auth).await,
+            StatusCode::OK,
+            "read-only key may fetch (git-upload-pack)"
+        );
+
+        // Writes are denied.
+        assert_eq!(
+            status_of(app.clone(), "POST", "/workspaces", auth).await,
+            StatusCode::FORBIDDEN,
+            "read-only key must NOT create a workspace (POST)"
+        );
+        assert_eq!(
+            status_of(app.clone(), "DELETE", "/workspaces", auth).await,
+            StatusCode::FORBIDDEN,
+            "read-only key must NOT delete (DELETE)"
+        );
+        assert_eq!(
+            status_of(app, "POST", "/repo/git-receive-pack", auth).await,
+            StatusCode::FORBIDDEN,
+            "read-only key must NOT push (git-receive-pack)"
+        );
+    }
+
+    /// A read+write (non-admin) key passes the write gate on the same routes —
+    /// the gate rejects the missing scope, not the method.
+    #[tokio::test]
+    async fn write_key_passes_the_write_gate() {
+        let (app, tok) = app_and_token(rw_scopes()).await;
+        let auth = Some(("Bearer", tok.as_str()));
+        assert_eq!(
+            status_of(app.clone(), "POST", "/workspaces", auth).await,
+            StatusCode::OK,
+            "a write-scoped key may create a workspace"
+        );
+        assert_eq!(
+            status_of(app, "POST", "/repo/git-receive-pack", auth).await,
+            StatusCode::OK,
+            "a write-scoped key may push"
+        );
+    }
+
+    /// An admin key implies write, so it passes the write gate too (and is the
+    /// only key that also passes the `/admin/*` gate).
+    #[tokio::test]
+    async fn admin_key_passes_the_write_gate() {
+        let (app, tok) = app_and_token(admin_scopes()).await;
+        let auth = Some(("Bearer", tok.as_str()));
+        assert_eq!(
+            status_of(app, "POST", "/workspaces", auth).await,
+            StatusCode::OK,
+            "admin implies write"
         );
     }
 
