@@ -249,23 +249,41 @@ impl ObjectStore for ReplicatedObjectStore {
             Err(e) => return Err(e),
         }
         let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
+        // Try EVERY peer: an unreachable one must not fail a read that a later
+        // replica can satisfy. Errors are remembered so we can tell "no replica
+        // has it" (clean NotFound) from "some replica was unreachable" (retryable
+        // Unavailable) — reporting NotFound for an object that merely couldn't be
+        // reached would be a false negative the GC/fetch paths must never see.
+        let mut peer_errs: Vec<LedgeError> = Vec::new();
         for p in &peers {
-            if let Some(bytes) = p.get(&id).await? {
-                // Content addressing makes the fetch verifiable + idempotent:
-                // the local re-write rederives the address; a mismatch means the
-                // peer handed us tampered/corrupt bytes.
-                let stored = self.local.write(bytes.clone()).await?;
-                if stored != id {
-                    return Err(LedgeError::Corruption(format!(
-                        "peer object {} hashed to {}",
-                        id.to_hex(),
-                        stored.to_hex()
-                    )));
+            match p.get(&id).await {
+                Ok(Some(bytes)) => {
+                    // Content addressing makes the fetch verifiable + idempotent:
+                    // the local re-write rederives the address; a mismatch means
+                    // the peer handed us tampered/corrupt bytes.
+                    let stored = self.local.write(bytes.clone()).await?;
+                    if stored != id {
+                        return Err(LedgeError::Corruption(format!(
+                            "peer object {} hashed to {}",
+                            id.to_hex(),
+                            stored.to_hex()
+                        )));
+                    }
+                    return Ok(bytes);
                 }
-                return Ok(bytes);
+                Ok(None) => {} // this peer cleanly lacks it — try the next
+                Err(e) => peer_errs.push(e), // unreachable — remember, try the next
             }
         }
-        Err(LedgeError::NotFound(id))
+        if peer_errs.is_empty() {
+            Err(LedgeError::NotFound(id))
+        } else {
+            Err(LedgeError::Unavailable(format!(
+                "object {} absent locally and {} peer(s) unreachable: {peer_errs:?}",
+                id.to_hex(),
+                peer_errs.len()
+            )))
+        }
     }
 
     /// Whether the object exists locally or on any peer.
@@ -274,12 +292,27 @@ impl ObjectStore for ReplicatedObjectStore {
             return Ok(true);
         }
         let peers: Vec<Arc<dyn ObjectPeer>> = self.peers.load().iter().cloned().collect();
+        // Consult every peer; a single unreachable replica must not mask another
+        // that holds the object. Only after all peers answer "no" (Ok(false)) is
+        // the object absent. If some were unreachable we cannot claim absence, so
+        // the fault is surfaced as retryable rather than a false `Ok(false)`.
+        let mut peer_errs: Vec<LedgeError> = Vec::new();
         for p in &peers {
-            if p.has(&id).await? {
-                return Ok(true);
+            match p.has(&id).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => peer_errs.push(e),
             }
         }
-        Ok(false)
+        if peer_errs.is_empty() {
+            Ok(false)
+        } else {
+            Err(LedgeError::Unavailable(format!(
+                "exists({}) inconclusive: {} peer(s) unreachable: {peer_errs:?}",
+                id.to_hex(),
+                peer_errs.len()
+            )))
+        }
     }
 }
 
@@ -347,6 +380,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that is always unreachable — every call errors.
+    struct ErrPeer;
+    #[async_trait]
+    impl ObjectPeer for ErrPeer {
+        async fn put(&self, _: &ObjectId, _: &[u8]) -> Result<()> {
+            Err(LedgeError::Unavailable("peer down".into()))
+        }
+        async fn put_git(&self, _: &ObjectId, _: u8, _: &[u8]) -> Result<()> {
+            Err(LedgeError::Unavailable("peer down".into()))
+        }
+        async fn get(&self, _: &ObjectId) -> Result<Option<Bytes>> {
+            Err(LedgeError::Unavailable("peer down".into()))
+        }
+        async fn has(&self, _: &ObjectId) -> Result<bool> {
+            Err(LedgeError::Unavailable("peer down".into()))
+        }
+    }
+
+    fn disk() -> (Arc<DiskObjectStore>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Arc::new(DiskObjectStore::new(dir.path().to_path_buf()).unwrap());
+        (s, dir)
+    }
+
+    /// A read that misses locally must self-heal from a peer that HAS the object,
+    /// even when an earlier peer in the set is unreachable. The `?` on the peer
+    /// fetch used to abort the whole read on the first peer's error, so a single
+    /// down replica failed reads that another replica could satisfy — the opposite
+    /// of what multi-replica read-repair is for.
+    #[tokio::test]
+    async fn read_heals_past_an_unreachable_peer() {
+        let (local, _d0) = disk();
+        let (good, _d1) = disk();
+        let content = Bytes::from_static(b"object behind a down peer");
+        let id = good.write(content.clone()).await.unwrap();
+
+        // Peer order: the unreachable one FIRST, the holder SECOND.
+        let peers: Vec<Arc<dyn ObjectPeer>> =
+            vec![Arc::new(ErrPeer), Arc::new(LocalObjectPeer::new(good))];
+        let store = ReplicatedObjectStore::new(local, peers);
+
+        let got = store
+            .read(id)
+            .await
+            .expect("read must heal from the good peer");
+        assert_eq!(got, content);
+    }
+
+    /// `exists` likewise must consult every peer, not stop at the first error.
+    #[tokio::test]
+    async fn exists_checks_past_an_unreachable_peer() {
+        let (local, _d0) = disk();
+        let (good, _d1) = disk();
+        let id = good
+            .write(Bytes::from_static(b"present on a later peer"))
+            .await
+            .unwrap();
+        let peers: Vec<Arc<dyn ObjectPeer>> =
+            vec![Arc::new(ErrPeer), Arc::new(LocalObjectPeer::new(good))];
+        let store = ReplicatedObjectStore::new(local, peers);
+        assert!(
+            store.exists(id).await.unwrap(),
+            "exists must find it on peer 2"
+        );
+    }
+
+    /// When NO peer has the object and none errored, the read is a clean NotFound.
+    #[tokio::test]
+    async fn read_absent_everywhere_is_not_found() {
+        let (local, _d0) = disk();
+        let (empty_peer, _d1) = disk();
+        let store =
+            ReplicatedObjectStore::new(local, vec![Arc::new(LocalObjectPeer::new(empty_peer))]);
+        let missing = ObjectId::from_bytes([0x11; 32]);
+        assert!(matches!(
+            store.read(missing).await,
+            Err(LedgeError::NotFound(_))
+        ));
+    }
 
     #[test]
     fn set_peers_swaps_peer_set() {
