@@ -123,7 +123,7 @@ impl ObjectPeer for FailingPeer {
     async fn put_git(&self, _: &ObjectId, _: u8, _: &[u8]) -> ledge_core::Result<()> {
         Err(LedgeError::Unavailable("peer down".into()))
     }
-    async fn get(&self, _: &ObjectId) -> ledge_core::Result<Option<Bytes>> {
+    async fn get(&self, _: &ObjectId) -> ledge_core::Result<Option<(u8, Bytes)>> {
         Ok(None)
     }
     async fn has(&self, _: &ObjectId) -> ledge_core::Result<bool> {
@@ -191,8 +191,8 @@ impl ObjectPeer for TamperingPeer {
     async fn put_git(&self, _: &ObjectId, _: u8, _: &[u8]) -> ledge_core::Result<()> {
         Ok(())
     }
-    async fn get(&self, _: &ObjectId) -> ledge_core::Result<Option<Bytes>> {
-        Ok(Some(self.bytes.clone()))
+    async fn get(&self, _: &ObjectId) -> ledge_core::Result<Option<(u8, Bytes)>> {
+        Ok(Some((3, self.bytes.clone())))
     }
     async fn has(&self, _: &ObjectId) -> ledge_core::Result<bool> {
         Ok(true)

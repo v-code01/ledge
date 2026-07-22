@@ -59,8 +59,13 @@ pub trait ObjectPeer: Send + Sync {
     /// Replicate a typed git object so the peer reproduces the same type byte.
     async fn put_git(&self, id: &ObjectId, git_type: u8, content: &[u8]) -> Result<()>;
 
-    /// Fetch the raw content for `id` from this peer, or `None` if absent.
-    async fn get(&self, id: &ObjectId) -> Result<Option<Bytes>>;
+    /// Fetch `(git_type, content)` for `id` from this peer, or `None` if absent.
+    ///
+    /// The git type travels with the content so a read-repair can re-store the
+    /// object with its true type (and therefore its true git SHA-1); repairing a
+    /// commit/tree/tag as an untyped blob would corrupt its git identity on the
+    /// healed replica.
+    async fn get(&self, id: &ObjectId) -> Result<Option<(u8, Bytes)>>;
 
     /// Whether this peer holds an object for `id`.
     async fn has(&self, id: &ObjectId) -> Result<bool>;
@@ -111,9 +116,16 @@ impl ObjectPeer for LocalObjectPeer {
         Ok(())
     }
 
-    async fn get(&self, id: &ObjectId) -> Result<Option<Bytes>> {
+    async fn get(&self, id: &ObjectId) -> Result<Option<(u8, Bytes)>> {
         match self.store.read(*id).await {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                // The store holds the git type in the object header; carry it so
+                // the repair re-stores with the correct type. A missing type is a
+                // store inconsistency (the object exists but has no header type) —
+                // surface it rather than silently defaulting to blob.
+                let git_type = self.store.git_type_of(*id).await?;
+                Ok(Some((git_type, bytes)))
+            }
             Err(LedgeError::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -257,11 +269,13 @@ impl ObjectStore for ReplicatedObjectStore {
         let mut peer_errs: Vec<LedgeError> = Vec::new();
         for p in &peers {
             match p.get(&id).await {
-                Ok(Some(bytes)) => {
+                Ok(Some((git_type, bytes))) => {
                     // Content addressing makes the fetch verifiable + idempotent:
                     // the local re-write rederives the address; a mismatch means
-                    // the peer handed us tampered/corrupt bytes.
-                    let stored = self.local.write(bytes.clone()).await?;
+                    // the peer handed us tampered/corrupt bytes. Re-store with the
+                    // peer's git type so a repaired commit/tree/tag keeps its true
+                    // type and SHA-1 (not the blob type an untyped write would give).
+                    let stored = self.local.write_git_object(git_type, bytes.clone()).await?;
                     if stored != id {
                         return Err(LedgeError::Corruption(format!(
                             "peer object {} hashed to {}",
@@ -391,7 +405,7 @@ mod tests {
         async fn put_git(&self, _: &ObjectId, _: u8, _: &[u8]) -> Result<()> {
             Err(LedgeError::Unavailable("peer down".into()))
         }
-        async fn get(&self, _: &ObjectId) -> Result<Option<Bytes>> {
+        async fn get(&self, _: &ObjectId) -> Result<Option<(u8, Bytes)>> {
             Err(LedgeError::Unavailable("peer down".into()))
         }
         async fn has(&self, _: &ObjectId) -> Result<bool> {
@@ -444,6 +458,33 @@ mod tests {
         assert!(
             store.exists(id).await.unwrap(),
             "exists must find it on peer 2"
+        );
+    }
+
+    /// Read-repair of a NON-blob object must preserve its git type on the local
+    /// replica. The repair used the untyped `local.write` (git blob = type 3), so
+    /// a healed commit/tree/tag was stored with the wrong type AND wrong git
+    /// SHA-1 — and a later clone served from this node would ship a broken pack
+    /// (the object's real sha1 is unresolvable). It must re-store with the type
+    /// the source replica reports.
+    #[tokio::test]
+    async fn read_repair_preserves_git_type() {
+        let (local, _d0) = disk();
+        let (good, _d1) = disk();
+        // A COMMIT object (git type 1) on the holder.
+        let commit = Bytes::from_static(b"tree 0000000000000000000000000000000000000000\n");
+        let id = good.write_git_object(1, commit.clone()).await.unwrap();
+        assert_eq!(good.git_type_of(id).await.unwrap(), 1);
+
+        let store = ReplicatedObjectStore::new(local, vec![Arc::new(LocalObjectPeer::new(good))]);
+        let got = store.read(id).await.unwrap();
+        assert_eq!(got, commit, "repair returns the correct bytes");
+
+        // The healed LOCAL copy must be a commit (1), not a blob (3).
+        assert_eq!(
+            store.local().git_type_of(id).await.unwrap(),
+            1,
+            "read-repair must preserve the git type on the local replica"
         );
     }
 

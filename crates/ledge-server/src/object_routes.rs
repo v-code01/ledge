@@ -77,12 +77,26 @@ pub async fn get_object(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid object id hex").into_response(),
     };
     match state.objects_disk.read(id).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            // Carry the git type so a peer's read-repair re-stores with the true
+            // type (not blob). Default to blob (3) if the type is somehow absent —
+            // no worse than omitting the header.
+            let git_type = state.objects_disk.git_type_of(id).await.unwrap_or(3);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (
+                        header::HeaderName::from_static(
+                            ledge_cluster::net_http::OBJECT_GIT_TYPE_HEADER,
+                        ),
+                        git_type.to_string(),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         Err(LedgeError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             warn!(error = %e, id = %id_hex, "object fetch failed");

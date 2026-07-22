@@ -376,6 +376,12 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
 
 // ── Object replication transport: HttpObjectPeer ─────────────────────────────
 
+/// Response header on `GET /objects/{shard}/{id}` carrying the object's git type
+/// byte (1=commit, 2=tree, 3=blob, 4=tag). Lets a read-repair re-store the fetched
+/// object with its true type instead of defaulting to blob. Shared by the peer
+/// (which reads it) and the server endpoint (which sends it).
+pub const OBJECT_GIT_TYPE_HEADER: &str = "x-ledge-git-type";
+
 /// HTTP transport for the [`crate::object_store::ObjectPeer`] trait.
 ///
 /// This is the production counterpart to [`crate::object_store::LocalObjectPeer`]
@@ -498,7 +504,7 @@ impl crate::object_store::ObjectPeer for HttpObjectPeer {
         self.put_typed(id, git_type, content).await
     }
 
-    async fn get(&self, id: &ObjectId) -> ledge_core::Result<Option<Bytes>> {
+    async fn get(&self, id: &ObjectId) -> ledge_core::Result<Option<(u8, Bytes)>> {
         let resp = self
             .client
             .get(self.object_url(id))
@@ -517,11 +523,22 @@ impl crate::object_store::ObjectPeer for HttpObjectPeer {
                 resp.status()
             )));
         }
+        // The git type rides in a response header so a read-repair can re-store
+        // the object with its true type. A same-version peer always sends it; an
+        // absent/unparseable header falls back to blob (3), the pre-typed-fetch
+        // behavior, which is correct for blobs (the common case) and no worse than
+        // before for the rest.
+        let git_type = resp
+            .headers()
+            .get(OBJECT_GIT_TYPE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(3);
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| LedgeError::Unavailable(format!("read fetch response: {e}")))?;
-        Ok(Some(bytes))
+        Ok(Some((git_type, bytes)))
     }
 
     async fn has(&self, id: &ObjectId) -> ledge_core::Result<bool> {
@@ -1017,12 +1034,24 @@ mod tests {
         async fn fetch(
             State(store): State<Arc<DiskObjectStore>>,
             Path((_shard, id_hex)): Path<(u32, String)>,
-        ) -> Result<Vec<u8>, StatusCode> {
-            let id = ObjectId::from_hex(&id_hex).map_err(|_| StatusCode::BAD_REQUEST)?;
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let Ok(id) = ObjectId::from_hex(&id_hex) else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
             match store.read(id).await {
-                Ok(bytes) => Ok(bytes.to_vec()),
-                Err(LedgeError::NotFound(_)) => Err(StatusCode::NOT_FOUND),
-                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+                // Mirror the real `object_routes::get_object`: send the git type
+                // header so HttpObjectPeer::get can carry it into a read-repair.
+                Ok(bytes) => {
+                    let git_type = store.git_type_of(id).await.unwrap_or(3);
+                    (
+                        [(super::OBJECT_GIT_TYPE_HEADER, git_type.to_string())],
+                        bytes.to_vec(),
+                    )
+                        .into_response()
+                }
+                Err(LedgeError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
         }
 
@@ -1051,8 +1080,12 @@ mod tests {
         assert!(store.exists(id).await.unwrap(), "peer stored the object");
         assert!(peer.has(&id).await.unwrap(), "has() sees the object");
 
-        let got = peer.get(&id).await.unwrap().expect("get returns Some");
+        let (got_type, got) = peer.get(&id).await.unwrap().expect("get returns Some");
         assert_eq!(&got[..], &content[..], "fetched bytes identical");
+        assert_eq!(
+            got_type, 3,
+            "a plain put stores a blob; get reports its type"
+        );
 
         // A missing id round-trips as None / false (404).
         let absent = ObjectId::from(blake3::hash(b"never written"));
@@ -1079,6 +1112,11 @@ mod tests {
             2,
             "type byte preserved"
         );
+
+        // And a fetch carries that type back over HTTP (the header the read-repair
+        // relies on to re-store a non-blob object with its true type).
+        let (got_type, _) = peer.get(&id).await.unwrap().expect("get returns Some");
+        assert_eq!(got_type, 2, "get reports the tree type over HTTP");
 
         server.abort();
     }
