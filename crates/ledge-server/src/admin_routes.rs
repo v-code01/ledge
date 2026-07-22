@@ -369,6 +369,41 @@ mod route_tests {
         );
     }
 
+    /// A snapshot destination INSIDE the data dir must be refused, not begin the
+    /// clone-into-itself runaway. `state_over`'s data dir is the src; a dest under
+    /// it must fail cleanly (500 from clone_tree's refusal) and leave nothing.
+    #[tokio::test]
+    async fn snapshot_dest_inside_data_dir_is_refused() {
+        let src_dir = TempDir::new().unwrap();
+        let state = state_over(&src_dir);
+        let data_dir = state.data_dir.clone();
+        let dest = data_dir.join("nested-snapshot"); // inside the source tree
+        let dest_str = dest.to_str().unwrap().to_string();
+
+        let app = crate::build_app(state);
+        let body = serde_json::to_string(&SnapshotRequest { dest: dest_str }).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/snapshot")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a dest inside the data dir must be refused"
+        );
+        assert!(
+            !dest.exists(),
+            "the runaway nested destination must never be created"
+        );
+    }
+
     /// `POST /admin/repack` returns 200 and a JSON body carrying the pass stats.
     #[tokio::test]
     async fn repack_endpoint_returns_stats() {

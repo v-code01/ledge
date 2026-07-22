@@ -80,12 +80,63 @@ pub fn clone_tree(src_dir: &Path, dst_dir: &Path) -> Result<CloneStats> {
             ),
         )));
     }
+    // Refuse a destination inside the source tree. clone_tree creates `dst_dir`
+    // then walks `src_dir`; if `dst_dir` is under `src_dir`, the walk re-enters
+    // the destination it just created and clones it into itself, recursing
+    // without bound (stack overflow / ENAMETOOLONG / disk fill). A snapshot into
+    // the data dir is a plausible operator mistake, so we fail fast — before any
+    // directory is created — rather than leave a deep partial tree behind.
+    if dest_within_src(src_dir, dst_dir)? {
+        return Err(LedgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "clone_tree destination {} is inside the source tree {}",
+                dst_dir.display(),
+                src_dir.display()
+            ),
+        )));
+    }
     let mut stats = CloneStats::default();
     // The destination root mirrors src_dir; create it then walk recursively.
     std::fs::create_dir_all(dst_dir).map_err(LedgeError::Io)?;
     stats.dirs += 1;
     clone_tree_into(src_dir, dst_dir, &mut stats)?;
     Ok(stats)
+}
+
+/// Is `dst` the same as, or nested inside, `src` — by real filesystem location
+/// (symlinks resolved), not string prefix? `src` is resolved with
+/// [`std::fs::canonicalize`]; `dst` does not exist yet, so its nearest existing
+/// ancestor is canonicalized and the not-yet-created tail re-appended. Comparison
+/// is component-wise via [`Path::starts_with`], so `/data-backups` is NOT inside
+/// `/data`.
+fn dest_within_src(src: &Path, dst: &Path) -> Result<bool> {
+    let src_c = std::fs::canonicalize(src).map_err(LedgeError::Io)?;
+    let dst_c = canonicalize_leaf(dst)?;
+    Ok(dst_c.starts_with(&src_c))
+}
+
+/// Canonicalize a path whose leaf may not exist: resolve the deepest existing
+/// ancestor (following symlinks there), then re-append the absent components.
+/// Falls back to the path as-given if it has no existing ancestor at all.
+fn canonicalize_leaf(p: &Path) -> Result<std::path::PathBuf> {
+    let mut ancestor = p;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            let mut base = std::fs::canonicalize(ancestor).map_err(LedgeError::Io)?;
+            base.extend(tail.iter().rev());
+            return Ok(base);
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                ancestor = parent;
+            }
+            // Root, or a relative path with no existing prefix: nothing to resolve.
+            _ => return Ok(p.to_path_buf()),
+        }
+    }
 }
 
 /// Walk one directory level, cloning entries into the corresponding `dst`
@@ -202,6 +253,46 @@ mod tests {
             fs::read_link(&link).unwrap(),
             std::path::PathBuf::from("top.txt")
         );
+    }
+
+    /// A destination INSIDE the source tree must be refused. Otherwise the walk
+    /// re-enters the freshly-created destination and clones it into itself,
+    /// recursing without bound (stack overflow / disk fill / ENAMETOOLONG). A
+    /// snapshot into a subdirectory of the data dir is a plausible operator
+    /// mistake, so this is a real footgun that can crash the server.
+    #[test]
+    fn clone_tree_refuses_dest_inside_src() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f"), b"x").unwrap();
+        let dst = src.join("snapshot"); // nested INSIDE src
+
+        let err = clone_tree(&src, &dst).unwrap_err();
+        assert!(
+            matches!(err, LedgeError::Io(_)),
+            "expected an Io refusal, got {err:?}"
+        );
+        // Crucially: it must refuse UP FRONT, never begin the runaway nesting.
+        assert!(
+            !dst.exists(),
+            "clone_tree must not create the nested destination before refusing"
+        );
+    }
+
+    /// The refusal is by real location, not string prefix: `/data-backups` is not
+    /// inside `/data`, and a sibling destination clones normally.
+    #[test]
+    fn clone_tree_allows_sibling_dest_with_shared_prefix() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("data");
+        let dst = root.path().join("data-backups"); // shares the "data" prefix, NOT inside
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f"), b"x").unwrap();
+
+        let stats = clone_tree(&src, &dst).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(fs::read(dst.join("f")).unwrap(), b"x");
     }
 
     #[test]
