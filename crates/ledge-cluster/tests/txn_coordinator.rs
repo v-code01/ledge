@@ -741,3 +741,118 @@ async fn workspace_commit_cross_shard_is_atomic() {
     assert_eq!(store1.get(&s1).await.unwrap().unwrap().target, oid(11));
     assert_eq!(store1.get(&s2).await.unwrap().unwrap().target, oid(22));
 }
+
+/// The cross-node resolver residual, now closed: a resolver on a node that does
+/// NOT host the coordinator shard must still presumed-abort a stale lock, by
+/// recording the terminal `Abort` on the coord shard via the forwardable
+/// `TxnDecide` (record-before-release across nodes), then releasing the lock it
+/// hosts.
+///
+/// Placement: shard 0 → node 1 only, shard 1 → node 2 only. A txn's coord shard
+/// is min(participants) = shard 0 (hosted by node 1). The prepared lock sits on
+/// shard 1 (hosted by node 2). The resolver runs on NODE 2, which does not host
+/// the coord shard, so it must forward the decide to node 1.
+///
+/// Before the fix, node 2's resolver hit `if !hosts_locally(coord) { continue }`
+/// and left the lock held (resolved == 0), waiting for node 1's resolver. Now it
+/// resolves immediately.
+#[tokio::test]
+async fn resolver_forwards_decide_when_it_does_not_host_coord_shard() {
+    use ledge_cluster::forward::{ClusterOp, RefOpResponse};
+    use ledge_raft::{LedgeOp, LedgeResp, TxnDecision, TxnId};
+
+    let cluster = MultiShardCluster::start(2, &[1, 2, 3]).await;
+    // Distinct placement: shard 0 on node 1, shard 1 on node 2.
+    let map = ShardMap::from_entries([
+        (
+            ShardId(0),
+            vec![Replica {
+                node_id: 1,
+                addr: "mem://1".into(),
+            }],
+        ),
+        (
+            ShardId(1),
+            vec![Replica {
+                node_id: 2,
+                addr: "mem://2".into(),
+            }],
+        ),
+    ])
+    .unwrap();
+    let fwd = Arc::new(InMemoryForwarder::new());
+    fwd.set_map(map.clone());
+    let store1 = cluster.cluster_ref_store_hosting(1, &map, fwd.clone()); // hosts shard 0 (coord)
+    let store2 = cluster.cluster_ref_store_hosting(2, &map, fwd.clone()); // hosts shard 1 (participant)
+    fwd.register(1, Arc::new(StoreApplier(store1.clone())));
+    fwd.register(2, Arc::new(StoreApplier(store2.clone())));
+
+    // A ref that routes to shard 1 (the non-coord participant).
+    let (a, b) = cluster.two_names_on_distinct_shards();
+    let (name_s1, _name_s0) = if cluster.router().shard_for(a.as_str()) == ShardId(1) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let coord_shard = ShardId(0);
+    let txn = TxnId::from_bytes([0x5c; 16]);
+
+    // Crash BEFORE TxnDecide: Begin (PENDING) on the coord shard (node 1 hosts it),
+    // then a Prepare lock on shard 1 (node 2 hosts it).
+    store1
+        .apply_txn_record_op(
+            coord_shard,
+            LedgeOp::TxnBegin {
+                txn_id: txn,
+                participants: vec![ShardId(1).0],
+            },
+        )
+        .await
+        .unwrap();
+    let vote = store2
+        .op_on_shard(
+            ShardId(1),
+            ClusterOp::Prepare {
+                txn_id: txn,
+                coord_shard: coord_shard.0,
+                name: name_s1.as_str().to_string(),
+                target_bytes: *oid(7).as_bytes(),
+                expected_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(vote, RefOpResponse::Vote(true)));
+
+    // The resolver runs on NODE 2, which does NOT host the coord shard (0).
+    assert!(!store2.hosts_locally(coord_shard));
+    let resolver = TxnResolver::new(store2.clone()).with_ttl(std::time::Duration::ZERO);
+    let resolved = resolver.resolve_once().await.unwrap();
+    assert!(
+        resolved >= 1,
+        "node 2's resolver must resolve the lock by forwarding TxnDecide to node 1"
+    );
+
+    // The lock was released and NO ref advanced.
+    assert!(store2.get(&name_s1).await.unwrap().is_none());
+    // And the ref is writable again (lock gone).
+    store2.update(&name_s1, oid(1), None).await.unwrap();
+
+    // The Abort was made durable on the coord shard (node 1) via the forward, and
+    // is monotone: a late Commit still returns Abort.
+    let late = store1
+        .apply_txn_record_op(
+            coord_shard,
+            LedgeOp::TxnDecide {
+                txn_id: txn,
+                commit: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        late,
+        LedgeResp::TxnState(Some(TxnDecision::Abort)),
+        "the forwarded presumed-abort must be durable + monotone on the coord shard"
+    );
+}

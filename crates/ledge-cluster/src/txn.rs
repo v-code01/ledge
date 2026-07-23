@@ -338,11 +338,15 @@ impl AtomicCommit for TxnCoordinator {
 /// (a GC-then-recreate would let a late `Commit` win); it is reclaimed by the
 /// coordinator's own `TxnEnd` when it resumes and honors the abort.
 ///
-/// Residual: property (1) requires this node to host the coord shard. Where it
-/// does not, the resolver leaves the lock untouched (rather than release it
-/// without a durable decision) for the coord-shard host's resolver — safe, at the
-/// cost of a longer cross-node hold. Making `TxnDecide` forwardable would let any
-/// node record the decision and resolve such locks immediately (a follow-up).
+/// Cross-node: property (1) requires the terminal `Abort` be durable on the coord
+/// shard before release. `TxnDecide` is a forwardable [`ClusterOp`], so a resolver
+/// that does NOT host the coord shard records the decision via `op_on_shard`
+/// (local-or-forwarded) — the write returns only once durable on the coord shard's
+/// quorum, so record-before-release holds. A resolver on any node therefore
+/// resolves a lock immediately rather than waiting for the coord-shard host's
+/// resolver. Rolled-forward `Commit` records are likewise reclaimed via a
+/// forwardable `TxnEnd`, so no orphaned-commit record leaks when the resolving
+/// node does not host the coord shard.
 pub struct TxnResolver {
     store: Arc<ClusterRefStore>,
     /// A `Pending`/absent decision older than this is presumed-abort.
@@ -395,28 +399,31 @@ impl TxnResolver {
                     // released: otherwise a slow coordinator resuming mid-sweep could
                     // (via the monotone TxnDecide) still decide Commit and roll
                     // forward another of this txn's still-held locks, splitting it
-                    // across shards. Only the coord-shard host can record the
-                    // decision; where this node does NOT host it, we cannot make the
-                    // abort durable, so we must NOT release the lock (releasing
-                    // without a durable decision reopens the split window) — leave it
-                    // for the coord-shard host's resolver (safe; longer cross-node
-                    // hold).
-                    if !self.store.hosts_locally(coord) {
-                        continue;
-                    }
-                    self.store
-                        .apply_txn_record_op(
+                    // across shards. `TxnDecide` is a forwardable `ClusterOp`, so we
+                    // record the decision on the coord shard LOCAL-OR-FORWARDED —
+                    // returning means it is durable on the coord shard's quorum, so
+                    // record-before-release holds even when this node does not host
+                    // the coord shard. The monotone SM returns the WINNING decision,
+                    // so a coordinator that reached its commit point just before us
+                    // wins and we roll forward instead of releasing.
+                    decision = match self
+                        .store
+                        .op_on_shard(
                             coord,
-                            LedgeOp::TxnDecide {
+                            ClusterOp::TxnDecide {
                                 txn_id: intent.txn_id,
                                 commit: false,
                             },
                         )
-                        .await?;
-                    // Re-read the WINNING decision: a coordinator that reached its
-                    // commit point just before us wins (monotone), so we roll forward
-                    // instead of releasing.
-                    decision = self.read_decision(coord, intent.txn_id).await?;
+                        .await?
+                    {
+                        RefOpResponse::TxnDecisionResp(d) => d,
+                        other => {
+                            return Err(LedgeError::Unavailable(format!(
+                                "unexpected txn-decide resp: {other:?}"
+                            )))
+                        }
+                    };
                 }
 
                 let commit = decision == Some(TxnDecision::Commit);
@@ -444,11 +451,15 @@ impl TxnResolver {
 
         for (txn_id, coord_shard) in to_gc {
             let coord = ShardId(coord_shard);
-            if self.store.hosts_locally(coord) {
-                self.store
-                    .apply_txn_record_op(coord, LedgeOp::TxnEnd { txn_id })
-                    .await?;
-            }
+            // Reclaim the rolled-forward Commit record on the coord shard,
+            // LOCAL-OR-FORWARDED. Forwarding closes the leak where an
+            // orphaned-commit record resolved entirely by non-coord-hosting
+            // resolvers would otherwise never be GC'd. GC'ing a terminal Commit
+            // record is safe from any node (see the type doc); only Abort records
+            // are deliberately never reclaimed here.
+            self.store
+                .op_on_shard(coord, ClusterOp::TxnEnd { txn_id })
+                .await?;
         }
 
         Ok(resolved)

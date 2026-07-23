@@ -100,6 +100,28 @@ pub enum ClusterOp {
         /// The coordinator shard whose SM holds the record.
         coord_shard: u32,
     },
+    /// Write a transaction's terminal decision on its coordinator shard — the
+    /// forwardable form of the record write, so a [`crate::txn::TxnResolver`] on
+    /// ANY node can make a presumed-abort durable on the coord shard even when it
+    /// does not host it (the record-before-release invariant, cross-node). The
+    /// op is routed to the coord shard via `op_on_shard`. MONOTONE: the state
+    /// machine keeps the FIRST terminal decision and returns the winner, so a
+    /// late/forwarded decide can never flip an existing decision.
+    TxnDecide {
+        /// The transaction to decide.
+        txn_id: TxnId,
+        /// `true` = commit, `false` = abort.
+        commit: bool,
+    },
+    /// GC a transaction's record on its coordinator shard — the forwardable form
+    /// of the record reclaim, so a resolver that rolled a `Commit` forward can
+    /// reclaim the record even when it does not host the coord shard (else an
+    /// orphaned-commit record resolved entirely by non-coord-hosting resolvers
+    /// would leak). The op is routed to the coord shard via `op_on_shard`.
+    TxnEnd {
+        /// The transaction whose record to reclaim.
+        txn_id: TxnId,
+    },
 }
 
 /// The applied result of a forwarded [`ClusterOp`]. Mirrors the `LedgeResp`

@@ -859,6 +859,31 @@ impl ClusterRefStore {
                 };
                 Ok(RefOpResponse::TxnDecisionResp(entry))
             }
+            ClusterOp::TxnDecide { txn_id, commit } => {
+                // Record the terminal decision on THIS shard (= the coord shard;
+                // the caller routed here). MONOTONE in the SM: the first terminal
+                // decision wins and is returned, so a forwarded presumed-abort
+                // cannot flip a coordinator's earlier Commit. Replicated write, so
+                // returning means the decision is durable on the shard's quorum —
+                // the record-before-release guarantee the resolver depends on.
+                match self
+                    .client_write_routed(shard, LedgeOp::TxnDecide { txn_id, commit })
+                    .await?
+                {
+                    LedgeResp::TxnState(d) => Ok(RefOpResponse::TxnDecisionResp(d)),
+                    other => Err(infra(format!("unexpected resp for txn-decide: {other:?}"))),
+                }
+            }
+            ClusterOp::TxnEnd { txn_id } => {
+                match self
+                    .client_write_routed(shard, LedgeOp::TxnEnd { txn_id })
+                    .await?
+                {
+                    // TxnEnd GCs the record and returns the now-absent state (None).
+                    LedgeResp::TxnState(d) => Ok(RefOpResponse::TxnDecisionResp(d)),
+                    other => Err(infra(format!("unexpected resp for txn-end: {other:?}"))),
+                }
+            }
         }
     }
 }
