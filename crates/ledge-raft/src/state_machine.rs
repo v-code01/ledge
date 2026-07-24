@@ -586,23 +586,48 @@ impl StateMachineStore {
     /// node that installed a snapshot then served a CAS update would diverge in
     /// `version` from a node that replayed the log. `restore_from` closes that
     /// gap: the snapshot install path is byte-identical to the log-replay path.
-    async fn restore(&mut self, bytes: &[u8]) {
+    /// Rebuild applied state from a snapshot payload. Fails GRACEFULLY — never
+    /// panics the follower's SM task — on:
+    /// - a corrupt / truncated / version-skewed payload (bincode decode, or a ref
+    ///   name that no longer validates) → `read_snapshot` StorageError;
+    /// - a local IO failure while rebuilding the stores, e.g. disk-full
+    ///   (`tempdir`/`open`/`restore_from`/lease `put`) → `write_state_machine`.
+    ///
+    /// The new stores are built in a fresh dir and swapped in atomically ONLY on
+    /// full success, so a failure leaves the prior applied state intact (no torn
+    /// or partial install) and openraft can retry or surface the error.
+    async fn restore(&mut self, bytes: &[u8]) -> Result<(), StorageError<u64>> {
         let (dump, _): (StateDump, _) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| StorageError::from(StorageIOError::read_snapshot(None, &e)))?;
+        let dir = tempfile::tempdir()
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         let hlc = Arc::new(HLC::new());
-        let refs = Arc::new(RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone()).unwrap());
-        let leases = Arc::new(LeaseStore::open(dir.path().to_path_buf(), hlc).unwrap());
-        // Restore the FULL RefEntry set verbatim — version preserved.
-        let entries: Vec<(RefName, RefEntry)> = dump
-            .refs
-            .into_iter()
-            .map(|(name, entry)| (RefName::new(&name).expect("snapshot ref name valid"), entry))
-            .collect();
-        refs.restore_from(entries).await.expect("restore refs");
+        let refs = Arc::new(
+            RefStoreImpl::open(dir.path().to_path_buf(), hlc.clone())
+                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?,
+        );
+        let leases = Arc::new(
+            LeaseStore::open(dir.path().to_path_buf(), hlc)
+                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?,
+        );
+        // Restore the FULL RefEntry set verbatim — version preserved. A ref name
+        // that fails to validate means the snapshot payload is corrupt.
+        let mut entries: Vec<(RefName, RefEntry)> = Vec::with_capacity(dump.refs.len());
+        for (name, entry) in dump.refs {
+            let rn = RefName::new(&name)
+                .map_err(|e| StorageError::from(StorageIOError::read_snapshot(None, &e)))?;
+            entries.push((rn, entry));
+        }
+        refs.restore_from(entries)
+            .await
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         // Leases carry their own hlc + generation; `put` stores them verbatim.
         for lease in dump.leases {
-            leases.put(lease).await.expect("restore lease");
+            leases
+                .put(lease)
+                .await
+                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
         }
         // Atomically swap the whole store set so any shared ReadHandle observes
         // the restored state as one consistent unit, never a torn pair.
@@ -619,6 +644,7 @@ impl StateMachineStore {
             map.insert(k, v);
         }
         self.txn_records.store(Arc::new(map));
+        Ok(())
     }
 }
 
@@ -850,7 +876,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        self.restore(snapshot.get_ref()).await;
+        // Rebuild applied state first. A failure here (corrupt payload / disk-full)
+        // returns a StorageError WITHOUT mutating the resume point or persisting a
+        // bad snapshot — the prior state stays intact and openraft can retry.
+        self.restore(snapshot.get_ref()).await?;
         self.last_applied_log = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         // Persist the installed snapshot + the new resume point durably (disk-backed
@@ -1836,6 +1865,46 @@ mod tests {
             "applied_state().last_applied_log must survive restart (else openraft replays purged log)"
         );
         assert_eq!(last_after.unwrap().index, 3);
+    }
+
+    /// A corrupt / truncated snapshot payload (e.g. from a version-skewed peer or
+    /// a partial transfer) must make `install_snapshot` FAIL GRACEFULLY — return a
+    /// StorageError, never panic the follower's SM task — and leave the prior
+    /// applied state intact (the failed install must not tear it down).
+    #[tokio::test]
+    async fn install_snapshot_rejects_corrupt_payload_without_panicking() {
+        let mut sm = StateMachineStore::new_temp().await;
+        // Seed applied state so we can prove a failed install does not destroy it.
+        let _ = sm.apply(entries_for(ops())).await.unwrap();
+        assert!(
+            sm.read_handle()
+                .applied_ref("refs/heads/main")
+                .await
+                .is_some(),
+            "precondition: main ref is applied"
+        );
+
+        // Bytes that are not a decodable bincode StateDump.
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "corrupt".into(),
+        };
+        let garbage = Box::new(Cursor::new(vec![0xff, 0xfe, 0xfd, 0x00, 0x7a, 0x13]));
+
+        let res = sm.install_snapshot(&meta, garbage).await;
+        assert!(
+            res.is_err(),
+            "a corrupt snapshot must return a StorageError, not panic"
+        );
+        // Prior applied state survives the rejected install.
+        assert!(
+            sm.read_handle()
+                .applied_ref("refs/heads/main")
+                .await
+                .is_some(),
+            "a failed install must leave the prior applied state intact"
+        );
     }
 
     /// SNAPSHOT DURABILITY. Build a snapshot in a disk-backed SM, drop it, reopen
